@@ -47,6 +47,9 @@ sudo make reload MODE0=output MODE1=input EDGE1=rising
 `reload` unloads the add-on and reloads it with the selected modes and input
 edge defaults.
 
+Before proceeding with Input and Output, make sure testptp is installed. If not, here is a repo:
+https://github.com/Time-Appliances-Project/Incubation-Projects/tree/master/Software/testptp
+
 ## Input With testptp
 
 Find the PTP device:
