@@ -2,15 +2,14 @@
 
 Author: Ahmad Byagowi
 
-Experimental out-of-tree Linux kernel module that exposes Intel Time-Aware
-GPIO / Timed I/O blocks on systems where firmware does not enumerate the ACPI
-devices.
+Linux kernel module that exposes Time-Aware GPIO / Timed I/O blocks on systems.
+It also works where system's firmware does not enumerate the ACPI devices.
 
 Each static TGPIO block can be selected independently as:
 
-- `input`: PTP external timestamp input.
-- `output`: PTP periodic output.
-- `off`: leave the block unused.
+- `off`: leave the block unused (0).
+- `input`: PTP external timestamp input (1).
+- `output`: PTP periodic output (2).
 
 The default is both blocks as inputs, matching the first working input setup.
 
