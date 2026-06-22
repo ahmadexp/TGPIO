@@ -131,7 +131,7 @@ ASUS ProArt Z890-CREATOR WIFI with the BIOS version 3202
 
 link: https://www.asus.com/us/motherboards-components/motherboards/proart/proart-z890-creator-wifi/
 
-with out of the box Ubuntu Ubuntu 26.04 LTS (comes with default 7.0.0-22-generic)
+Using "out of the box" Ubuntu 26.04 LTS (that comes with the default Linux kernel 7.0.0-22-generic)
 
 ## Safety
 
