@@ -123,9 +123,24 @@ Remove the persistent install:
 sudo make uninstall
 ```
 
+## Known working setup
+
+The following is a known working setup with confirmed results:
+
+ASUS ProArt Z890-CREATOR WIFI with the BIOS version 3202
+
+link: https://www.asus.com/us/motherboards-components/motherboards/proart/proart-z890-creator-wifi/
+
+with out of the box Ubuntu Ubuntu 26.04 LTS (comes with default 7.0.0-22-generic)
+
+## Safety
+
+This module maps and exposes MMIO resources. Wrong addresses can write to the
+wrong hardware registers. Use only address sets confirmed for your platform.
+
 ## Important Notes
 
-Do not load this at the same time as the separate TGPIO Platform output module.
+Do not load this at the same time as the separate TGPIO Platform module (a separate repo for output only).
 This add-on owns the selected static blocks itself.
 
 Hardware input timestamps are converted from captured ART cycles using
