@@ -13,6 +13,7 @@
 #include <linux/clocksource_ids.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
+#include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -52,6 +53,7 @@
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (10 * NSEC_PER_MSEC)
 #define TGPIO_CPUID_ART_LEAF	0x15
+#define TGPIO_PHC_MAX_ADJ_PPB	100000000L
 
 enum tgpio_mode {
 	TGPIO_MODE_OFF,
@@ -62,6 +64,11 @@ enum tgpio_mode {
 enum tgpio_timestamp_mode {
 	TGPIO_TIMESTAMP_REALTIME,
 	TGPIO_TIMESTAMP_ART,
+};
+
+enum tgpio_clock_mode {
+	TGPIO_CLOCK_REALTIME,
+	TGPIO_CLOCK_PHC,
 };
 
 enum tgpio_output_phase {
@@ -82,12 +89,14 @@ static char mode0_param[16] = "input";
 static char mode1_param[16] = "input";
 static char edge0_param[16] = "rising";
 static char edge1_param[16] = "rising";
+static char clock_mode_param[16] = "realtime";
 static char timestamp_mode_param[16] = "realtime";
 static char output_polarity_param[16] = "normal";
 static unsigned int poll_ms = 10;
 static unsigned long art_frequency;
 static unsigned int tsc_art_numerator;
 static unsigned int tsc_art_denominator;
+static enum tgpio_clock_mode clock_mode;
 static enum tgpio_timestamp_mode timestamp_mode;
 static enum tgpio_output_polarity output_polarity;
 static bool hardware_timestamps = true;
@@ -115,6 +124,10 @@ MODULE_PARM_DESC(edge0, "Default input edge for block 0: rising, falling, or bot
 
 module_param_string(edge1, edge1_param, sizeof(edge1_param), 0444);
 MODULE_PARM_DESC(edge1, "Default input edge for block 1: rising, falling, or both");
+
+module_param_string(clock_mode, clock_mode_param, sizeof(clock_mode_param), 0444);
+MODULE_PARM_DESC(clock_mode,
+		 "PTP clock mode: realtime or phc");
 
 module_param_string(timestamp_mode, timestamp_mode_param,
 		    sizeof(timestamp_mode_param), 0444);
@@ -145,7 +158,15 @@ MODULE_PARM_DESC(tsc_art_denominator,
 module_param(hardware_timestamps, bool, 0644);
 MODULE_PARM_DESC(hardware_timestamps, "Use hardware capture time instead of poll time");
 
+struct tgpio_phc_clock {
+	spinlock_t lock;
+	u64 anchor_art;
+	s64 anchor_ns;
+	long scaled_ppm;
+};
+
 struct tgpio_block {
+	struct tgpio_state *state;
 	unsigned int index;
 	unsigned long addr;
 	enum tgpio_mode mode;
@@ -167,6 +188,7 @@ struct tgpio_state {
 	struct ptp_clock_info info;
 	struct ptp_clock *clock;
 	struct ptp_pin_desc pin_config[TGPIO_MAX_BLOCKS];
+	struct tgpio_phc_clock phc;
 	struct delayed_work poll_work;
 	struct mutex lock;
 	unsigned int n_ptp_pins;
@@ -225,6 +247,38 @@ static int tgpio_parse_edge(const char *value, u32 *edge_bits)
 	if (sysfs_streq(value, "both") || sysfs_streq(value, "toggle") ||
 	    sysfs_streq(value, "all")) {
 		*edge_bits = TGPIOCTL_EP_TOGGLE;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static const char *tgpio_clock_mode_name(enum tgpio_clock_mode mode)
+{
+	switch (mode) {
+	case TGPIO_CLOCK_REALTIME:
+		return "realtime";
+	case TGPIO_CLOCK_PHC:
+		return "phc";
+	default:
+		return "unknown";
+	}
+}
+
+static int tgpio_parse_clock_mode(const char *value,
+				  enum tgpio_clock_mode *mode)
+{
+	if (sysfs_streq(value, "realtime") ||
+	    sysfs_streq(value, "clock_realtime") ||
+	    sysfs_streq(value, "real")) {
+		*mode = TGPIO_CLOCK_REALTIME;
+		return 0;
+	}
+
+	if (sysfs_streq(value, "phc") ||
+	    sysfs_streq(value, "adjustable") ||
+	    sysfs_streq(value, "adjusted")) {
+		*mode = TGPIO_CLOCK_PHC;
 		return 0;
 	}
 
@@ -441,6 +495,327 @@ static u64 tgpio_art_to_ns(u64 art)
 						 art_frequency);
 }
 
+static u64 tgpio_abs_s64(s64 value)
+{
+	if (value < 0)
+		return (u64)(-(value + 1)) + 1;
+
+	return value;
+}
+
+static bool tgpio_add_s64_overflow(s64 lhs, s64 rhs, s64 *result)
+{
+	if (rhs > 0 && lhs > S64_MAX - rhs)
+		return true;
+
+	if (rhs < 0 && lhs < S64_MIN - rhs)
+		return true;
+
+	*result = lhs + rhs;
+	return false;
+}
+
+static bool tgpio_u64_to_s64(u64 value, s64 *result)
+{
+	if (value > S64_MAX)
+		return false;
+
+	*result = value;
+	return true;
+}
+
+static bool tgpio_art_delta_to_ns(s64 cycles, s64 *ns)
+{
+	u64 abs_cycles = tgpio_abs_s64(cycles);
+	u64 seconds;
+	u64 rem;
+	u64 abs_ns;
+
+	if (!art_frequency)
+		return false;
+
+	seconds = div64_u64_rem(abs_cycles, art_frequency, &rem);
+	if (seconds > div64_u64(S64_MAX, NSEC_PER_SEC))
+		return false;
+
+	abs_ns = seconds * NSEC_PER_SEC +
+		 div64_ul(rem * NSEC_PER_SEC, art_frequency);
+	if (abs_ns > S64_MAX)
+		return false;
+
+	*ns = cycles < 0 ? -(s64)abs_ns : (s64)abs_ns;
+	return true;
+}
+
+static bool tgpio_ns_delta_to_art(s64 ns, s64 *cycles)
+{
+	u64 abs_ns = tgpio_abs_s64(ns);
+	u64 seconds;
+	u64 rem;
+	u64 abs_cycles;
+
+	if (!art_frequency)
+		return false;
+
+	seconds = div64_u64_rem(abs_ns, NSEC_PER_SEC, &rem);
+	if (seconds && art_frequency > div64_u64(U64_MAX, seconds))
+		return false;
+
+	abs_cycles = seconds * art_frequency +
+		     div64_u64(rem * art_frequency, NSEC_PER_SEC);
+	if (abs_cycles > S64_MAX)
+		return false;
+
+	*cycles = ns < 0 ? -(s64)abs_cycles : (s64)abs_cycles;
+	return true;
+}
+
+static s64 tgpio_scaled_ppm_to_ppb(long scaled_ppm)
+{
+	if (scaled_ppm > div_s64(S64_MAX, 1000))
+		return S64_MAX;
+	if (scaled_ppm < div_s64(S64_MIN, 1000))
+		return S64_MIN;
+
+	return div_s64((s64)scaled_ppm * 1000, 1 << 16);
+}
+
+static s64 tgpio_apply_ppb_to_ns(s64 ns, s64 ppb)
+{
+	bool negative = (ns < 0) ^ (ppb < 0);
+	u64 abs_ns = tgpio_abs_s64(ns);
+	u64 abs_ppb = tgpio_abs_s64(ppb);
+	u64 seconds;
+	u64 rem;
+	u64 correction;
+
+	if (!ns || !ppb)
+		return 0;
+
+	seconds = div64_u64_rem(abs_ns, NSEC_PER_SEC, &rem);
+	correction = seconds * abs_ppb +
+		     div64_u64(rem * abs_ppb, NSEC_PER_SEC);
+
+	if (correction > S64_MAX)
+		correction = S64_MAX;
+
+	return negative ? -(s64)correction : (s64)correction;
+}
+
+static bool tgpio_phc_base_to_adjusted_delta(s64 base_ns, s64 ppb,
+					     s64 *adjusted_ns)
+{
+	s64 correction = tgpio_apply_ppb_to_ns(base_ns, ppb);
+
+	return !tgpio_add_s64_overflow(base_ns, correction, adjusted_ns);
+}
+
+static bool tgpio_phc_adjusted_to_base_delta(s64 adjusted_ns, s64 ppb,
+					     s64 *base_ns)
+{
+	bool negative = adjusted_ns < 0;
+	u64 abs_adjusted = tgpio_abs_s64(adjusted_ns);
+	s64 denominator_s64;
+	u64 denominator;
+	u64 quotient;
+	u64 rem;
+	u64 abs_base;
+
+	denominator_s64 = (s64)NSEC_PER_SEC + ppb;
+	if (denominator_s64 <= 0)
+		return false;
+	denominator = denominator_s64;
+
+	quotient = div64_u64_rem(abs_adjusted, denominator, &rem);
+	if (quotient > div64_u64(S64_MAX, NSEC_PER_SEC))
+		return false;
+
+	abs_base = quotient * NSEC_PER_SEC +
+		   div64_u64(rem * NSEC_PER_SEC, denominator);
+	if (abs_base > S64_MAX)
+		return false;
+
+	*base_ns = negative ? -(s64)abs_base : (s64)abs_base;
+	return true;
+}
+
+static bool tgpio_get_current_art(u64 *art)
+{
+	return ktime_real_to_base_clock(ktime_get_real(), CSID_X86_ART, art);
+}
+
+static bool tgpio_phc_art_to_ns_locked(struct tgpio_state *state, u64 art,
+				       s64 *phc_ns)
+{
+	struct tgpio_phc_clock *phc = &state->phc;
+	s64 delta_cycles;
+	s64 base_delta_ns;
+	s64 adjusted_delta_ns;
+	s64 ppb;
+
+	if (art >= phc->anchor_art) {
+		if (!tgpio_u64_to_s64(art - phc->anchor_art, &delta_cycles))
+			return false;
+	} else {
+		if (!tgpio_u64_to_s64(phc->anchor_art - art, &delta_cycles))
+			return false;
+		delta_cycles = -delta_cycles;
+	}
+
+	if (!tgpio_art_delta_to_ns(delta_cycles, &base_delta_ns))
+		return false;
+
+	ppb = tgpio_scaled_ppm_to_ppb(phc->scaled_ppm);
+	if (!tgpio_phc_base_to_adjusted_delta(base_delta_ns, ppb,
+					      &adjusted_delta_ns))
+		return false;
+
+	return !tgpio_add_s64_overflow(phc->anchor_ns, adjusted_delta_ns,
+				       phc_ns);
+}
+
+static bool tgpio_phc_art_to_ns(struct tgpio_state *state, u64 art,
+				s64 *phc_ns)
+{
+	unsigned long flags;
+	bool ret;
+
+	spin_lock_irqsave(&state->phc.lock, flags);
+	ret = tgpio_phc_art_to_ns_locked(state, art, phc_ns);
+	spin_unlock_irqrestore(&state->phc.lock, flags);
+
+	return ret;
+}
+
+static bool tgpio_phc_now_ns(struct tgpio_state *state, s64 *phc_ns)
+{
+	u64 art;
+
+	if (!tgpio_get_current_art(&art))
+		return false;
+
+	return tgpio_phc_art_to_ns(state, art, phc_ns);
+}
+
+static bool tgpio_phc_ns_to_art(struct tgpio_state *state, s64 phc_ns,
+				u64 *art)
+{
+	unsigned long flags;
+	u64 anchor_art;
+	s64 anchor_ns;
+	long scaled_ppm;
+	s64 phc_delta_ns;
+	s64 base_delta_ns;
+	s64 delta_cycles;
+	s64 ppb;
+
+	spin_lock_irqsave(&state->phc.lock, flags);
+	anchor_art = state->phc.anchor_art;
+	anchor_ns = state->phc.anchor_ns;
+	scaled_ppm = state->phc.scaled_ppm;
+	spin_unlock_irqrestore(&state->phc.lock, flags);
+
+	if (tgpio_add_s64_overflow(phc_ns, -anchor_ns, &phc_delta_ns))
+		return false;
+
+	ppb = tgpio_scaled_ppm_to_ppb(scaled_ppm);
+	if (!tgpio_phc_adjusted_to_base_delta(phc_delta_ns, ppb,
+					      &base_delta_ns))
+		return false;
+
+	if (!tgpio_ns_delta_to_art(base_delta_ns, &delta_cycles))
+		return false;
+
+	if (delta_cycles >= 0) {
+		*art = anchor_art + (u64)delta_cycles;
+		if (*art < anchor_art)
+			return false;
+	} else {
+		u64 abs_cycles = tgpio_abs_s64(delta_cycles);
+
+		if (abs_cycles > anchor_art)
+			return false;
+		*art = anchor_art - abs_cycles;
+	}
+
+	return true;
+}
+
+static bool tgpio_phc_delta_to_real_ns(struct tgpio_state *state,
+				       s64 phc_delta_ns, u64 *real_delta_ns)
+{
+	unsigned long flags;
+	long scaled_ppm;
+	s64 base_delta_ns;
+	s64 ppb;
+
+	if (phc_delta_ns <= 0) {
+		*real_delta_ns = 0;
+		return true;
+	}
+
+	spin_lock_irqsave(&state->phc.lock, flags);
+	scaled_ppm = state->phc.scaled_ppm;
+	spin_unlock_irqrestore(&state->phc.lock, flags);
+
+	ppb = tgpio_scaled_ppm_to_ppb(scaled_ppm);
+	if (!tgpio_phc_adjusted_to_base_delta(phc_delta_ns, ppb,
+					      &base_delta_ns) ||
+	    base_delta_ns < 0)
+		return false;
+
+	*real_delta_ns = base_delta_ns;
+	return true;
+}
+
+static bool tgpio_clock_now_ns(struct tgpio_state *state, s64 *ns)
+{
+	if (clock_mode == TGPIO_CLOCK_PHC)
+		return tgpio_phc_now_ns(state, ns);
+
+	*ns = ktime_get_real_ns();
+	return true;
+}
+
+static bool tgpio_clock_ns_to_art(struct tgpio_state *state, s64 ns, u64 *art)
+{
+	if (clock_mode == TGPIO_CLOCK_PHC)
+		return tgpio_phc_ns_to_art(state, ns, art);
+
+	return ktime_real_to_base_clock(ns_to_ktime(ns), CSID_X86_ART, art);
+}
+
+static bool tgpio_clock_delta_to_real_ns(struct tgpio_state *state,
+					 s64 clock_delta_ns,
+					 u64 *real_delta_ns)
+{
+	if (clock_mode == TGPIO_CLOCK_PHC)
+		return tgpio_phc_delta_to_real_ns(state, clock_delta_ns,
+						  real_delta_ns);
+
+	if (clock_delta_ns <= 0)
+		*real_delta_ns = 0;
+	else
+		*real_delta_ns = clock_delta_ns;
+	return true;
+}
+
+static int tgpio_phc_init_clock(struct tgpio_state *state)
+{
+	ktime_t realtime;
+	u64 art;
+
+	realtime = ktime_get_real();
+	if (!ktime_real_to_base_clock(realtime, CSID_X86_ART, &art))
+		return -ENODEV;
+
+	spin_lock_init(&state->phc.lock);
+	state->phc.anchor_art = art;
+	state->phc.anchor_ns = ktime_to_ns(realtime);
+	state->phc.scaled_ppm = 0;
+	return 0;
+}
+
 static void tgpio_read_capture(struct tgpio_block *block, u64 *event_count,
 			       u64 *art_cycles)
 {
@@ -504,6 +879,7 @@ tgpio_snapshot_timestamp_history(struct system_time_snapshot *history,
 				 bool *valid)
 {
 	if (!hardware_timestamps ||
+	    clock_mode != TGPIO_CLOCK_REALTIME ||
 	    timestamp_mode != TGPIO_TIMESTAMP_REALTIME) {
 		*valid = false;
 		return;
@@ -591,7 +967,24 @@ static void tgpio_emit_event(struct tgpio_state *state,
 		return;
 
 	if (!hardware_timestamps) {
-		event.timestamp = ktime_get_real_ns();
+		s64 timestamp;
+
+		if (tgpio_clock_now_ns(state, &timestamp) && timestamp >= 0)
+			event.timestamp = timestamp;
+		else
+			event.timestamp = ktime_get_real_ns();
+	} else if (clock_mode == TGPIO_CLOCK_PHC) {
+		s64 timestamp;
+
+		if (!tgpio_phc_art_to_ns(state, art_cycles, &timestamp) ||
+		    timestamp < 0) {
+			pr_warn_ratelimited("failed to convert ART capture to "
+					    "adjusted PHC time; using poll time\n");
+			if (!tgpio_clock_now_ns(state, &timestamp) ||
+			    timestamp < 0)
+				timestamp = ktime_get_real_ns();
+		}
+		event.timestamp = timestamp;
 	} else if (timestamp_mode == TGPIO_TIMESTAMP_REALTIME) {
 		if (!tgpio_art_to_realtime_ns(block, art_cycles,
 					      &event.timestamp)) {
@@ -725,18 +1118,26 @@ static int tgpio_ptp_time_to_ns(const struct ptp_clock_time *time, u64 *ns)
 	return 0;
 }
 
-static ktime_t tgpio_ptp_time_to_ktime(const struct ptp_clock_time *time)
+static int tgpio_ptp_time_to_s64_ns(const struct ptp_clock_time *time, s64 *ns)
 {
-	return ktime_set(time->sec, time->nsec);
+	if (time->sec < 0 || time->nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+
+	if (time->sec > div64_s64(S64_MAX, NSEC_PER_SEC))
+		return -ERANGE;
+
+	*ns = (s64)time->sec * NSEC_PER_SEC + time->nsec;
+	return 0;
 }
 
-static bool tgpio_program_output_edge(struct tgpio_block *block,
+static bool tgpio_program_output_edge(struct tgpio_state *state,
+				      struct tgpio_block *block,
 				      ktime_t edge_time, u32 edge_bits)
 {
 	u64 art;
 	u32 ctrl;
 
-	if (!ktime_real_to_base_clock(edge_time, CSID_X86_ART, &art))
+	if (!tgpio_clock_ns_to_art(state, ktime_to_ns(edge_time), &art))
 		return false;
 
 	if (art > TGPIO_ART_HW_DELAY_CYCLES)
@@ -767,8 +1168,10 @@ static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
 {
 	struct tgpio_block *block =
 		container_of(timer, struct tgpio_block, output_timer);
+	struct tgpio_state *state = block->state;
 	ktime_t now;
 	ktime_t next_edge;
+	u64 interval_ns;
 	unsigned long flags;
 	u32 edge_bits;
 
@@ -787,7 +1190,10 @@ static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
 		edge_bits = TGPIOCTL_EP_TOGGLE;
 	}
 
-	if (!tgpio_program_output_edge(block, next_edge, edge_bits)) {
+	if (!tgpio_program_output_edge(state, block, next_edge, edge_bits) ||
+	    !tgpio_clock_delta_to_real_ns(state, block->output_half_period_ns,
+					  &interval_ns) ||
+	    !interval_ns) {
 		tgpio_disable_output_hw(block);
 		spin_unlock_irqrestore(&block->output_lock, flags);
 		return HRTIMER_NORESTART;
@@ -796,7 +1202,7 @@ static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
 	block->output_next_edge = next_edge;
 	block->output_phase = TGPIO_OUTPUT_TOGGLE;
 	now = ktime_get_real();
-	hrtimer_forward(timer, now, ns_to_ktime(block->output_half_period_ns));
+	hrtimer_forward(timer, now, ns_to_ktime(interval_ns));
 	spin_unlock_irqrestore(&block->output_lock, flags);
 
 	return HRTIMER_RESTART;
@@ -820,15 +1226,18 @@ static int tgpio_config_output(struct tgpio_state *state,
 {
 	struct tgpio_block *block;
 	int block_index;
-	ktime_t first_edge;
-	ktime_t min_first_edge;
-	ktime_t prime_edge;
+	s64 first_edge_ns;
+	s64 min_first_edge_ns;
+	s64 now_ns;
+	s64 prime_edge_ns;
+	s64 timer_delay_clock_ns;
+	s64 timer_start_ns;
 	ktime_t timer_start;
-	ktime_t lead;
 	unsigned long irqflags;
 	u64 period_ns;
 	u64 half_period_ns;
 	u64 lead_ns;
+	u64 timer_delay_ns;
 	int ret;
 	u32 ctrl;
 
@@ -860,13 +1269,27 @@ static int tgpio_config_output(struct tgpio_state *state,
 	if (!timekeeping_clocksource_has_base(CSID_X86_ART))
 		return -ENODEV;
 
-	first_edge = tgpio_ptp_time_to_ktime(&perout->start);
+	ret = tgpio_ptp_time_to_s64_ns(&perout->start, &first_edge_ns);
+	if (ret)
+		return ret;
+
+	if (!tgpio_clock_now_ns(state, &now_ns))
+		return -ENODEV;
+
 	lead_ns = tgpio_output_lead_time_ns(half_period_ns);
-	lead = ns_to_ktime(lead_ns);
-	min_first_edge = ktime_add_ns(ktime_get_real(), 3 * lead_ns);
-	if (ktime_before(first_edge, min_first_edge))
-		first_edge = min_first_edge;
-	prime_edge = ktime_sub(first_edge, ns_to_ktime(2 * lead_ns));
+	if (tgpio_add_s64_overflow(now_ns, 3 * lead_ns, &min_first_edge_ns))
+		return -ERANGE;
+	if (first_edge_ns < min_first_edge_ns)
+		first_edge_ns = min_first_edge_ns;
+	prime_edge_ns = first_edge_ns - 2 * lead_ns;
+	timer_start_ns = first_edge_ns - lead_ns;
+	if (tgpio_add_s64_overflow(timer_start_ns, -now_ns,
+				   &timer_delay_clock_ns))
+		return -ERANGE;
+
+	if (!tgpio_clock_delta_to_real_ns(state, timer_delay_clock_ns,
+					  &timer_delay_ns))
+		return -ENODEV;
 
 	tgpio_disable_output(block);
 
@@ -880,7 +1303,7 @@ static int tgpio_config_output(struct tgpio_state *state,
 	ctrl &= ~(TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
 	tgpio_writel(block, TGPIOCTL, ctrl);
 
-	if (!tgpio_program_output_edge(block, prime_edge,
+	if (!tgpio_program_output_edge(state, block, ns_to_ktime(prime_edge_ns),
 				       tgpio_output_edge_bits(false))) {
 		tgpio_disable_output_hw(block);
 		spin_unlock_irqrestore(&block->output_lock, irqflags);
@@ -888,7 +1311,7 @@ static int tgpio_config_output(struct tgpio_state *state,
 	}
 
 	block->output_half_period_ns = half_period_ns;
-	block->output_next_edge = first_edge;
+	block->output_next_edge = ns_to_ktime(first_edge_ns);
 	block->output_phase = TGPIO_OUTPUT_FIRST_RISING;
 	block->output_enabled = true;
 
@@ -898,7 +1321,7 @@ static int tgpio_config_output(struct tgpio_state *state,
 
 	spin_unlock_irqrestore(&block->output_lock, irqflags);
 
-	timer_start = ktime_sub(first_edge, lead);
+	timer_start = ktime_add_ns(ktime_get_real(), timer_delay_ns);
 	if (ktime_before(timer_start, ktime_get_real()))
 		timer_start = ktime_get_real();
 
@@ -934,6 +1357,20 @@ static int tgpio_ptp_enable(struct ptp_clock_info *ptp,
 static int tgpio_ptp_gettime64(struct ptp_clock_info *ptp,
 			       struct timespec64 *ts)
 {
+	struct tgpio_state *state =
+		container_of(ptp, struct tgpio_state, info);
+	s64 now_ns;
+
+	if (clock_mode == TGPIO_CLOCK_PHC) {
+		if (!tgpio_phc_now_ns(state, &now_ns))
+			return -ENODEV;
+		if (now_ns < 0)
+			return -ERANGE;
+
+		*ts = ns_to_timespec64(now_ns);
+		return 0;
+	}
+
 	ktime_get_real_ts64(ts);
 	return 0;
 }
@@ -941,17 +1378,101 @@ static int tgpio_ptp_gettime64(struct ptp_clock_info *ptp,
 static int tgpio_ptp_settime64(struct ptp_clock_info *ptp,
 			       const struct timespec64 *ts)
 {
-	return -EOPNOTSUPP;
+	struct tgpio_state *state =
+		container_of(ptp, struct tgpio_state, info);
+	unsigned long flags;
+	s64 ns;
+	u64 art;
+
+	if (clock_mode != TGPIO_CLOCK_PHC)
+		return -EOPNOTSUPP;
+
+	if (ts->tv_sec < 0 || ts->tv_nsec < 0 ||
+	    ts->tv_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+	if (ts->tv_sec > div64_s64(S64_MAX, NSEC_PER_SEC))
+		return -ERANGE;
+
+	ns = timespec64_to_ns(ts);
+	if (ns < 0)
+		return -ERANGE;
+
+	if (!tgpio_get_current_art(&art))
+		return -ENODEV;
+
+	spin_lock_irqsave(&state->phc.lock, flags);
+	state->phc.anchor_art = art;
+	state->phc.anchor_ns = ns;
+	spin_unlock_irqrestore(&state->phc.lock, flags);
+
+	return 0;
 }
 
 static int tgpio_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
 {
-	return -EOPNOTSUPP;
+	struct tgpio_state *state =
+		container_of(ptp, struct tgpio_state, info);
+	unsigned long flags;
+	s64 now_ns;
+	s64 adjusted_ns;
+	u64 art;
+
+	if (clock_mode != TGPIO_CLOCK_PHC)
+		return -EOPNOTSUPP;
+
+	if (!tgpio_get_current_art(&art))
+		return -ENODEV;
+
+	spin_lock_irqsave(&state->phc.lock, flags);
+	if (!tgpio_phc_art_to_ns_locked(state, art, &now_ns) ||
+	    tgpio_add_s64_overflow(now_ns, delta, &adjusted_ns)) {
+		spin_unlock_irqrestore(&state->phc.lock, flags);
+		return -ERANGE;
+	}
+	if (adjusted_ns < 0) {
+		spin_unlock_irqrestore(&state->phc.lock, flags);
+		return -ERANGE;
+	}
+
+	state->phc.anchor_art = art;
+	state->phc.anchor_ns = adjusted_ns;
+	spin_unlock_irqrestore(&state->phc.lock, flags);
+
+	return 0;
 }
 
 static int tgpio_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
 {
-	return -EOPNOTSUPP;
+	struct tgpio_state *state =
+		container_of(ptp, struct tgpio_state, info);
+	unsigned long flags;
+	s64 now_ns;
+	s64 ppb;
+	u64 art;
+
+	if (clock_mode != TGPIO_CLOCK_PHC)
+		return -EOPNOTSUPP;
+
+	ppb = tgpio_scaled_ppm_to_ppb(scaled_ppm);
+	if (ppb > TGPIO_PHC_MAX_ADJ_PPB ||
+	    ppb < -TGPIO_PHC_MAX_ADJ_PPB)
+		return -ERANGE;
+
+	if (!tgpio_get_current_art(&art))
+		return -ENODEV;
+
+	spin_lock_irqsave(&state->phc.lock, flags);
+	if (!tgpio_phc_art_to_ns_locked(state, art, &now_ns)) {
+		spin_unlock_irqrestore(&state->phc.lock, flags);
+		return -ERANGE;
+	}
+
+	state->phc.anchor_art = art;
+	state->phc.anchor_ns = now_ns;
+	state->phc.scaled_ppm = scaled_ppm;
+	spin_unlock_irqrestore(&state->phc.lock, flags);
+
+	return 0;
 }
 
 static int tgpio_ptp_verify(struct ptp_clock_info *ptp, unsigned int pin,
@@ -1069,6 +1590,7 @@ static int tgpio_configure_blocks(struct tgpio_state *state)
 	for (i = 0; i < ARRAY_SIZE(state->blocks); i++) {
 		struct tgpio_block *block = &state->blocks[i];
 
+		block->state = state;
 		block->index = i;
 		block->addr = addrs[i];
 		spin_lock_init(&block->output_lock);
@@ -1174,7 +1696,8 @@ static int tgpio_register_ptp_clock(struct tgpio_state *state)
 	state->info.owner = THIS_MODULE;
 	snprintf(state->info.name, sizeof(state->info.name),
 		 "Intel TGPIO");
-	state->info.max_adj = 0;
+	state->info.max_adj = clock_mode == TGPIO_CLOCK_PHC ?
+			      TGPIO_PHC_MAX_ADJ_PPB : 0;
 	state->info.n_pins = state->n_ptp_pins;
 	state->info.n_ext_ts = state->n_ptp_pins;
 	state->info.n_per_out = state->n_ptp_pins;
@@ -1213,6 +1736,13 @@ static int __init tgpio_input_init(void)
 	mutex_init(&tgpio->lock);
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
 
+	ret = tgpio_parse_clock_mode(clock_mode_param, &clock_mode);
+	if (ret) {
+		pr_err("invalid clock_mode=%s; use realtime or phc\n",
+		       clock_mode_param);
+		goto err_cleanup;
+	}
+
 	ret = tgpio_parse_timestamp_mode(timestamp_mode_param, &timestamp_mode);
 	if (ret) {
 		pr_err("invalid timestamp_mode=%s; use realtime or art\n",
@@ -1232,7 +1762,24 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
-	if (tgpio_needs_art_frequency(tgpio)) {
+	if (clock_mode == TGPIO_CLOCK_PHC) {
+		if (!timekeeping_clocksource_has_base(CSID_X86_ART)) {
+			pr_err("clock_mode=phc requires a timekeeper clocksource "
+			       "based on ART\n");
+			ret = -ENODEV;
+			goto err_cleanup;
+		}
+
+		ret = tgpio_resolve_art_frequency();
+		if (ret)
+			goto err_cleanup;
+
+		ret = tgpio_phc_init_clock(tgpio);
+		if (ret)
+			goto err_cleanup;
+
+		pr_info("PTP clock uses adjustable ART-backed PHC mode\n");
+	} else if (tgpio_needs_art_frequency(tgpio)) {
 		ret = tgpio_resolve_art_frequency();
 		if (ret)
 			goto err_cleanup;
@@ -1254,9 +1801,10 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
-	pr_info("loaded with mode0=%s mode1=%s timestamp_mode=%s output_polarity=%s\n",
+	pr_info("loaded with mode0=%s mode1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s\n",
 		tgpio_mode_name(tgpio->blocks[0].mode),
 		tgpio_mode_name(tgpio->blocks[1].mode),
+		tgpio_clock_mode_name(clock_mode),
 		tgpio_timestamp_mode_name(timestamp_mode),
 		tgpio_output_polarity_name(output_polarity));
 	return 0;
