@@ -29,8 +29,8 @@ addr1=0xFE001310
 mmio_size=0x38
 mode0=input
 mode1=input
-edge0=both
-edge1=both
+edge0=rising
+edge1=rising
 poll_ms=10
 art_frequency=0
 ```
@@ -83,8 +83,8 @@ For `testptp -L`, the `-i` value is the PTP channel. It does not need to match
 the physical TGPIO block number; for example, `-i 0 -L 1,1` maps physical
 TGPIO1 to external timestamp channel 0.
 
-By default, input timestamps are captured on both rising and falling edges.
-Choose one edge at load time with `EDGE0` or `EDGE1`:
+By default, input timestamps are captured on rising edges. Choose a different
+edge mode at load time with `EDGE0` or `EDGE1`:
 
 ```sh
 sudo make reload MODE0=output MODE1=input EDGE1=rising
