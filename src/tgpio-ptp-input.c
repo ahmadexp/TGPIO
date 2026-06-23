@@ -294,6 +294,10 @@ static int tgpio_parse_output_polarity(const char *value,
 
 static u32 tgpio_output_edge_bits(bool rising)
 {
+	/*
+	 * TGPIO output compare polarity is opposite the input-edge names on
+	 * the confirmed platform; keep logical rising/falling decisions here.
+	 */
 	if (output_polarity == TGPIO_OUTPUT_INVERTED)
 		return rising ? TGPIOCTL_EP_RISING : TGPIOCTL_EP_FALLING;
 
