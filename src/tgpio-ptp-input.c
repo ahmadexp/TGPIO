@@ -332,6 +332,25 @@ static int tgpio_resolve_art_frequency(void)
 	return -ENODEV;
 }
 
+static void tgpio_probe_art_parameters_for_status(void)
+{
+	unsigned long detected;
+
+	if (tgpio_detect_cpuid_art_frequency(&detected)) {
+		if (!art_frequency)
+			art_frequency = detected;
+		pr_info("detected CPUID leaf %#x ART frequency %lu Hz; "
+			"TSC/ART ratio %u/%u\n",
+			TGPIO_CPUID_ART_LEAF, detected,
+			tsc_art_numerator, tsc_art_denominator);
+	} else if (tsc_art_numerator && tsc_art_denominator) {
+		pr_info("detected CPUID leaf %#x TSC/ART ratio %u/%u; "
+			"ART frequency not reported\n",
+			TGPIO_CPUID_ART_LEAF, tsc_art_numerator,
+			tsc_art_denominator);
+	}
+}
+
 static int tgpio_check_addr(unsigned long addr)
 {
 	if (!addr || !mmio_size)
@@ -1162,6 +1181,7 @@ static int __init tgpio_input_init(void)
 			ret = -ENODEV;
 			goto err_cleanup;
 		}
+		tgpio_probe_art_parameters_for_status();
 		pr_info("hardware input timestamps use CLOCK_REALTIME via ART base clock\n");
 	} else if (!art_frequency) {
 		pr_info("ART frequency not needed for this configuration\n");
