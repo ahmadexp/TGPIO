@@ -12,6 +12,7 @@ MODE0="${MODE0:-input}"
 MODE1="${MODE1:-input}"
 EDGE0="${EDGE0:-rising}"
 EDGE1="${EDGE1:-rising}"
+TIMESTAMP_MODE="${TIMESTAMP_MODE:-realtime}"
 POLL_MS="${POLL_MS:-10}"
 ART_FREQUENCY="${ART_FREQUENCY:-0}"
 HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
@@ -63,7 +64,8 @@ fi
 
 insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	use_second="${USE_SECOND}" mode0="${MODE0}" mode1="${MODE1}" \
-	edge0="${EDGE0}" edge1="${EDGE1}" poll_ms="${POLL_MS}" \
+	edge0="${EDGE0}" edge1="${EDGE1}" timestamp_mode="${TIMESTAMP_MODE}" \
+	poll_ms="${POLL_MS}" \
 	art_frequency="${ART_FREQUENCY}" hardware_timestamps="${HARDWARE_TIMESTAMPS}"
 
 "${SCRIPT_DIR}/status.sh"

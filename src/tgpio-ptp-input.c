@@ -59,6 +59,11 @@ enum tgpio_mode {
 	TGPIO_MODE_OUTPUT,
 };
 
+enum tgpio_timestamp_mode {
+	TGPIO_TIMESTAMP_REALTIME,
+	TGPIO_TIMESTAMP_ART,
+};
+
 static unsigned long addr0 = 0xFE001210;
 static unsigned long addr1 = 0xFE001310;
 static unsigned int mmio_size = 0x38;
@@ -67,10 +72,12 @@ static char mode0_param[16] = "input";
 static char mode1_param[16] = "input";
 static char edge0_param[16] = "rising";
 static char edge1_param[16] = "rising";
+static char timestamp_mode_param[16] = "realtime";
 static unsigned int poll_ms = 10;
 static unsigned long art_frequency;
 static unsigned int tsc_art_numerator;
 static unsigned int tsc_art_denominator;
+static enum tgpio_timestamp_mode timestamp_mode;
 static bool hardware_timestamps = true;
 
 module_param(addr0, ulong, 0444);
@@ -96,6 +103,11 @@ MODULE_PARM_DESC(edge0, "Default input edge for block 0: rising, falling, or bot
 
 module_param_string(edge1, edge1_param, sizeof(edge1_param), 0444);
 MODULE_PARM_DESC(edge1, "Default input edge for block 1: rising, falling, or both");
+
+module_param_string(timestamp_mode, timestamp_mode_param,
+		    sizeof(timestamp_mode_param), 0444);
+MODULE_PARM_DESC(timestamp_mode,
+		 "Hardware timestamp mode: realtime or art");
 
 module_param(poll_ms, uint, 0644);
 MODULE_PARM_DESC(poll_ms, "Polling interval for captured input events");
@@ -124,6 +136,8 @@ struct tgpio_block {
 	bool enabled;
 	u32 input_edge_bits;
 	u64 last_count;
+	struct system_time_snapshot timestamp_history;
+	bool timestamp_history_valid;
 	struct hrtimer output_timer;
 	spinlock_t output_lock;
 	bool output_enabled;
@@ -193,6 +207,36 @@ static int tgpio_parse_edge(const char *value, u32 *edge_bits)
 	if (sysfs_streq(value, "both") || sysfs_streq(value, "toggle") ||
 	    sysfs_streq(value, "all")) {
 		*edge_bits = TGPIOCTL_EP_TOGGLE;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static const char *tgpio_timestamp_mode_name(enum tgpio_timestamp_mode mode)
+{
+	switch (mode) {
+	case TGPIO_TIMESTAMP_REALTIME:
+		return "realtime";
+	case TGPIO_TIMESTAMP_ART:
+		return "art";
+	default:
+		return "unknown";
+	}
+}
+
+static int tgpio_parse_timestamp_mode(const char *value,
+				      enum tgpio_timestamp_mode *mode)
+{
+	if (sysfs_streq(value, "realtime") ||
+	    sysfs_streq(value, "clock_realtime") ||
+	    sysfs_streq(value, "real")) {
+		*mode = TGPIO_TIMESTAMP_REALTIME;
+		return 0;
+	}
+
+	if (sysfs_streq(value, "art") || sysfs_streq(value, "raw")) {
+		*mode = TGPIO_TIMESTAMP_ART;
 		return 0;
 	}
 
@@ -272,7 +316,8 @@ static int tgpio_resolve_art_frequency(void)
 	}
 
 	if (tsc_art_numerator && tsc_art_denominator) {
-		pr_err("CPUID leaf %#x reported TSC/ART ratio %u/%u but no ART frequency; set art_frequency=<Hz>\n",
+		pr_err("CPUID leaf %#x reported TSC/ART ratio %u/%u but no "
+		       "ART frequency; set art_frequency=<Hz>\n",
 		       TGPIO_CPUID_ART_LEAF, tsc_art_numerator,
 		       tsc_art_denominator);
 	} else {
@@ -334,6 +379,75 @@ static void tgpio_read_capture(struct tgpio_block *block, u64 *event_count,
 	*art_cycles = ((u64)tcv_hi << 32) | tcv_lo;
 }
 
+struct tgpio_crosststamp_ctx {
+	u64 art_cycles;
+};
+
+static int tgpio_get_crosststamp(ktime_t *device_time,
+				 struct system_counterval_t *sys_counterval,
+				 void *ctx)
+{
+	struct tgpio_crosststamp_ctx *timestamp = ctx;
+
+	*device_time = ns_to_ktime(0);
+	sys_counterval->cycles = timestamp->art_cycles;
+	sys_counterval->cs_id = CSID_X86_ART;
+	sys_counterval->use_nsecs = false;
+
+	return 0;
+}
+
+static bool tgpio_art_to_realtime_ns(struct tgpio_block *block, u64 art,
+				     u64 *timestamp)
+{
+	struct tgpio_crosststamp_ctx ctx = {
+		.art_cycles = art,
+	};
+	struct system_device_crosststamp xtstamp = {
+		.clock_id = CLOCK_REALTIME,
+	};
+	struct system_time_snapshot *history = NULL;
+	int ret;
+
+	if (block->timestamp_history_valid)
+		history = &block->timestamp_history;
+
+	ret = get_device_system_crosststamp(tgpio_get_crosststamp, &ctx,
+					    history, &xtstamp);
+	if (ret)
+		return false;
+
+	*timestamp = ktime_to_ns(xtstamp.sys_systime);
+	return true;
+}
+
+static void
+tgpio_snapshot_timestamp_history(struct system_time_snapshot *history,
+				 bool *valid)
+{
+	if (!hardware_timestamps ||
+	    timestamp_mode != TGPIO_TIMESTAMP_REALTIME) {
+		*valid = false;
+		return;
+	}
+
+	ktime_get_snapshot_id(CLOCK_REALTIME, history);
+	*valid = history->valid;
+}
+
+static void tgpio_save_timestamp_history(struct tgpio_block *block,
+					 struct system_time_snapshot *history,
+					 bool valid)
+{
+	if (!valid) {
+		block->timestamp_history_valid = false;
+		return;
+	}
+
+	block->timestamp_history = *history;
+	block->timestamp_history_valid = true;
+}
+
 static bool tgpio_block_supports_func(struct tgpio_state *state,
 				      unsigned int block_index,
 				      enum ptp_pin_function func)
@@ -386,8 +500,9 @@ static unsigned int tgpio_channel_for_block(struct tgpio_state *state,
 	return block_index;
 }
 
-static void tgpio_emit_event(struct tgpio_state *state, unsigned int index,
-			     u64 art_cycles)
+static void tgpio_emit_event(struct tgpio_state *state,
+			     struct tgpio_block *block,
+			     unsigned int index, u64 art_cycles)
 {
 	struct ptp_clock_event event = {
 		.type = PTP_CLOCK_EXTTS,
@@ -397,10 +512,18 @@ static void tgpio_emit_event(struct tgpio_state *state, unsigned int index,
 	if (!state->clock)
 		return;
 
-	if (hardware_timestamps)
-		event.timestamp = tgpio_art_to_ns(art_cycles);
-	else
+	if (!hardware_timestamps) {
 		event.timestamp = ktime_get_real_ns();
+	} else if (timestamp_mode == TGPIO_TIMESTAMP_REALTIME) {
+		if (!tgpio_art_to_realtime_ns(block, art_cycles,
+					      &event.timestamp)) {
+			pr_warn_ratelimited("failed to convert ART capture to "
+					    "CLOCK_REALTIME; using poll time\n");
+			event.timestamp = ktime_get_real_ns();
+		}
+	} else {
+		event.timestamp = tgpio_art_to_ns(art_cycles);
+	}
 
 	ptp_clock_event(state->clock, &event);
 }
@@ -416,6 +539,8 @@ static void tgpio_poll_work(struct work_struct *work)
 	mutex_lock(&state->lock);
 	for (i = 0; i < ARRAY_SIZE(state->blocks); i++) {
 		struct tgpio_block *block = &state->blocks[i];
+		struct system_time_snapshot history;
+		bool history_valid;
 		u64 count;
 		u64 art;
 
@@ -423,6 +548,7 @@ static void tgpio_poll_work(struct work_struct *work)
 			continue;
 
 		enabled = true;
+		tgpio_snapshot_timestamp_history(&history, &history_valid);
 		tgpio_read_capture(block, &count, &art);
 
 		if (count != block->last_count) {
@@ -431,8 +557,10 @@ static void tgpio_poll_work(struct work_struct *work)
 			block->last_count = count;
 			channel = tgpio_channel_for_block(state, i,
 							  PTP_PF_EXTTS);
-			tgpio_emit_event(state, channel, art);
+			tgpio_emit_event(state, block, channel, art);
 		}
+
+		tgpio_save_timestamp_history(block, &history, history_valid);
 	}
 	mutex_unlock(&state->lock);
 
@@ -480,6 +608,9 @@ static int tgpio_config_input(struct tgpio_state *state, unsigned int channel,
 	tgpio_writel(block, TGPIOCTL, ctrl);
 
 	if (on) {
+		struct system_time_snapshot history;
+		bool history_valid;
+
 		ctrl &= ~TGPIOCTL_EP;
 		ctrl |= tgpio_edge_bits(block, flags);
 		ctrl |= TGPIOCTL_DIR;
@@ -487,6 +618,8 @@ static int tgpio_config_input(struct tgpio_state *state, unsigned int channel,
 
 		tgpio_read_capture(block, &count, &art);
 		block->last_count = count;
+		tgpio_snapshot_timestamp_history(&history, &history_valid);
+		tgpio_save_timestamp_history(block, &history, history_valid);
 		block->enabled = true;
 
 		ctrl |= TGPIOCTL_EN;
@@ -495,6 +628,7 @@ static int tgpio_config_input(struct tgpio_state *state, unsigned int channel,
 				      msecs_to_jiffies(poll_ms ? poll_ms : 1));
 	} else {
 		block->enabled = false;
+		block->timestamp_history_valid = false;
 		tgpio_writel(block, TGPIOCTL, ctrl);
 	}
 
@@ -886,6 +1020,27 @@ static bool tgpio_needs_art_frequency(struct tgpio_state *state)
 	if (!hardware_timestamps)
 		return false;
 
+	if (timestamp_mode != TGPIO_TIMESTAMP_ART)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(state->blocks); i++) {
+		if (state->blocks[i].mode == TGPIO_MODE_INPUT)
+			return true;
+	}
+
+	return false;
+}
+
+static bool tgpio_needs_art_base_clock(struct tgpio_state *state)
+{
+	unsigned int i;
+
+	if (!hardware_timestamps)
+		return false;
+
+	if (timestamp_mode != TGPIO_TIMESTAMP_REALTIME)
+		return false;
+
 	for (i = 0; i < ARRAY_SIZE(state->blocks); i++) {
 		if (state->blocks[i].mode == TGPIO_MODE_INPUT)
 			return true;
@@ -959,6 +1114,13 @@ static int __init tgpio_input_init(void)
 	mutex_init(&tgpio->lock);
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
 
+	ret = tgpio_parse_timestamp_mode(timestamp_mode_param, &timestamp_mode);
+	if (ret) {
+		pr_err("invalid timestamp_mode=%s; use realtime or art\n",
+		       timestamp_mode_param);
+		goto err_cleanup;
+	}
+
 	ret = tgpio_configure_blocks(tgpio);
 	if (ret)
 		goto err_cleanup;
@@ -967,6 +1129,15 @@ static int __init tgpio_input_init(void)
 		ret = tgpio_resolve_art_frequency();
 		if (ret)
 			goto err_cleanup;
+	} else if (tgpio_needs_art_base_clock(tgpio)) {
+		if (!timekeeping_clocksource_has_base(CSID_X86_ART)) {
+			pr_err("timestamp_mode=realtime requires a timekeeper "
+			       "clocksource based on ART; use timestamp_mode=art "
+			       "or hardware_timestamps=0\n");
+			ret = -ENODEV;
+			goto err_cleanup;
+		}
+		pr_info("hardware input timestamps use CLOCK_REALTIME via ART base clock\n");
 	} else if (!art_frequency) {
 		pr_info("ART frequency not needed for this configuration\n");
 	}
@@ -975,9 +1146,10 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
-	pr_info("loaded with mode0=%s mode1=%s\n",
+	pr_info("loaded with mode0=%s mode1=%s timestamp_mode=%s\n",
 		tgpio_mode_name(tgpio->blocks[0].mode),
-		tgpio_mode_name(tgpio->blocks[1].mode));
+		tgpio_mode_name(tgpio->blocks[1].mode),
+		tgpio_timestamp_mode_name(timestamp_mode));
 	return 0;
 
 err_cleanup:
