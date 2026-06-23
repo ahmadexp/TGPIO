@@ -31,6 +31,7 @@ mode0=input
 mode1=input
 edge0=rising
 edge1=rising
+timestamp_mode=realtime
 poll_ms=10
 art_frequency=0
 ```
@@ -41,6 +42,10 @@ art_frequency=0
 CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
 `tsc_art_numerator` and `tsc_art_denominator` and shows it in `make status`.
 
+`timestamp_mode=realtime` reports hardware input captures in the same
+`CLOCK_REALTIME` timebase returned by the PTP clock. Use
+`TIMESTAMP_MODE=art` to report raw ART-cycle-derived nanoseconds instead.
+
 Mixed-mode examples:
 
 ```sh
@@ -48,6 +53,7 @@ sudo make reload MODE0=output MODE1=input
 sudo make reload MODE0=input MODE1=output
 sudo make reload MODE0=output MODE1=off
 sudo make reload MODE0=output MODE1=input EDGE1=rising
+sudo make reload MODE0=input TIMESTAMP_MODE=art
 ```
 
 `reload` unloads the add-on and reloads it with the selected modes and input
@@ -146,16 +152,18 @@ wrong hardware registers. Use only address sets confirmed for your platform.
 
 ## Important Notes
 
-Do not load this at the same time as the separate TGPIO Platform module (a separate repo for output only).
+Do not load this at the same time as the separate TGPIO Platform module
+(a separate repo for output only).
 This add-on owns the selected static blocks itself.
 
-Hardware input timestamps are converted from captured ART cycles. By default,
-`ART_FREQUENCY=0` auto-detects the ART/crystal frequency from CPUID leaf
-`0x15`. If the CPU does not report it, load with `ART_FREQUENCY=<Hz>` manually,
-for example `ART_FREQUENCY=25000000`. If the value is wrong, timestamps will
-still count events but their nanosecond scale will be wrong. Set
-`HARDWARE_TIMESTAMPS=0` to emit poll time instead of hardware capture time while
-debugging.
+Hardware input timestamps use `TIMESTAMP_MODE=realtime` by default, which
+converts captured ART cycles into `CLOCK_REALTIME` through the kernel
+timekeeping clocksource relationship. Use `TIMESTAMP_MODE=art` for the old raw
+ART-cycle-derived nanosecond scale. In that mode, `ART_FREQUENCY=0`
+auto-detects the ART/crystal frequency from CPUID leaf `0x15`. If the CPU does
+not report it, load with `ART_FREQUENCY=<Hz>` manually, for example
+`ART_FREQUENCY=25000000`. Set `HARDWARE_TIMESTAMPS=0` to emit poll time instead
+of hardware capture time while debugging.
 
 The CPUID `0x15` ratio is the TSC-to-ART ratio:
 `TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for
