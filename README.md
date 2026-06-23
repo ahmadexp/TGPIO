@@ -32,8 +32,14 @@ mode1=input
 edge0=both
 edge1=both
 poll_ms=10
-art_frequency=25000000
+art_frequency=0
 ```
+
+`art_frequency=0` means auto-detect the ART/crystal frequency from CPUID leaf
+`0x15`. Set `ART_FREQUENCY=<Hz>` to override it manually.
+
+CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
+`tsc_art_numerator` and `tsc_art_denominator` and shows it in `make status`.
 
 Mixed-mode examples:
 
@@ -143,10 +149,19 @@ wrong hardware registers. Use only address sets confirmed for your platform.
 Do not load this at the same time as the separate TGPIO Platform module (a separate repo for output only).
 This add-on owns the selected static blocks itself.
 
-Hardware input timestamps are converted from captured ART cycles using
-`ART_FREQUENCY`. If the value is wrong, timestamps will still count events but
-their nanosecond scale will be wrong. Set `HARDWARE_TIMESTAMPS=0` to emit poll
-time instead of hardware capture time while debugging.
+Hardware input timestamps are converted from captured ART cycles. By default,
+`ART_FREQUENCY=0` auto-detects the ART/crystal frequency from CPUID leaf
+`0x15`. If the CPU does not report it, load with `ART_FREQUENCY=<Hz>` manually,
+for example `ART_FREQUENCY=25000000`. If the value is wrong, timestamps will
+still count events but their nanosecond scale will be wrong. Set
+`HARDWARE_TIMESTAMPS=0` to emit poll time instead of hardware capture time while
+debugging.
+
+The CPUID `0x15` ratio is the TSC-to-ART ratio:
+`TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for
+diagnostics or for deriving the CPU TSC rate, but it is not applied to the
+TGPIO hardware timestamp conversion because the TGPIO compare/capture values
+are treated as ART-domain cycles.
 
 ## License
 

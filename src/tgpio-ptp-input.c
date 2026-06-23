@@ -23,6 +23,10 @@
 #include <linux/timekeeping.h>
 #include <linux/workqueue.h>
 
+#ifdef CONFIG_X86
+#include <asm/cpuid/api.h>
+#endif
+
 #define TGPIO_MAX_BLOCKS	2
 
 #define TGPIOCTL		0x00
@@ -47,6 +51,7 @@
 
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (10 * NSEC_PER_MSEC)
+#define TGPIO_CPUID_ART_LEAF	0x15
 
 enum tgpio_mode {
 	TGPIO_MODE_OFF,
@@ -63,7 +68,9 @@ static char mode1_param[16] = "input";
 static char edge0_param[16] = "both";
 static char edge1_param[16] = "both";
 static unsigned int poll_ms = 10;
-static unsigned long art_frequency = 25000000;
+static unsigned long art_frequency;
+static unsigned int tsc_art_numerator;
+static unsigned int tsc_art_denominator;
 static bool hardware_timestamps = true;
 
 module_param(addr0, ulong, 0444);
@@ -94,7 +101,17 @@ module_param(poll_ms, uint, 0644);
 MODULE_PARM_DESC(poll_ms, "Polling interval for captured input events");
 
 module_param(art_frequency, ulong, 0644);
-MODULE_PARM_DESC(art_frequency, "ART frequency used to convert capture cycles to nanoseconds");
+MODULE_PARM_DESC(art_frequency,
+		 "ART frequency in Hz used to convert capture cycles to "
+		 "nanoseconds; 0 auto-detects from CPUID leaf 0x15");
+
+module_param(tsc_art_numerator, uint, 0444);
+MODULE_PARM_DESC(tsc_art_numerator,
+		 "Detected CPUID leaf 0x15 TSC/ART numerator; 0 unknown");
+
+module_param(tsc_art_denominator, uint, 0444);
+MODULE_PARM_DESC(tsc_art_denominator,
+		 "Detected CPUID leaf 0x15 TSC/ART denominator; 0 unknown");
 
 module_param(hardware_timestamps, bool, 0644);
 MODULE_PARM_DESC(hardware_timestamps, "Use hardware capture time instead of poll time");
@@ -197,6 +214,71 @@ static inline void tgpio_write_compv(struct tgpio_block *block, u64 value)
 {
 	tgpio_writel(block, TGPIOCOMPV63_32, upper_32_bits(value));
 	tgpio_writel(block, TGPIOCOMPV31_0, lower_32_bits(value));
+}
+
+static bool tgpio_detect_cpuid_art_frequency(unsigned long *frequency)
+{
+#ifdef CONFIG_X86
+	u32 max_leaf;
+	u32 eax;
+	u32 ebx;
+	u32 ecx;
+	u32 edx;
+
+	cpuid(0, &max_leaf, &ebx, &ecx, &edx);
+	if (max_leaf < TGPIO_CPUID_ART_LEAF)
+		return false;
+
+	cpuid_count(TGPIO_CPUID_ART_LEAF, 0, &eax, &ebx, &ecx, &edx);
+	if (!eax || !ebx)
+		return false;
+
+	tsc_art_numerator = ebx;
+	tsc_art_denominator = eax;
+	if (!ecx)
+		return false;
+
+	*frequency = ecx;
+	return true;
+#else
+	(void)frequency;
+	return false;
+#endif
+}
+
+static int tgpio_resolve_art_frequency(void)
+{
+	unsigned long detected;
+	bool cpuid_art_frequency;
+
+	cpuid_art_frequency = tgpio_detect_cpuid_art_frequency(&detected);
+
+	if (art_frequency) {
+		pr_info("using manual ART frequency %lu Hz\n",
+			art_frequency);
+		if (tsc_art_numerator && tsc_art_denominator)
+			pr_info("detected CPUID leaf %#x TSC/ART ratio %u/%u\n",
+				TGPIO_CPUID_ART_LEAF, tsc_art_numerator,
+				tsc_art_denominator);
+		return 0;
+	}
+
+	if (cpuid_art_frequency) {
+		art_frequency = detected;
+		pr_info("auto-detected ART frequency %lu Hz from CPUID leaf %#x; TSC/ART ratio %u/%u\n",
+			art_frequency, TGPIO_CPUID_ART_LEAF,
+			tsc_art_numerator, tsc_art_denominator);
+		return 0;
+	}
+
+	if (tsc_art_numerator && tsc_art_denominator) {
+		pr_err("CPUID leaf %#x reported TSC/ART ratio %u/%u but no ART frequency; set art_frequency=<Hz>\n",
+		       TGPIO_CPUID_ART_LEAF, tsc_art_numerator,
+		       tsc_art_denominator);
+	} else {
+		pr_err("could not auto-detect ART frequency; set art_frequency=<Hz>\n");
+	}
+	return -ENODEV;
 }
 
 static int tgpio_check_addr(unsigned long addr)
@@ -797,6 +879,21 @@ static int tgpio_configure_blocks(struct tgpio_state *state)
 	return 0;
 }
 
+static bool tgpio_needs_art_frequency(struct tgpio_state *state)
+{
+	unsigned int i;
+
+	if (!hardware_timestamps)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(state->blocks); i++) {
+		if (state->blocks[i].mode == TGPIO_MODE_INPUT)
+			return true;
+	}
+
+	return false;
+}
+
 static void tgpio_setup_pin_descs(struct tgpio_state *state)
 {
 	unsigned int i;
@@ -852,7 +949,7 @@ static int __init tgpio_input_init(void)
 {
 	int ret;
 
-	if (!mmio_size || !art_frequency)
+	if (!mmio_size)
 		return -EINVAL;
 
 	tgpio = kzalloc(sizeof(*tgpio), GFP_KERNEL);
@@ -865,6 +962,14 @@ static int __init tgpio_input_init(void)
 	ret = tgpio_configure_blocks(tgpio);
 	if (ret)
 		goto err_cleanup;
+
+	if (tgpio_needs_art_frequency(tgpio)) {
+		ret = tgpio_resolve_art_frequency();
+		if (ret)
+			goto err_cleanup;
+	} else if (!art_frequency) {
+		pr_info("ART frequency not needed for this configuration\n");
+	}
 
 	ret = tgpio_register_ptp_clock(tgpio);
 	if (ret)

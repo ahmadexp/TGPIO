@@ -12,7 +12,7 @@ MODE1 ?= input
 EDGE0 ?= both
 EDGE1 ?= both
 POLL_MS ?= 10
-ART_FREQUENCY ?= 25000000
+ART_FREQUENCY ?= 0
 HARDWARE_TIMESTAMPS ?= 1
 
 .PHONY: all clean help load reload unload status install uninstall
