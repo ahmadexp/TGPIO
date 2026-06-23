@@ -403,9 +403,7 @@ static bool tgpio_art_to_realtime_ns(struct tgpio_block *block, u64 art,
 	struct tgpio_crosststamp_ctx ctx = {
 		.art_cycles = art,
 	};
-	struct system_device_crosststamp xtstamp = {
-		.clock_id = CLOCK_REALTIME,
-	};
+	struct system_device_crosststamp xtstamp = { };
 	struct system_time_snapshot *history = NULL;
 	int ret;
 
@@ -417,7 +415,7 @@ static bool tgpio_art_to_realtime_ns(struct tgpio_block *block, u64 art,
 	if (ret)
 		return false;
 
-	*timestamp = ktime_to_ns(xtstamp.sys_systime);
+	*timestamp = ktime_to_ns(xtstamp.sys_realtime);
 	return true;
 }
 
@@ -431,8 +429,8 @@ tgpio_snapshot_timestamp_history(struct system_time_snapshot *history,
 		return;
 	}
 
-	ktime_get_snapshot_id(CLOCK_REALTIME, history);
-	*valid = history->valid;
+	ktime_get_snapshot(history);
+	*valid = true;
 }
 
 static void tgpio_save_timestamp_history(struct tgpio_block *block,
