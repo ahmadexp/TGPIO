@@ -118,8 +118,9 @@ sudo testptp -i 1 -p 1000000000 -d /dev/ptpX
 ```
 
 `-L pin,2` assigns the pin to periodic output. `-p 1000000000` starts a
-1-second period output; the driver programs TGPIO toggle edges every half
-period.
+1-second period output. The driver first primes the output low, then schedules
+the first active edge as rising and continues with TGPIO toggle edges every
+half period.
 
 ## Persistent Install
 

@@ -64,6 +64,11 @@ enum tgpio_timestamp_mode {
 	TGPIO_TIMESTAMP_ART,
 };
 
+enum tgpio_output_phase {
+	TGPIO_OUTPUT_FIRST_RISING,
+	TGPIO_OUTPUT_TOGGLE,
+};
+
 static unsigned long addr0 = 0xFE001210;
 static unsigned long addr1 = 0xFE001310;
 static unsigned int mmio_size = 0x38;
@@ -141,6 +146,7 @@ struct tgpio_block {
 	struct hrtimer output_timer;
 	spinlock_t output_lock;
 	bool output_enabled;
+	enum tgpio_output_phase output_phase;
 	u64 output_half_period_ns;
 	ktime_t output_next_edge;
 };
@@ -337,7 +343,7 @@ static int tgpio_check_addr(unsigned long addr)
 	return 0;
 }
 
-static ktime_t tgpio_output_lead_time(u64 half_period_ns)
+static u64 tgpio_output_lead_time_ns(u64 half_period_ns)
 {
 	u64 lead = min_t(u64, TGPIO_OUTPUT_SAFE_TIME_NS,
 			 div64_u64(half_period_ns, 4));
@@ -345,7 +351,7 @@ static ktime_t tgpio_output_lead_time(u64 half_period_ns)
 	if (!lead)
 		lead = 1;
 
-	return ns_to_ktime(lead);
+	return lead;
 }
 
 static u64 tgpio_art_to_ns(u64 art)
@@ -651,15 +657,21 @@ static ktime_t tgpio_ptp_time_to_ktime(const struct ptp_clock_time *time)
 }
 
 static bool tgpio_program_output_edge(struct tgpio_block *block,
-				      ktime_t edge_time)
+				      ktime_t edge_time, u32 edge_bits)
 {
 	u64 art;
+	u32 ctrl;
 
 	if (!ktime_real_to_base_clock(edge_time, CSID_X86_ART, &art))
 		return false;
 
 	if (art > TGPIO_ART_HW_DELAY_CYCLES)
 		art -= TGPIO_ART_HW_DELAY_CYCLES;
+
+	ctrl = tgpio_readl(block, TGPIOCTL);
+	ctrl &= ~TGPIOCTL_EP;
+	ctrl |= edge_bits;
+	tgpio_writel(block, TGPIOCTL, ctrl);
 
 	tgpio_write_compv(block, art);
 	return true;
@@ -674,6 +686,7 @@ static void tgpio_disable_output_hw(struct tgpio_block *block)
 	ctrl &= ~TGPIOCTL_EN;
 	tgpio_writel(block, TGPIOCTL, ctrl);
 	block->output_enabled = false;
+	block->output_phase = TGPIO_OUTPUT_TOGGLE;
 }
 
 static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
@@ -683,6 +696,7 @@ static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
 	ktime_t now;
 	ktime_t next_edge;
 	unsigned long flags;
+	u32 edge_bits;
 
 	spin_lock_irqsave(&block->output_lock, flags);
 	if (!block->output_enabled) {
@@ -690,15 +704,23 @@ static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
 		return HRTIMER_NORESTART;
 	}
 
-	next_edge = ktime_add_ns(block->output_next_edge,
-				 block->output_half_period_ns);
-	if (!tgpio_program_output_edge(block, next_edge)) {
+	if (block->output_phase == TGPIO_OUTPUT_FIRST_RISING) {
+		next_edge = block->output_next_edge;
+		edge_bits = TGPIOCTL_EP_RISING;
+	} else {
+		next_edge = ktime_add_ns(block->output_next_edge,
+					 block->output_half_period_ns);
+		edge_bits = TGPIOCTL_EP_TOGGLE;
+	}
+
+	if (!tgpio_program_output_edge(block, next_edge, edge_bits)) {
 		tgpio_disable_output_hw(block);
 		spin_unlock_irqrestore(&block->output_lock, flags);
 		return HRTIMER_NORESTART;
 	}
 
 	block->output_next_edge = next_edge;
+	block->output_phase = TGPIO_OUTPUT_TOGGLE;
 	now = ktime_get_real();
 	hrtimer_forward(timer, now, ns_to_ktime(block->output_half_period_ns));
 	spin_unlock_irqrestore(&block->output_lock, flags);
@@ -726,11 +748,13 @@ static int tgpio_config_output(struct tgpio_state *state,
 	int block_index;
 	ktime_t first_edge;
 	ktime_t min_first_edge;
+	ktime_t prime_edge;
 	ktime_t timer_start;
 	ktime_t lead;
 	unsigned long irqflags;
 	u64 period_ns;
 	u64 half_period_ns;
+	u64 lead_ns;
 	int ret;
 	u32 ctrl;
 
@@ -763,10 +787,12 @@ static int tgpio_config_output(struct tgpio_state *state,
 		return -ENODEV;
 
 	first_edge = tgpio_ptp_time_to_ktime(&perout->start);
-	lead = tgpio_output_lead_time(half_period_ns);
-	min_first_edge = ktime_add(ktime_get_real(), lead);
+	lead_ns = tgpio_output_lead_time_ns(half_period_ns);
+	lead = ns_to_ktime(lead_ns);
+	min_first_edge = ktime_add_ns(ktime_get_real(), 3 * lead_ns);
 	if (ktime_before(first_edge, min_first_edge))
 		first_edge = min_first_edge;
+	prime_edge = ktime_sub(first_edge, ns_to_ktime(2 * lead_ns));
 
 	tgpio_disable_output(block);
 
@@ -778,10 +804,10 @@ static int tgpio_config_output(struct tgpio_state *state,
 	tgpio_write_compv(block, 0);
 
 	ctrl &= ~(TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
-	ctrl |= TGPIOCTL_EP_TOGGLE;
 	tgpio_writel(block, TGPIOCTL, ctrl);
 
-	if (!tgpio_program_output_edge(block, first_edge)) {
+	if (!tgpio_program_output_edge(block, prime_edge,
+				       TGPIOCTL_EP_FALLING)) {
 		tgpio_disable_output_hw(block);
 		spin_unlock_irqrestore(&block->output_lock, irqflags);
 		return -ENODEV;
@@ -789,15 +815,16 @@ static int tgpio_config_output(struct tgpio_state *state,
 
 	block->output_half_period_ns = half_period_ns;
 	block->output_next_edge = first_edge;
+	block->output_phase = TGPIO_OUTPUT_FIRST_RISING;
 	block->output_enabled = true;
 
+	ctrl = tgpio_readl(block, TGPIOCTL);
 	ctrl |= TGPIOCTL_EN;
 	tgpio_writel(block, TGPIOCTL, ctrl);
 
 	spin_unlock_irqrestore(&block->output_lock, irqflags);
 
-	timer_start = ktime_sub(ktime_add_ns(first_edge, half_period_ns),
-				lead);
+	timer_start = ktime_sub(first_edge, lead);
 	if (ktime_before(timer_start, ktime_get_real()))
 		timer_start = ktime_get_real();
 
