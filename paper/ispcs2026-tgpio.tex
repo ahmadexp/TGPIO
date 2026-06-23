@@ -1,0 +1,214 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{url}
+
+\title{Time-Aware GPIO as a Linux PTP Clock}
+
+\author{
+\IEEEauthorblockN{Ahmad Byagowi}
+\IEEEauthorblockA{
+TODO: Affiliation\\
+TODO: City, Country\\
+TODO: Email}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Clock synchronization protocols make time comparable across systems, but measurement and control applications also need a way to attach that time to physical signals. Precision Time Measurement (PTM) and Precision Time Protocol (PTP) can provide timing relationships for host, endpoint, and network clocks; Time-Aware GPIO (TGPIO) is important because it provides the complementary timed I/O boundary, capturing external edges and generating scheduled output transitions in the platform time domain. This paper presents a Linux driver that exposes firmware-undeclared Intel TGPIO hardware through the standard PTP hardware clock interface. The driver maps known MMIO resources, configures TGPIO blocks for external timestamp input or periodic output, and integrates the hardware's Always Running Timer (ART) timebase with Linux timekeeping. It supports both raw ART-derived timestamps and \texttt{CLOCK\_REALTIME}-aligned timestamps, allowing synchronized platform time to be observed and exercised at external pins with existing PTP user-space tools. We describe the driver architecture, pin-function model, timestamp conversion path, and output scheduling mechanism, along with practical issues encountered during bring-up, including firmware discovery gaps, ART/TSC ratio handling, input edge defaults, deterministic output startup, and output polarity selection. The work demonstrates that TGPIO can turn an otherwise internal PTM/PTP-aware timing domain into usable physical I/O for synchronization, measurement, and control.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Precision Time Protocol, Precision Time Measurement, PTP hardware clock, timed I/O, Time-Aware GPIO, ART, Linux kernel, external timestamp, periodic output
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Precision timing systems often need more than a synchronized network clock. They also need physical I/O that can bind events in the external world to a shared timebase. Examples include timestamping a pulse-per-second signal, measuring a trigger edge from an instrument, or generating a scheduled output transition for a device under test. Linux already provides a mature PTP hardware clock (PHC) abstraction for these ancillary timing functions, including external timestamp input and periodic output generation \cite{linux-ptp-docs}.
+
+Some commodity platforms contain timed I/O resources that are not exposed to the operating system through normal firmware enumeration. In that case, standard platform-driver discovery fails even when the underlying MMIO register block is present and functional. The result is an awkward gap: the hardware can be useful for synchronization experiments and measurement, but applications have no standard way to reach it.
+
+This paper describes an out-of-tree Linux driver that bridges that gap for Intel Time-Aware GPIO (TGPIO) blocks on a tested desktop platform. The driver maps known static MMIO resources, exposes each block as a PTP pin, and allows the block to be configured as an external timestamp input, a periodic output generator, or unused. It is designed around the Linux PHC interface rather than a custom userspace ABI, so existing tools such as \texttt{testptp} can configure pins, enable external timestamp events, and request periodic output.
+
+The central design problem is not only register access. TGPIO capture and compare values are expressed in the platform ART domain, while the PTP clock interface normally presents timestamps in the system realtime clock domain. The driver therefore provides two timestamp modes: a default \texttt{CLOCK\_REALTIME}-aligned mode using Linux timekeeping's ART base-clock relationship, and a raw ART-derived mode for diagnostics. The implementation also handles practical bring-up issues that are easy to miss in a purely architectural description, including default input edge selection, deterministic output startup, and output polarity.
+
+The main contributions of this work are:
+\begin{itemize}
+\item a PTP-clock abstraction for static TGPIO MMIO blocks that firmware does not enumerate;
+\item per-block mode selection for external timestamp input, periodic output, or disabled operation;
+\item a timestamp path that supports both realtime-converted hardware captures and raw ART-derived timestamps;
+\item deterministic periodic-output startup with explicit output polarity control; and
+\item a reproducible bring-up workflow using standard Linux kernel and PTP user APIs.
+\end{itemize}
+
+\section{Background}
+
+\subsection{Linux PTP Hardware Clocks}
+
+Linux exposes hardware-assisted precision timing through the PHC subsystem. A PHC driver registers a \texttt{struct ptp\_clock\_info}, implements operations such as \texttt{gettime64()} and \texttt{enable()}, and advertises ancillary features including external timestamp channels and periodic outputs. Userspace configures those features through the PTP character device interface. For this work, the key pin functions are \texttt{PTP\_PF\_EXTTS}, which emits timestamped edge events, and \texttt{PTP\_PF\_PEROUT}, which requests a periodic output signal \cite{linux-ptp-docs,linux-ptp-header}.
+
+The PHC interface is a good boundary for TGPIO because it avoids inventing a new control plane for a timing device. It also allows the driver to interoperate with existing test and measurement programs. In the implementation described here, the registered clock reports the name Intel TGPIO; the PTP clock's time-read operation returns realtime; and pin assignment controls which physical TGPIO block is used for external timestamp input or periodic output.
+
+\subsection{ART, TSC, and Cross Timestamps}
+
+Modern Intel platforms include timing relationships among the Time Stamp Counter (TSC), the ART, and system time. CPUID leaf \texttt{0x15} can report a crystal clock frequency and a TSC-to-crystal ratio on supported processors \cite{intel-sdm}. Linux timekeeping also exposes mechanisms for relating hardware counter values to system time, including cross-timestamp support for device counters \cite{linux-timekeeping-docs,linux-crosststamp-rfc}.
+
+The TGPIO hardware used by this driver captures and compares ART-domain counter values. For external timestamp input, the driver can either convert captured ART cycles into realtime nanoseconds or expose raw ART-derived nanoseconds. For periodic output, the driver converts a requested realtime edge time into an ART compare value before programming the TGPIO compare registers.
+
+\subsection{Firmware Enumeration Gap}
+
+Upstream and public discussion around Intel timed I/O shows that TGPIO-like facilities have existed in Linux development contexts \cite{linux-pps-gen-tio,lkml-tgpio-pmc,lkml-tgpio-io}. However, the platform studied here did not enumerate the relevant ACPI device for the operating system. The driver therefore treats the MMIO base addresses as platform-specific module parameters. This is less general than firmware discovery, but it is a useful technique when the hardware exists and the address map has been confirmed.
+
+\section{Driver Design}
+
+\subsection{Static Blocks and Module Parameters}
+
+The driver supports two static TGPIO blocks. Each block has a configurable MMIO base address, a common MMIO span, and an independent mode. The default addresses are \texttt{0xFE001210} and \texttt{0xFE001310}, with a default register span of \texttt{0x38} bytes. Each block can be loaded in \texttt{input}, \texttt{output}, or \texttt{off} mode. The default configuration enables both blocks as rising-edge external timestamp inputs.
+
+Table~\ref{tab:params} summarizes the most relevant module parameters. The design intentionally keeps platform identity outside the driver binary. This makes the module easy to test on systems where the relevant MMIO resources are known, while avoiding a false claim of general platform discovery.
+
+\begin{table}[t]
+\caption{Selected Driver Parameters}
+\label{tab:params}
+\centering
+\footnotesize
+\begin{tabular}{@{}p{0.34\linewidth}p{0.22\linewidth}p{0.33\linewidth}@{}}
+\toprule
+Parameter & Default & Purpose\\
+\midrule
+\texttt{addr0}, \texttt{addr1} & static & TGPIO MMIO bases\\
+\texttt{mode0}, \texttt{mode1} & input & per-block function\\
+\texttt{edge0}, \texttt{edge1} & rising & default input edge\\
+\texttt{timestamp\_mode} & realtime & event timestamp domain\\
+\texttt{output\_polarity} & normal & logical output polarity\\
+\texttt{poll\_ms} & 10 & input polling interval\\
+\texttt{art\_frequency} & 0 & raw ART conversion frequency\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{PTP Pin Model}
+
+At load time, the driver maps all enabled blocks and registers a single PTP clock. Each block becomes a PTP pin descriptor named according to its physical block index and selected mode. The PTP pin verification path accepts external timestamp requests only on blocks loaded in input mode and periodic-output requests only on blocks loaded in output mode. This prevents userspace from assigning a pin function that the selected hardware mode cannot support.
+
+Channel mapping follows the PTP pin assignment model. A physical TGPIO block may be assigned to an external timestamp or periodic-output channel through \texttt{testptp -L}. If userspace does not create an explicit assignment, the driver falls back to a direct channel-to-block mapping where possible. This keeps the common two-block setup simple while still exercising the standard PTP pin API.
+
+\begin{figure}[t]
+\centering
+\fbox{\begin{minipage}{0.45\textwidth}
+\small
+\textbf{External timestamp path}\\
+External edge $\rightarrow$ TGPIO capture registers $\rightarrow$ poll worker $\rightarrow$ PTP event\\[0.5em]
+\textbf{Periodic output path}\\
+PTP perout request $\rightarrow$ realtime edge time $\rightarrow$ ART compare value $\rightarrow$ TGPIO output
+\end{minipage}}
+\caption{High-level architecture of the TGPIO PTP driver.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{External Timestamp Input}
+
+For input mode, enabling a PTP external timestamp request configures the TGPIO direction bit for input, applies an edge selection, clears the cached event count, and starts a delayed work item. The poll worker reads the capture timestamp and event counter from the block. The hardware register sequence matters: reading the low capture timestamp register latches the associated timestamp and event-count values, after which the driver reads the high and low count registers and the high timestamp register.
+
+When the event count changes, the driver emits a PTP external timestamp event through the PHC event path. The event timestamp is chosen according to the timestamp mode. For debugging, a module option can bypass the captured hardware timestamp and emit the current poll time instead.
+
+\subsection{Periodic Output}
+
+For output mode, a PTP periodic-output request supplies a start time and period in the PTP clock's time domain. The driver rejects unsupported perout flags, validates the period, computes a half-period, and requires that Linux timekeeping expose an ART base clock. It then converts each scheduled realtime edge into an ART compare value using \texttt{ktime\_real\_to\_base\_clock()}.
+
+The output path programs an initial preconditioning edge before enabling steady toggling. The first active edge is treated as logical rising; later edges are programmed as hardware toggles separated by half the requested period. A high-resolution timer periodically advances the next compare value. To avoid programming an edge too close to the current time, the driver enforces a lead time bounded by a fixed safe interval and by the requested half-period.
+
+\section{Clock-Domain Handling}
+
+The driver exposes a PTP clock whose \texttt{gettime64()} operation returns \texttt{CLOCK\_REALTIME}. This choice makes external timestamp events and periodic-output requests line up with ordinary Linux realtime values and the behavior expected by tools such as \texttt{testptp}. Internally, however, the TGPIO registers use ART-domain counter values for both capture and compare.
+
+For input events, the default realtime path constructs a device cross-timestamp context with the captured ART cycle count and the Linux ART clocksource identifier. It then calls the kernel cross-timestamp interface and uses the returned realtime value as the PTP event timestamp. The driver snapshots system time before reading the capture registers and reuses that history as a hint for the next conversion.
+
+The alternate ART mode converts ART cycles to nanoseconds using the configured or auto-detected ART frequency. This mode is useful for debugging the hardware counter scale but intentionally does not claim realtime epoch alignment. CPUID leaf \texttt{0x15} is used to detect the ART frequency when available and to report the TSC/ART ratio for diagnostics. The TSC/ART ratio is not applied to TGPIO capture values because those values are already treated as ART-domain cycles.
+
+\begin{table}[t]
+\caption{Timestamp Modes}
+\label{tab:modes}
+\centering
+\footnotesize
+\begin{tabular}{@{}p{0.30\linewidth}p{0.36\linewidth}p{0.23\linewidth}@{}}
+\toprule
+Mode & PTP event timestamp & Dependency\\
+\midrule
+poll-time debug & poll time & realtime clock\\
+realtime & ART converted to realtime & ART base clock\\
+ART raw & ART-derived nanoseconds & ART frequency\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For output events, realtime-to-ART conversion is required because the userspace request is expressed in the PTP clock domain while the hardware compare register expects ART cycles. The driver therefore verifies that Linux timekeeping exposes an ART base clock before accepting periodic-output requests. If the timekeeping relationship is unavailable, the driver fails the request rather than scheduling an edge in the wrong domain.
+
+\section{Bring-Up Lessons}
+
+Several implementation details were discovered through bring-up rather than from the initial driver outline. First, the input default was changed to rising edge. Both-edge capture can be useful for debugging, but a rising-edge default better matches common PPS and trigger workflows and avoids accidentally doubling the apparent event rate.
+
+Second, realtime timestamping and raw ART timestamping need different dependency checks. Raw ART conversion requires a frequency value, either supplied by the user or auto-detected through CPUID. Realtime conversion instead relies on Linux timekeeping's ART base-clock relationship. As a result, the driver reports CPUID frequency and ratio values for diagnostics even when realtime mode does not mathematically require the manual ART frequency scale.
+
+Third, output compare polarity on the confirmed platform did not match the names used for input edge selection. The driver therefore separates logical output polarity from input edge terminology. The normal polarity setting represents the behavior that produced the desired rising-edge output on the tested platform, while an inverted setting remains available for boards or measurement paths that invert the signal.
+
+Finally, periodic output startup required a deterministic preconditioning step. The driver first schedules an inactive logical edge before the requested first active edge. It then schedules the first active edge as logical rising and continues with hardware toggles. This avoids the ambiguous startup behavior observed when the first programmed compare transition left the signal in the opposite phase from the requested waveform.
+
+\section{Evaluation Plan}
+
+This draft does not yet include final measurement results. The evaluation should establish that the driver loads reproducibly, emits coherent external timestamp events, generates periodic output with the requested polarity, and preserves the intended relationship between realtime and ART modes.
+
+The tested platform is an ASUS ProArt Z890-CREATOR WIFI motherboard with BIOS version 3202 running Ubuntu 26.04 LTS with Linux \texttt{7.0.0-22-generic}. The default static TGPIO addresses and two-block setup were validated on that system. Table~\ref{tab:eval} lists the measurements that should be collected before submission.
+
+\begin{table*}[t]
+\caption{Planned Evaluation Measurements}
+\label{tab:eval}
+\centering
+\begin{tabular}{lll}
+\toprule
+Experiment & Method & Reported metric\\
+\midrule
+Load status & \texttt{make status}, \texttt{dmesg} & modes, PTP device\\
+Input capture & PPS or signal generator + \texttt{testptp -e} & interval error, misses\\
+Output period & \texttt{testptp -p} + oscilloscope & period error, jitter\\
+Startup phase & repeated reloads + scope trigger & first-edge correctness\\
+Timestamp mode & realtime vs. ART logs & epoch and scale behavior\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+For input timestamping, a periodic signal should be applied to an input-configured TGPIO block. The event log from \texttt{testptp} should be parsed for event-count continuity and timestamp intervals. A one-hertz input is enough to verify functional behavior, while a higher-rate input can reveal polling-related event-loss limits.
+
+For output generation, an output-configured block should be assigned with \texttt{testptp} and driven with a one-second period request. Oscilloscope captures should record the first active edge after enabling perout, steady-state period, and polarity. The same experiment should be repeated with normal and inverted polarity settings to document the sign convention.
+
+For timestamp-mode comparison, the same input signal should be captured in realtime and ART modes. The realtime mode should align with the PTP clock epoch, while the ART mode should show raw ART-derived nanoseconds. This comparison is important because the two modes answer different debugging questions and should not be interpreted interchangeably.
+
+\section{Limitations and Future Work}
+
+The current implementation is intentionally platform-specific. It requires known MMIO addresses and should only be loaded on systems where those addresses have been confirmed. A production-quality upstream driver would need robust platform discovery, ownership checks, and maintainable quirks rather than hard-coded defaults.
+
+The external timestamp path is polling-based. Polling keeps the driver compact and was sufficient for bring-up, but it creates a latency and event-loss tradeoff controlled by \texttt{poll\_ms}. An interrupt-backed capture path would be preferable for high-rate event streams or applications that need lower software latency.
+
+The PTP clock exposed by this driver is not an adjustable independent oscillator. It reports Linux realtime and uses the platform timekeeping relationship to translate between realtime and ART. This is appropriate for the driver goal, but it differs from a network interface card PHC that owns and disciplines an independent hardware clock.
+
+Future work includes validating the driver across additional platforms, replacing static addressing with a discovery or quirk mechanism, adding interrupt support where available, and evaluating whether a subset of the design is suitable for upstream Linux review.
+
+\section{Conclusion}
+
+This work shows that firmware-undeclared timed I/O hardware can be made useful through the standard Linux PTP interface. By mapping known TGPIO MMIO resources and presenting each block as a PTP external timestamp input or periodic output pin, the driver lets existing tools control hardware that would otherwise be inaccessible to userspace.
+
+The most important engineering issues are clock-domain correctness and deterministic output behavior. TGPIO capture and compare values are ART-domain cycles, while PTP userspace operates naturally in realtime. The driver addresses this with explicit timestamp modes, Linux timekeeping cross-timestamp conversion, realtime-to-ART output scheduling, and polarity-aware startup sequencing. The resulting design provides a practical bridge for measurement, synchronization, and control experiments on platforms with hidden timed I/O resources.
+
+\section*{Acknowledgment}
+
+The author acknowledges the use of OpenAI Codex for assistance with manuscript organization and drafting.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
