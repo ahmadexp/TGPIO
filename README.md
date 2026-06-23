@@ -135,6 +135,9 @@ In PHC mode:
 - External timestamp events are reported in the adjusted PHC time domain.
 - Periodic output requests are interpreted in the adjusted PHC time domain and
   converted back to ART compare values before programming hardware.
+- If a tool such as `phc2sys` steps the TGPIO PHC while periodic output is
+  active, the driver re-primes and re-arms the output in the adjusted PHC
+  domain so a stale compare value does not stop the waveform.
 
 `TIMESTAMP_MODE=art` is intended for the default realtime clock mode. In PHC
 mode, hardware input events are emitted in adjusted PHC time so that PHC tools

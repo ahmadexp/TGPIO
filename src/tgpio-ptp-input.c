@@ -1152,6 +1152,57 @@ static bool tgpio_program_output_edge(struct tgpio_state *state,
 	return true;
 }
 
+static int tgpio_prepare_output_timing(struct tgpio_state *state,
+				       u64 half_period_ns,
+				       s64 *first_edge_ns,
+				       s64 *prime_edge_ns,
+				       ktime_t *timer_start)
+{
+	s64 min_first_edge_ns;
+	s64 now_ns;
+	s64 timer_delay_clock_ns;
+	s64 timer_start_ns;
+	s64 lead_ns_s64;
+	u64 lead_ns;
+	u64 timer_delay_ns;
+	ktime_t now;
+
+	if (!tgpio_clock_now_ns(state, &now_ns))
+		return -ENODEV;
+	if (now_ns < 0)
+		return -ERANGE;
+
+	lead_ns = tgpio_output_lead_time_ns(half_period_ns);
+	if (lead_ns > S64_MAX / 3)
+		return -ERANGE;
+	lead_ns_s64 = (s64)lead_ns;
+
+	if (tgpio_add_s64_overflow(now_ns, 3 * lead_ns_s64,
+				   &min_first_edge_ns))
+		return -ERANGE;
+	if (*first_edge_ns < min_first_edge_ns)
+		*first_edge_ns = min_first_edge_ns;
+
+	if (tgpio_add_s64_overflow(*first_edge_ns, -2 * lead_ns_s64,
+				   prime_edge_ns) ||
+	    tgpio_add_s64_overflow(*first_edge_ns, -lead_ns_s64,
+				   &timer_start_ns) ||
+	    tgpio_add_s64_overflow(timer_start_ns, -now_ns,
+				   &timer_delay_clock_ns))
+		return -ERANGE;
+
+	if (!tgpio_clock_delta_to_real_ns(state, timer_delay_clock_ns,
+					  &timer_delay_ns))
+		return -ENODEV;
+
+	now = ktime_get_real();
+	*timer_start = ktime_add_ns(now, timer_delay_ns);
+	if (ktime_before(*timer_start, now))
+		*timer_start = now;
+
+	return 0;
+}
+
 static void tgpio_disable_output_hw(struct tgpio_block *block)
 {
 	u32 ctrl;
@@ -1162,6 +1213,40 @@ static void tgpio_disable_output_hw(struct tgpio_block *block)
 	tgpio_writel(block, TGPIOCTL, ctrl);
 	block->output_enabled = false;
 	block->output_phase = TGPIO_OUTPUT_TOGGLE;
+}
+
+static int tgpio_arm_output_locked(struct tgpio_state *state,
+				   struct tgpio_block *block,
+				   s64 first_edge_ns,
+				   s64 prime_edge_ns,
+				   u64 half_period_ns)
+{
+	u32 ctrl;
+
+	ctrl = tgpio_readl(block, TGPIOCTL);
+	ctrl &= ~TGPIOCTL_EN;
+	tgpio_writel(block, TGPIOCTL, ctrl);
+	tgpio_write_compv(block, 0);
+
+	ctrl &= ~(TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
+	tgpio_writel(block, TGPIOCTL, ctrl);
+
+	if (!tgpio_program_output_edge(state, block, ns_to_ktime(prime_edge_ns),
+				       tgpio_output_edge_bits(false))) {
+		tgpio_disable_output_hw(block);
+		return -ENODEV;
+	}
+
+	block->output_half_period_ns = half_period_ns;
+	block->output_next_edge = ns_to_ktime(first_edge_ns);
+	block->output_phase = TGPIO_OUTPUT_FIRST_RISING;
+	block->output_enabled = true;
+
+	ctrl = tgpio_readl(block, TGPIOCTL);
+	ctrl |= TGPIOCTL_EN;
+	tgpio_writel(block, TGPIOCTL, ctrl);
+
+	return 0;
 }
 
 static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
@@ -1227,19 +1312,12 @@ static int tgpio_config_output(struct tgpio_state *state,
 	struct tgpio_block *block;
 	int block_index;
 	s64 first_edge_ns;
-	s64 min_first_edge_ns;
-	s64 now_ns;
 	s64 prime_edge_ns;
-	s64 timer_delay_clock_ns;
-	s64 timer_start_ns;
 	ktime_t timer_start;
 	unsigned long irqflags;
 	u64 period_ns;
 	u64 half_period_ns;
-	u64 lead_ns;
-	u64 timer_delay_ns;
 	int ret;
-	u32 ctrl;
 
 	block_index = tgpio_find_block_for_channel(state, PTP_PF_PEROUT,
 						   perout->index);
@@ -1273,60 +1351,87 @@ static int tgpio_config_output(struct tgpio_state *state,
 	if (ret)
 		return ret;
 
-	if (!tgpio_clock_now_ns(state, &now_ns))
-		return -ENODEV;
-
-	lead_ns = tgpio_output_lead_time_ns(half_period_ns);
-	if (tgpio_add_s64_overflow(now_ns, 3 * lead_ns, &min_first_edge_ns))
-		return -ERANGE;
-	if (first_edge_ns < min_first_edge_ns)
-		first_edge_ns = min_first_edge_ns;
-	prime_edge_ns = first_edge_ns - 2 * lead_ns;
-	timer_start_ns = first_edge_ns - lead_ns;
-	if (tgpio_add_s64_overflow(timer_start_ns, -now_ns,
-				   &timer_delay_clock_ns))
-		return -ERANGE;
-
-	if (!tgpio_clock_delta_to_real_ns(state, timer_delay_clock_ns,
-					  &timer_delay_ns))
-		return -ENODEV;
+	ret = tgpio_prepare_output_timing(state, half_period_ns,
+					  &first_edge_ns, &prime_edge_ns,
+					  &timer_start);
+	if (ret)
+		return ret;
 
 	tgpio_disable_output(block);
 
 	spin_lock_irqsave(&block->output_lock, irqflags);
-
-	ctrl = tgpio_readl(block, TGPIOCTL);
-	ctrl &= ~TGPIOCTL_EN;
-	tgpio_writel(block, TGPIOCTL, ctrl);
-	tgpio_write_compv(block, 0);
-
-	ctrl &= ~(TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
-	tgpio_writel(block, TGPIOCTL, ctrl);
-
-	if (!tgpio_program_output_edge(state, block, ns_to_ktime(prime_edge_ns),
-				       tgpio_output_edge_bits(false))) {
-		tgpio_disable_output_hw(block);
+	ret = tgpio_arm_output_locked(state, block, first_edge_ns,
+				      prime_edge_ns, half_period_ns);
+	if (ret) {
 		spin_unlock_irqrestore(&block->output_lock, irqflags);
-		return -ENODEV;
+		return ret;
 	}
-
-	block->output_half_period_ns = half_period_ns;
-	block->output_next_edge = ns_to_ktime(first_edge_ns);
-	block->output_phase = TGPIO_OUTPUT_FIRST_RISING;
-	block->output_enabled = true;
-
-	ctrl = tgpio_readl(block, TGPIOCTL);
-	ctrl |= TGPIOCTL_EN;
-	tgpio_writel(block, TGPIOCTL, ctrl);
-
 	spin_unlock_irqrestore(&block->output_lock, irqflags);
-
-	timer_start = ktime_add_ns(ktime_get_real(), timer_delay_ns);
-	if (ktime_before(timer_start, ktime_get_real()))
-		timer_start = ktime_get_real();
 
 	hrtimer_start(&block->output_timer, timer_start, HRTIMER_MODE_ABS);
 	return 0;
+}
+
+static void tgpio_resync_outputs_after_phc_step(struct tgpio_state *state)
+{
+	unsigned int i;
+
+	if (clock_mode != TGPIO_CLOCK_PHC)
+		return;
+
+	mutex_lock(&state->lock);
+	for (i = 0; i < ARRAY_SIZE(state->blocks); i++) {
+		struct tgpio_block *block = &state->blocks[i];
+		unsigned long flags;
+		u64 half_period_ns;
+		s64 first_edge_ns = 0;
+		s64 prime_edge_ns;
+		ktime_t timer_start;
+		int ret;
+		u32 ctrl;
+
+		if (block->mode != TGPIO_MODE_OUTPUT || !block->base)
+			continue;
+
+		hrtimer_cancel(&block->output_timer);
+
+		spin_lock_irqsave(&block->output_lock, flags);
+		if (!block->output_enabled) {
+			spin_unlock_irqrestore(&block->output_lock, flags);
+			continue;
+		}
+		half_period_ns = block->output_half_period_ns;
+		ctrl = tgpio_readl(block, TGPIOCTL);
+		tgpio_write_compv(block, 0);
+		ctrl &= ~TGPIOCTL_EN;
+		tgpio_writel(block, TGPIOCTL, ctrl);
+		spin_unlock_irqrestore(&block->output_lock, flags);
+
+		ret = tgpio_prepare_output_timing(state, half_period_ns,
+						  &first_edge_ns,
+						  &prime_edge_ns,
+						  &timer_start);
+
+		spin_lock_irqsave(&block->output_lock, flags);
+		if (!block->output_enabled) {
+			spin_unlock_irqrestore(&block->output_lock, flags);
+			continue;
+		}
+		if (ret ||
+		    tgpio_arm_output_locked(state, block, first_edge_ns,
+					    prime_edge_ns, half_period_ns)) {
+			tgpio_disable_output_hw(block);
+			spin_unlock_irqrestore(&block->output_lock, flags);
+			pr_warn_ratelimited("failed to resync output block %u after PHC step\n",
+					    i);
+			continue;
+		}
+		spin_unlock_irqrestore(&block->output_lock, flags);
+
+		hrtimer_start(&block->output_timer, timer_start,
+			      HRTIMER_MODE_ABS);
+	}
+	mutex_unlock(&state->lock);
 }
 
 static int tgpio_ptp_enable(struct ptp_clock_info *ptp,
@@ -1405,6 +1510,7 @@ static int tgpio_ptp_settime64(struct ptp_clock_info *ptp,
 	state->phc.anchor_ns = ns;
 	spin_unlock_irqrestore(&state->phc.lock, flags);
 
+	tgpio_resync_outputs_after_phc_step(state);
 	return 0;
 }
 
@@ -1438,6 +1544,7 @@ static int tgpio_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
 	state->phc.anchor_ns = adjusted_ns;
 	spin_unlock_irqrestore(&state->phc.lock, flags);
 
+	tgpio_resync_outputs_after_phc_step(state);
 	return 0;
 }
 
