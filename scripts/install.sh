@@ -17,6 +17,7 @@ MODE1="${MODE1:-input}"
 EDGE0="${EDGE0:-rising}"
 EDGE1="${EDGE1:-rising}"
 TIMESTAMP_MODE="${TIMESTAMP_MODE:-realtime}"
+OUTPUT_POLARITY="${OUTPUT_POLARITY:-normal}"
 POLL_MS="${POLL_MS:-10}"
 ART_FREQUENCY="${ART_FREQUENCY:-0}"
 HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
@@ -36,7 +37,7 @@ install -m 0644 "${MODULE_PATH}" "${DEST_DIR}/${MODULE_FILE}"
 depmod "${KREL}"
 
 cat >/etc/modprobe.d/tgpio-ptp-input.conf <<EOF
-options ${MODULE_NAME} addr0=${ADDR0} addr1=${ADDR1} mmio_size=${MMIO_SIZE} use_second=${USE_SECOND} mode0=${MODE0} mode1=${MODE1} edge0=${EDGE0} edge1=${EDGE1} timestamp_mode=${TIMESTAMP_MODE} poll_ms=${POLL_MS} art_frequency=${ART_FREQUENCY} hardware_timestamps=${HARDWARE_TIMESTAMPS}
+options ${MODULE_NAME} addr0=${ADDR0} addr1=${ADDR1} mmio_size=${MMIO_SIZE} use_second=${USE_SECOND} mode0=${MODE0} mode1=${MODE1} edge0=${EDGE0} edge1=${EDGE1} timestamp_mode=${TIMESTAMP_MODE} output_polarity=${OUTPUT_POLARITY} poll_ms=${POLL_MS} art_frequency=${ART_FREQUENCY} hardware_timestamps=${HARDWARE_TIMESTAMPS}
 EOF
 
 cat >/etc/modules-load.d/tgpio-ptp-input.conf <<EOF
