@@ -31,7 +31,7 @@ mode0=input
 mode1=input
 edge0=rising
 edge1=rising
-clock_mode=realtime
+clock_mode=phc
 timestamp_mode=realtime
 output_polarity=normal
 poll_ms=10
@@ -39,23 +39,23 @@ art_frequency=0
 ```
 
 `art_frequency=0` means auto-detect the ART/crystal frequency from CPUID leaf
-`0x15` when raw ART timestamp mode needs it. Set `ART_FREQUENCY=<Hz>` to
-override it manually.
+`0x15` when PHC mode or raw ART timestamp mode needs it. Set
+`ART_FREQUENCY=<Hz>` to override it manually.
 
 CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
 `tsc_art_numerator` and `tsc_art_denominator` and shows it in `make status`.
 
-`timestamp_mode=realtime` reports hardware input captures in the same
-`CLOCK_REALTIME` timebase returned by the PTP clock. Use
-`TIMESTAMP_MODE=art` to report raw ART-cycle-derived nanoseconds instead.
+`clock_mode=phc` is the default and exposes an adjustable ART-backed PHC. In
+PHC mode the driver implements `gettime64`, `settime64`, `adjtime`, and
+`adjfine`, reports a non-zero `max_adj`, and emits hardware external timestamp
+events in the adjusted PHC time domain. This is the mode to use with tools that
+discipline a PHC from external timestamps, such as `ts2phc`.
 
-`clock_mode=realtime` keeps the PTP clock tied to Linux `CLOCK_REALTIME`, which
-is the default behavior. Use `CLOCK_MODE=phc` to expose an adjustable
-ART-backed PHC. In PHC mode the driver implements `gettime64`, `settime64`,
-`adjtime`, and `adjfine`, reports a non-zero `max_adj`, and emits hardware
-external timestamp events in the adjusted PHC time domain. This is the mode to
-use with tools that discipline a PHC from external timestamps, such as
-`ts2phc`.
+Use `CLOCK_MODE=realtime` to keep the PTP clock tied directly to Linux
+`CLOCK_REALTIME`. In realtime clock mode, `TIMESTAMP_MODE=realtime` reports
+hardware input captures in the same `CLOCK_REALTIME` timebase returned by the
+PTP clock. Use `TIMESTAMP_MODE=art` to report raw ART-cycle-derived nanoseconds
+instead.
 
 Mixed-mode examples:
 
@@ -66,7 +66,8 @@ sudo make reload MODE0=output MODE1=off
 sudo make reload MODE0=output MODE1=input EDGE1=rising
 sudo make reload MODE0=input TIMESTAMP_MODE=art
 sudo make reload MODE0=output OUTPUT_POLARITY=inverted
-sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off
+sudo make reload MODE0=input MODE1=off
+sudo make reload CLOCK_MODE=realtime MODE0=input MODE1=off
 ```
 
 `reload` unloads the add-on and reloads it with the selected modes and input
@@ -116,16 +117,16 @@ override the module default for that request.
 
 ## Adjustable PHC Mode
 
-`CLOCK_MODE=phc` creates a software-adjusted PHC backed by the platform ART
-counter. The ART counter itself is not disciplined; the driver keeps an
-adjustable PHC offset and frequency scale on top of ART. This allows tools such
-as `ts2phc` to steer the TGPIO PTP clock while the TGPIO capture/compare
-registers continue to use ART-domain hardware timestamps.
+The default `CLOCK_MODE=phc` creates a software-adjusted PHC backed by the
+platform ART counter. The ART counter itself is not disciplined; the driver
+keeps an adjustable PHC offset and frequency scale on top of ART. This allows
+tools such as `ts2phc` to steer the TGPIO PTP clock while the TGPIO
+capture/compare registers continue to use ART-domain hardware timestamps.
 
 Example load for a TGPIO external timestamp input:
 
 ```sh
-sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off EDGE0=rising
+sudo make reload MODE0=input MODE1=off EDGE0=rising
 ```
 
 In PHC mode:
@@ -139,9 +140,9 @@ In PHC mode:
   active, the driver re-primes and re-arms the output in the adjusted PHC
   domain so a stale compare value does not stop the waveform.
 
-`TIMESTAMP_MODE=art` is intended for the default realtime clock mode. In PHC
-mode, hardware input events are emitted in adjusted PHC time so that PHC tools
-see a consistent clock domain.
+`TIMESTAMP_MODE=art` is intended for explicit `CLOCK_MODE=realtime` debugging.
+In the default PHC mode, hardware input events are emitted in adjusted PHC time
+so that PHC tools see a consistent clock domain.
 
 ## Output With testptp
 

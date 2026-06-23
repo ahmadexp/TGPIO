@@ -60,9 +60,9 @@ synchronization, measurement, and control.
 1. A PTP-clock abstraction for static TGPIO MMIO blocks that firmware does not
    enumerate.
 2. Per-block mode selection: off, external timestamp input, or periodic output.
-3. Hardware timestamp handling across ART, TSC/ART CPUID metadata, and
-   CLOCK_REALTIME-compatible PTP events.
-4. Optional ART-backed adjustable PHC mode for external-reference tools such as
+3. Hardware timestamp handling across ART, TSC/ART CPUID metadata, PHC time,
+   and CLOCK_REALTIME-compatible PTP events.
+4. Default ART-backed adjustable PHC mode for external-reference tools such as
    `ts2phc`.
 5. Deterministic output startup with explicit polarity control.
 6. A reproducible bring-up workflow using standard Linux kernel and PTP user
@@ -116,7 +116,7 @@ Core design points:
 - PTP pin descriptors and channel-to-block mapping.
 - Input polling reads latched capture timestamp and event counter.
 - Output uses Linux realtime-to-ART conversion to program compare values.
-- Optional `clock_mode=phc` maintains an adjustable ART-backed PHC model for
+- Default `clock_mode=phc` maintains an adjustable ART-backed PHC model for
   tools such as `ts2phc`.
 - Safety boundaries: do not load with a separate platform driver owning the same
   hardware.
@@ -137,11 +137,12 @@ PTP perout request -> PTP clock domain -> ART compare value -> TGPIO output
 Explain the important engineering story:
 
 - Captured TGPIO values are ART-domain cycles.
-- `clock_mode=realtime` keeps the PTP clock tied to `CLOCK_REALTIME`.
-- `clock_mode=phc` exposes an ART-backed adjustable PHC for tools such as
+- Default `clock_mode=phc` exposes an ART-backed adjustable PHC for tools such as
   `ts2phc`.
-- `timestamp_mode=realtime` converts captures into `CLOCK_REALTIME` in default
-  clock mode.
+- `clock_mode=realtime` keeps the PTP clock tied to `CLOCK_REALTIME` when
+  explicitly requested.
+- `timestamp_mode=realtime` converts captures into `CLOCK_REALTIME` when
+  `clock_mode=realtime` is explicitly requested.
 - `timestamp_mode=art` preserves raw ART-derived nanoseconds for debugging or
   comparison.
 - CPUID leaf `0x15` provides ART frequency and TSC/ART ratio when available.
@@ -198,14 +199,14 @@ Measurements to collect:
    - Confirm `timestamp_mode=realtime` aligns with PTP `gettime64`.
 
 5. Adjustable PHC mode:
-   - Load with `CLOCK_MODE=phc`.
+   - Load with the default `CLOCK_MODE=phc`.
    - Use `testptp` to set, step, and frequency-adjust the PHC.
    - Use `ts2phc` with an external timestamp input to confirm the clock can be
      disciplined by linuxptp tooling.
 
 6. GPS PPS minimal-hardware timing path:
    - Connect a GPS receiver PPS output directly to a TGPIO input.
-   - Use `CLOCK_MODE=phc` and `ts2phc` to discipline the TGPIO PHC.
+   - Use the default PHC mode and `ts2phc` to discipline the TGPIO PHC.
    - Use normal Linux time tooling to make the disciplined time visible to the
      system clock.
    - Report whether stable host time is obtained without an additional timing
@@ -235,7 +236,7 @@ Be candid:
 - Static MMIO addresses must be known and platform-specific.
 - Polling detects capture events; an interrupt-backed path would reduce latency
   and event-loss risk.
-- The optional PHC mode adjusts a software clock model layered on ART rather
+- The default PHC mode adjusts a software clock model layered on ART rather
   than disciplining the ART oscillator itself.
 - This is an out-of-tree driver intended for platforms where firmware does not
   expose hardware.
