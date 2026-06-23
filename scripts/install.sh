@@ -36,9 +36,22 @@ install -d "${DEST_DIR}"
 install -m 0644 "${MODULE_PATH}" "${DEST_DIR}/${MODULE_FILE}"
 depmod "${KREL}"
 
-cat >/etc/modprobe.d/tgpio-ptp-input.conf <<EOF
-options ${MODULE_NAME} addr0=${ADDR0} addr1=${ADDR1} mmio_size=${MMIO_SIZE} use_second=${USE_SECOND} mode0=${MODE0} mode1=${MODE1} edge0=${EDGE0} edge1=${EDGE1} timestamp_mode=${TIMESTAMP_MODE} output_polarity=${OUTPUT_POLARITY} poll_ms=${POLL_MS} art_frequency=${ART_FREQUENCY} hardware_timestamps=${HARDWARE_TIMESTAMPS}
-EOF
+{
+	printf 'options %s' "${MODULE_NAME}"
+	printf ' addr0=%s' "${ADDR0}"
+	printf ' addr1=%s' "${ADDR1}"
+	printf ' mmio_size=%s' "${MMIO_SIZE}"
+	printf ' use_second=%s' "${USE_SECOND}"
+	printf ' mode0=%s' "${MODE0}"
+	printf ' mode1=%s' "${MODE1}"
+	printf ' edge0=%s' "${EDGE0}"
+	printf ' edge1=%s' "${EDGE1}"
+	printf ' timestamp_mode=%s' "${TIMESTAMP_MODE}"
+	printf ' output_polarity=%s' "${OUTPUT_POLARITY}"
+	printf ' poll_ms=%s' "${POLL_MS}"
+	printf ' art_frequency=%s' "${ART_FREQUENCY}"
+	printf ' hardware_timestamps=%s\n' "${HARDWARE_TIMESTAMPS}"
+} >/etc/modprobe.d/tgpio-ptp-input.conf
 
 cat >/etc/modules-load.d/tgpio-ptp-input.conf <<EOF
 ${MODULE_NAME}
