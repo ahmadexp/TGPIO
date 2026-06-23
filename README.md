@@ -32,6 +32,7 @@ mode1=input
 edge0=rising
 edge1=rising
 timestamp_mode=realtime
+output_polarity=normal
 poll_ms=10
 art_frequency=0
 ```
@@ -55,6 +56,7 @@ sudo make reload MODE0=input MODE1=output
 sudo make reload MODE0=output MODE1=off
 sudo make reload MODE0=output MODE1=input EDGE1=rising
 sudo make reload MODE0=input TIMESTAMP_MODE=art
+sudo make reload MODE0=output OUTPUT_POLARITY=inverted
 ```
 
 `reload` unloads the add-on and reloads it with the selected modes and input
@@ -122,6 +124,9 @@ sudo testptp -i 1 -p 1000000000 -d /dev/ptpX
 1-second period output. The driver first primes the output low, then schedules
 the first active edge as rising and continues with TGPIO toggle edges every
 half period.
+
+If your board or measurement path inverts the output, reload with
+`OUTPUT_POLARITY=inverted`.
 
 ## Persistent Install
 

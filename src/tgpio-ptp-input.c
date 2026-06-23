@@ -69,6 +69,11 @@ enum tgpio_output_phase {
 	TGPIO_OUTPUT_TOGGLE,
 };
 
+enum tgpio_output_polarity {
+	TGPIO_OUTPUT_NORMAL,
+	TGPIO_OUTPUT_INVERTED,
+};
+
 static unsigned long addr0 = 0xFE001210;
 static unsigned long addr1 = 0xFE001310;
 static unsigned int mmio_size = 0x38;
@@ -78,11 +83,13 @@ static char mode1_param[16] = "input";
 static char edge0_param[16] = "rising";
 static char edge1_param[16] = "rising";
 static char timestamp_mode_param[16] = "realtime";
+static char output_polarity_param[16] = "normal";
 static unsigned int poll_ms = 10;
 static unsigned long art_frequency;
 static unsigned int tsc_art_numerator;
 static unsigned int tsc_art_denominator;
 static enum tgpio_timestamp_mode timestamp_mode;
+static enum tgpio_output_polarity output_polarity;
 static bool hardware_timestamps = true;
 
 module_param(addr0, ulong, 0444);
@@ -113,6 +120,11 @@ module_param_string(timestamp_mode, timestamp_mode_param,
 		    sizeof(timestamp_mode_param), 0444);
 MODULE_PARM_DESC(timestamp_mode,
 		 "Hardware timestamp mode: realtime or art");
+
+module_param_string(output_polarity, output_polarity_param,
+		    sizeof(output_polarity_param), 0444);
+MODULE_PARM_DESC(output_polarity,
+		 "Periodic output polarity: normal or inverted");
 
 module_param(poll_ms, uint, 0644);
 MODULE_PARM_DESC(poll_ms, "Polling interval for captured input events");
@@ -247,6 +259,45 @@ static int tgpio_parse_timestamp_mode(const char *value,
 	}
 
 	return -EINVAL;
+}
+
+static const char *tgpio_output_polarity_name(enum tgpio_output_polarity polarity)
+{
+	switch (polarity) {
+	case TGPIO_OUTPUT_NORMAL:
+		return "normal";
+	case TGPIO_OUTPUT_INVERTED:
+		return "inverted";
+	default:
+		return "unknown";
+	}
+}
+
+static int tgpio_parse_output_polarity(const char *value,
+				       enum tgpio_output_polarity *polarity)
+{
+	if (sysfs_streq(value, "normal") ||
+	    sysfs_streq(value, "active_high")) {
+		*polarity = TGPIO_OUTPUT_NORMAL;
+		return 0;
+	}
+
+	if (sysfs_streq(value, "inverted") ||
+	    sysfs_streq(value, "invert") ||
+	    sysfs_streq(value, "active_low")) {
+		*polarity = TGPIO_OUTPUT_INVERTED;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static u32 tgpio_output_edge_bits(bool rising)
+{
+	if (output_polarity == TGPIO_OUTPUT_INVERTED)
+		return rising ? TGPIOCTL_EP_RISING : TGPIOCTL_EP_FALLING;
+
+	return rising ? TGPIOCTL_EP_FALLING : TGPIOCTL_EP_RISING;
 }
 
 static inline u32 tgpio_readl(struct tgpio_block *block, u32 offset)
@@ -725,7 +776,7 @@ static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
 
 	if (block->output_phase == TGPIO_OUTPUT_FIRST_RISING) {
 		next_edge = block->output_next_edge;
-		edge_bits = TGPIOCTL_EP_RISING;
+		edge_bits = tgpio_output_edge_bits(true);
 	} else {
 		next_edge = ktime_add_ns(block->output_next_edge,
 					 block->output_half_period_ns);
@@ -826,7 +877,7 @@ static int tgpio_config_output(struct tgpio_state *state,
 	tgpio_writel(block, TGPIOCTL, ctrl);
 
 	if (!tgpio_program_output_edge(block, prime_edge,
-				       TGPIOCTL_EP_FALLING)) {
+				       tgpio_output_edge_bits(false))) {
 		tgpio_disable_output_hw(block);
 		spin_unlock_irqrestore(&block->output_lock, irqflags);
 		return -ENODEV;
@@ -1165,6 +1216,14 @@ static int __init tgpio_input_init(void)
 		goto err_cleanup;
 	}
 
+	ret = tgpio_parse_output_polarity(output_polarity_param,
+					  &output_polarity);
+	if (ret) {
+		pr_err("invalid output_polarity=%s; use normal or inverted\n",
+		       output_polarity_param);
+		goto err_cleanup;
+	}
+
 	ret = tgpio_configure_blocks(tgpio);
 	if (ret)
 		goto err_cleanup;
@@ -1191,10 +1250,11 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
-	pr_info("loaded with mode0=%s mode1=%s timestamp_mode=%s\n",
+	pr_info("loaded with mode0=%s mode1=%s timestamp_mode=%s output_polarity=%s\n",
 		tgpio_mode_name(tgpio->blocks[0].mode),
 		tgpio_mode_name(tgpio->blocks[1].mode),
-		tgpio_timestamp_mode_name(timestamp_mode));
+		tgpio_timestamp_mode_name(timestamp_mode),
+		tgpio_output_polarity_name(output_polarity));
 	return 0;
 
 err_cleanup:
