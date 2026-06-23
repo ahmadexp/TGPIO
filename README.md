@@ -31,6 +31,7 @@ mode0=input
 mode1=input
 edge0=rising
 edge1=rising
+clock_mode=realtime
 timestamp_mode=realtime
 output_polarity=normal
 poll_ms=10
@@ -48,6 +49,14 @@ CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
 `CLOCK_REALTIME` timebase returned by the PTP clock. Use
 `TIMESTAMP_MODE=art` to report raw ART-cycle-derived nanoseconds instead.
 
+`clock_mode=realtime` keeps the PTP clock tied to Linux `CLOCK_REALTIME`, which
+is the default behavior. Use `CLOCK_MODE=phc` to expose an adjustable
+ART-backed PHC. In PHC mode the driver implements `gettime64`, `settime64`,
+`adjtime`, and `adjfine`, reports a non-zero `max_adj`, and emits hardware
+external timestamp events in the adjusted PHC time domain. This is the mode to
+use with tools that discipline a PHC from external timestamps, such as
+`ts2phc`.
+
 Mixed-mode examples:
 
 ```sh
@@ -57,6 +66,7 @@ sudo make reload MODE0=output MODE1=off
 sudo make reload MODE0=output MODE1=input EDGE1=rising
 sudo make reload MODE0=input TIMESTAMP_MODE=art
 sudo make reload MODE0=output OUTPUT_POLARITY=inverted
+sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off
 ```
 
 `reload` unloads the add-on and reloads it with the selected modes and input
@@ -103,6 +113,32 @@ sudo make reload MODE0=output MODE1=input EDGE1=both
 
 If a userspace program sends explicit PTP rising/falling edge flags, those flags
 override the module default for that request.
+
+## Adjustable PHC Mode
+
+`CLOCK_MODE=phc` creates a software-adjusted PHC backed by the platform ART
+counter. The ART counter itself is not disciplined; the driver keeps an
+adjustable PHC offset and frequency scale on top of ART. This allows tools such
+as `ts2phc` to steer the TGPIO PTP clock while the TGPIO capture/compare
+registers continue to use ART-domain hardware timestamps.
+
+Example load for a TGPIO external timestamp input:
+
+```sh
+sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off EDGE0=rising
+```
+
+In PHC mode:
+
+- `testptp -g` reads the adjusted TGPIO PHC time.
+- `testptp -s` and linuxptp adjustment calls can set or adjust the PHC.
+- External timestamp events are reported in the adjusted PHC time domain.
+- Periodic output requests are interpreted in the adjusted PHC time domain and
+  converted back to ART compare values before programming hardware.
+
+`TIMESTAMP_MODE=art` is intended for the default realtime clock mode. In PHC
+mode, hardware input events are emitted in adjusted PHC time so that PHC tools
+see a consistent clock domain.
 
 ## Output With testptp
 
@@ -176,6 +212,10 @@ In realtime mode, `art_frequency` and the TSC/ART ratio are reported for
 diagnostics when CPUID exposes them, but realtime timestamp conversion uses the
 kernel timekeeping ART base-clock relationship instead of the manual frequency
 scale.
+
+In PHC mode, `art_frequency` is required so the driver can convert between ART
+cycles and adjusted PHC nanoseconds. `ART_FREQUENCY=0` still means auto-detect
+from CPUID leaf `0x15` when the CPU reports it.
 
 The CPUID `0x15` ratio is the TSC-to-ART ratio:
 `TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for

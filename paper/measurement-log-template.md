@@ -13,6 +13,8 @@ tables and figures in the paper.
 - TGPIO module commit:
 - Oscilloscope or time interval counter:
 - Signal generator or PPS source:
+- GPS receiver model:
+- GPS PPS electrical interface/level:
 
 ## Module Load
 
@@ -127,3 +129,133 @@ Notes:
 - Realtime timestamps should align with the PTP clock epoch.
 - ART timestamps should reflect raw ART-derived nanoseconds and should not be
   interpreted as Unix epoch time.
+
+## Adjustable PHC Experiment
+
+Configuration:
+
+- Input block:
+- PTP device:
+- Input signal:
+- ART frequency:
+- CPUID TSC/ART ratio:
+- linuxptp version:
+
+Load command:
+
+```sh
+sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off EDGE0=rising
+```
+
+Basic PHC checks:
+
+```sh
+sudo testptp -d /dev/ptpX -g
+sudo testptp -d /dev/ptpX -s
+sudo testptp -d /dev/ptpX -a 1000000
+sudo testptp -d /dev/ptpX -f 1000
+```
+
+ts2phc command:
+
+```sh
+sudo ts2phc -f TODO-ts2phc.conf -m
+```
+
+Artifacts:
+
+- `paper/data/TODO-phc-testptp.log`
+- `paper/data/TODO-ts2phc.log`
+
+Metrics:
+
+- PHC set/read behavior:
+- PHC step response:
+- PHC frequency adjustment response:
+- External timestamp event continuity:
+- ts2phc offset before convergence:
+- ts2phc offset after convergence:
+
+## GPS PPS Minimal-Hardware Experiment
+
+Configuration:
+
+- GPS receiver model:
+- GPS antenna/location:
+- PPS electrical level:
+- TGPIO input block:
+- PTP device:
+- System clock tool:
+- linuxptp version:
+
+Load command:
+
+```sh
+sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off EDGE0=rising
+```
+
+External timestamp setup:
+
+```sh
+sudo testptp -i 0 -L 0,1 -d /dev/ptpX
+```
+
+ts2phc command:
+
+```sh
+sudo ts2phc -f TODO-gps-tgpio-ts2phc.conf -m
+```
+
+System-time command:
+
+```sh
+sudo phc2sys -s /dev/ptpX -c CLOCK_REALTIME -m
+```
+
+Artifacts:
+
+- `paper/data/TODO-gps-testptp.log`
+- `paper/data/TODO-gps-ts2phc.log`
+- `paper/data/TODO-gps-phc2sys.log`
+
+Metrics:
+
+- PPS event continuity:
+- ts2phc convergence time:
+- TGPIO PHC offset after convergence:
+- CLOCK_REALTIME offset after phc2sys convergence:
+- CPU load:
+- Extra timing hardware used:
+
+## TSN OS Participation Experiment
+
+Configuration:
+
+- Timing source:
+- TGPIO PHC:
+- OS clock:
+- TSN stack/tools:
+- Network interface:
+- NIC hardware timestamping support:
+- Traffic scheduling mechanism:
+
+Timing setup:
+
+```sh
+sudo ts2phc -f TODO-gps-tgpio-ts2phc.conf -m
+sudo phc2sys -s /dev/ptpX -c CLOCK_REALTIME -m
+```
+
+Artifacts:
+
+- `paper/data/TODO-tsn-phc2sys.log`
+- `paper/data/TODO-tsn-os-clock.log`
+- `paper/data/TODO-tsn-application.log`
+
+Metrics:
+
+- OS clock offset relative to TGPIO PHC:
+- OS clock offset relative to GPS PPS:
+- Host-side timestamp error:
+- TSN application timing error:
+- NIC-specific limitations:
