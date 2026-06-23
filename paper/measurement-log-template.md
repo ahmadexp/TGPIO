@@ -144,7 +144,7 @@ Configuration:
 Load command:
 
 ```sh
-sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off EDGE0=rising
+sudo make reload MODE0=input MODE1=off EDGE0=rising
 ```
 
 Basic PHC checks:
@@ -191,7 +191,7 @@ Configuration:
 Load command:
 
 ```sh
-sudo make reload CLOCK_MODE=phc MODE0=input MODE1=off EDGE0=rising
+sudo make reload MODE0=input MODE1=off EDGE0=rising
 ```
 
 External timestamp setup:
