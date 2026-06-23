@@ -2,10 +2,11 @@
 
 Working title:
 
-> Time-Aware GPIO as a Linux PTP Clock
+> A Comprehensive Linux PTP Driver for Time-Aware GPIO
 
 Alternative titles:
 
+- Time-Aware GPIO as a Linux PTP Clock
 - A Linux PTP Interface for Firmware-Undeclared Intel Time-Aware GPIO Blocks
 - Practical Timed GPIO Capture and Generation Using ART-Domain Hardware Counters
 - Recovering Platform Timed I/O Functionality Through a PTP-Centric Linux Driver
