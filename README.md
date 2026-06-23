@@ -37,7 +37,8 @@ art_frequency=0
 ```
 
 `art_frequency=0` means auto-detect the ART/crystal frequency from CPUID leaf
-`0x15`. Set `ART_FREQUENCY=<Hz>` to override it manually.
+`0x15` when raw ART timestamp mode needs it. Set `ART_FREQUENCY=<Hz>` to
+override it manually.
 
 CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
 `tsc_art_numerator` and `tsc_art_denominator` and shows it in `make status`.
@@ -165,6 +166,11 @@ auto-detects the ART/crystal frequency from CPUID leaf `0x15`. If the CPU does
 not report it, load with `ART_FREQUENCY=<Hz>` manually, for example
 `ART_FREQUENCY=25000000`. Set `HARDWARE_TIMESTAMPS=0` to emit poll time instead
 of hardware capture time while debugging.
+
+In realtime mode, `art_frequency` and the TSC/ART ratio are reported for
+diagnostics when CPUID exposes them, but realtime timestamp conversion uses the
+kernel timekeeping ART base-clock relationship instead of the manual frequency
+scale.
 
 The CPUID `0x15` ratio is the TSC-to-ART ratio:
 `TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for
