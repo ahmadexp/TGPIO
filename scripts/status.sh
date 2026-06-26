@@ -19,7 +19,8 @@ done
 echo
 echo "== tgpio parameters =="
 for param in clock_mode timestamp_mode output_polarity art_frequency \
-	tsc_art_numerator tsc_art_denominator hardware_timestamps; do
+	tsc_art_numerator tsc_art_denominator hardware_timestamps \
+	hardware_periodic_output; do
 	path="/sys/module/tgpio_ptp_input/parameters/${param}"
 	[ -r "${path}" ] || continue
 	printf '%s=%s\n' "${param}" "$(cat "${path}")"

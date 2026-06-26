@@ -55,7 +55,7 @@ The main contributions of this work are:
 
 Linux exposes hardware-assisted precision timing through the PHC subsystem. A PHC driver registers a \texttt{struct ptp\_clock\_info}, implements operations such as \texttt{gettime64()} and \texttt{enable()}, and advertises ancillary features including external timestamp channels and periodic outputs. Userspace configures those features through the PTP character device interface. For this work, the key pin functions are \texttt{PTP\_PF\_EXTTS}, which emits timestamped edge events, and \texttt{PTP\_PF\_PEROUT}, which requests a periodic output signal \cite{linux-ptp-docs,linux-ptp-header}.
 
-The PHC interface is a good boundary for TGPIO because it avoids inventing a new control plane for a timing device. It also allows the driver to interoperate with existing test and measurement programs. In the implementation described here, the registered clock reports the name Intel TGPIO; the PTP clock's time-read operation returns realtime; and pin assignment controls which physical TGPIO block is used for external timestamp input or periodic output.
+The PHC interface is a good boundary for TGPIO because it avoids inventing a new control plane for a timing device. It also allows the driver to interoperate with existing test and measurement programs. In the implementation described here, the registered clock reports the name Intel TGPIO; the PTP clock's time-read operation returns adjusted PHC time by default or realtime in explicit realtime mode; and pin assignment controls which physical TGPIO block is used for external timestamp input or periodic output.
 
 \subsection{ART, TSC, and Cross Timestamps}
 
@@ -123,9 +123,9 @@ When the event count changes, the driver emits a PTP external timestamp event th
 
 \subsection{Periodic Output}
 
-For output mode, a PTP periodic-output request supplies a start time and period in the PTP clock's time domain. The driver rejects unsupported perout flags, validates the period, computes a half-period, and requires that Linux timekeeping expose an ART base clock. It then converts each scheduled PTP-clock edge into an ART compare value before programming the hardware.
+For output mode, a PTP periodic-output request supplies a start time and period in the PTP clock's time domain. The driver rejects unsupported perout flags, validates the period, computes a half-period, and requires that Linux timekeeping expose an ART base clock. It then converts the requested start time into an ART compare value and the requested half-period into an ART interval value before programming the hardware.
 
-The output path programs an initial preconditioning edge before enabling steady toggling. The first active edge is treated as logical rising; later edges are programmed as hardware toggles separated by half the requested period. A high-resolution timer periodically advances the next compare value. To avoid programming an edge too close to the current time, the driver enforces a lead time bounded by a fixed safe interval and by the requested half-period.
+The output path programs an initial preconditioning edge before enabling steady toggling. The first active edge is treated as logical rising. By default, steady-state output uses the TGPIO hardware periodic feature: the comparator register holds the first active edge, the periodic interval register holds the half-period in ART cycles, and the periodic-mode bit lets hardware generate subsequent toggle transitions without software reprogramming each edge. The earlier high-resolution timer re-arm path remains available as a fallback. To avoid programming an edge too close to the current time, the driver enforces a lead time before arming the first active transition.
 
 \section{Clock-Domain Handling}
 
@@ -152,17 +152,17 @@ PHC & adjusted PHC time & ART frequency\\
 \end{tabular}
 \end{table}
 
-For output events, clock-to-ART conversion is required because the userspace request is expressed in the PTP clock domain while the hardware compare register expects ART cycles. In realtime mode this conversion uses Linux timekeeping's realtime-to-ART relationship. In PHC mode it uses the driver's adjusted PHC offset and frequency scale. If the required timekeeping relationship is unavailable, the driver fails the request rather than scheduling an edge in the wrong domain.
+For output events, clock-to-ART conversion is required because the userspace request is expressed in the PTP clock domain while the hardware compare and interval registers expect ART cycles. In realtime mode, absolute edge-time conversion uses Linux timekeeping's realtime-to-ART relationship. In PHC mode it uses the driver's adjusted PHC offset and frequency scale. Hardware periodic output also requires the ART frequency so the requested interval can be programmed into the periodic interval register. If the required timekeeping relationship or frequency is unavailable, the driver fails the request rather than scheduling an edge in the wrong domain.
 
 \section{Bring-Up Lessons}
 
 Several implementation details were discovered through bring-up rather than from the initial driver outline. First, the input default was changed to rising edge. Both-edge capture can be useful for debugging, but a rising-edge default better matches common PPS and trigger workflows and avoids accidentally doubling the apparent event rate.
 
-Second, realtime timestamping and raw ART timestamping need different dependency checks. Raw ART conversion requires a frequency value, either supplied by the user or auto-detected through CPUID. Realtime conversion instead relies on Linux timekeeping's ART base-clock relationship. As a result, the driver reports CPUID frequency and ratio values for diagnostics even when realtime mode does not mathematically require the manual ART frequency scale.
+Second, realtime timestamping, raw ART timestamping, and hardware periodic output need different dependency checks. Raw ART conversion and hardware periodic intervals require a frequency value, either supplied by the user or auto-detected through CPUID. Realtime timestamp conversion instead relies on Linux timekeeping's ART base-clock relationship. As a result, the driver reports CPUID frequency and ratio values for diagnostics even when a particular realtime-only input configuration does not mathematically require the manual ART frequency scale.
 
 Third, output compare polarity on the confirmed platform did not match the names used for input edge selection. The driver therefore separates logical output polarity from input edge terminology. The normal polarity setting represents the behavior that produced the desired rising-edge output on the tested platform, while an inverted setting remains available for boards or measurement paths that invert the signal.
 
-Finally, periodic output startup required a deterministic preconditioning step. The driver first schedules an inactive logical edge before the requested first active edge. It then schedules the first active edge as logical rising and continues with hardware toggles. This avoids the ambiguous startup behavior observed when the first programmed compare transition left the signal in the opposite phase from the requested waveform.
+Finally, periodic output startup required a deterministic preconditioning step. The driver first schedules an inactive logical edge before the requested first active edge. It then arms hardware periodic mode so the first active transition is a logical rising edge and the hardware continues with toggles separated by the programmed interval. This avoids the ambiguous startup behavior observed when the first programmed compare transition left the signal in the opposite phase from the requested waveform, while allowing steady-state transitions faster than software could reliably schedule.
 
 \section{Evaluation Plan}
 

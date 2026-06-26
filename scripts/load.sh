@@ -18,6 +18,7 @@ OUTPUT_POLARITY="${OUTPUT_POLARITY:-normal}"
 POLL_MS="${POLL_MS:-10}"
 ART_FREQUENCY="${ART_FREQUENCY:-0}"
 HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
+HARDWARE_PERIODIC_OUTPUT="${HARDWARE_PERIODIC_OUTPUT:-1}"
 
 tgpio_input_loaded()
 {
@@ -69,6 +70,7 @@ insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	edge0="${EDGE0}" edge1="${EDGE1}" clock_mode="${CLOCK_MODE}" \
 	timestamp_mode="${TIMESTAMP_MODE}" \
 	output_polarity="${OUTPUT_POLARITY}" poll_ms="${POLL_MS}" \
-	art_frequency="${ART_FREQUENCY}" hardware_timestamps="${HARDWARE_TIMESTAMPS}"
+	art_frequency="${ART_FREQUENCY}" hardware_timestamps="${HARDWARE_TIMESTAMPS}" \
+	hardware_periodic_output="${HARDWARE_PERIODIC_OUTPUT}"
 
 "${SCRIPT_DIR}/status.sh"
