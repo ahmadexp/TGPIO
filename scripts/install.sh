@@ -22,6 +22,7 @@ OUTPUT_POLARITY="${OUTPUT_POLARITY:-normal}"
 POLL_MS="${POLL_MS:-10}"
 ART_FREQUENCY="${ART_FREQUENCY:-0}"
 HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
+HARDWARE_PERIODIC_OUTPUT="${HARDWARE_PERIODIC_OUTPUT:-1}"
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "Run as root: sudo $0" >&2
@@ -52,7 +53,8 @@ depmod "${KREL}"
 	printf ' output_polarity=%s' "${OUTPUT_POLARITY}"
 	printf ' poll_ms=%s' "${POLL_MS}"
 	printf ' art_frequency=%s' "${ART_FREQUENCY}"
-	printf ' hardware_timestamps=%s\n' "${HARDWARE_TIMESTAMPS}"
+	printf ' hardware_timestamps=%s' "${HARDWARE_TIMESTAMPS}"
+	printf ' hardware_periodic_output=%s\n' "${HARDWARE_PERIODIC_OUTPUT}"
 } >/etc/modprobe.d/tgpio-ptp-input.conf
 
 cat >/etc/modules-load.d/tgpio-ptp-input.conf <<EOF

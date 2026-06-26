@@ -36,11 +36,12 @@ timestamp_mode=realtime
 output_polarity=normal
 poll_ms=10
 art_frequency=0
+hardware_periodic_output=Y
 ```
 
 `art_frequency=0` means auto-detect the ART/crystal frequency from CPUID leaf
-`0x15` when PHC mode or raw ART timestamp mode needs it. Set
-`ART_FREQUENCY=<Hz>` to override it manually.
+`0x15` when PHC mode, hardware periodic output, or raw ART timestamp mode needs
+it. Set `ART_FREQUENCY=<Hz>` to override it manually.
 
 CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
 `tsc_art_numerator` and `tsc_art_denominator` and shows it in `make status`.
@@ -66,6 +67,7 @@ sudo make reload MODE0=output MODE1=off
 sudo make reload MODE0=output MODE1=input EDGE1=rising
 sudo make reload MODE0=input TIMESTAMP_MODE=art
 sudo make reload MODE0=output OUTPUT_POLARITY=inverted
+sudo make reload MODE0=output HARDWARE_PERIODIC_OUTPUT=0
 sudo make reload MODE0=input MODE1=off
 sudo make reload CLOCK_MODE=realtime MODE0=input MODE1=off
 ```
@@ -161,9 +163,18 @@ sudo testptp -i 1 -p 1000000000 -d /dev/ptpX
 ```
 
 `-L pin,2` assigns the pin to periodic output. `-p 1000000000` starts a
-1-second period output. The driver first primes the output low, then schedules
-the first active edge as rising and continues with TGPIO toggle edges every
-half period.
+1-second period output. By default, the driver first primes the output low,
+then arms TGPIO hardware periodic mode: `COMPV` holds the first active edge,
+`PIV` holds the half-period in ART cycles, and `TGPIOCTL.PM` lets hardware
+generate the steady toggle edges. This avoids reprogramming every transition
+from software and supports faster periodic transitions than the hrtimer re-arm
+path can reliably sustain.
+
+Use `HARDWARE_PERIODIC_OUTPUT=0` to return to the older software re-arm path:
+
+```sh
+sudo make reload MODE0=output HARDWARE_PERIODIC_OUTPUT=0
+```
 
 If your board or measurement path inverts the output, reload with
 `OUTPUT_POLARITY=inverted`.
@@ -220,6 +231,11 @@ scale.
 In PHC mode, `art_frequency` is required so the driver can convert between ART
 cycles and adjusted PHC nanoseconds. `ART_FREQUENCY=0` still means auto-detect
 from CPUID leaf `0x15` when the CPU reports it.
+
+Hardware periodic output also requires `art_frequency`, because the TGPIO
+periodic interval register is programmed in ART cycles. If CPUID does not
+report the crystal frequency, set `ART_FREQUENCY=<Hz>` manually or load with
+`HARDWARE_PERIODIC_OUTPUT=0` to use the software re-arm fallback.
 
 The CPUID `0x15` ratio is the TSC-to-ART ratio:
 `TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for

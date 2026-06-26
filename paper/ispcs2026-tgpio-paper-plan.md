@@ -103,8 +103,8 @@ Cover briefly:
 - Linux PTP clock API: `PTP_PF_EXTTS`, `PTP_PF_PEROUT`, pin assignment,
   `testptp`.
 - Intel ART/TSC relationship and CPUID leaf `0x15`.
-- TGPIO register model used by this driver: control, compare, capture timestamp,
-  event count.
+- TGPIO register model used by this driver: control, compare, periodic interval,
+  capture timestamp, event count.
 - Problem with firmware enumeration gaps.
 
 ### 3. Driver Design
@@ -115,7 +115,8 @@ Core design points:
 - Per-block mode parsing.
 - PTP pin descriptors and channel-to-block mapping.
 - Input polling reads latched capture timestamp and event counter.
-- Output uses Linux realtime-to-ART conversion to program compare values.
+- Output uses clock-to-ART conversion to program compare values and ART
+  frequency conversion to program hardware periodic interval values.
 - Default `clock_mode=phc` maintains an adjustable ART-backed PHC model for
   tools such as `ts2phc`.
 - Safety boundaries: do not load with a separate platform driver owning the same
@@ -169,6 +170,8 @@ Use this section to make the paper valuable rather than just descriptive:
 - Output polarity on the confirmed platform required treating output compare
   polarity separately from input edge names.
 - Output startup required a preconditioning step before the first active edge.
+- Hardware periodic output avoids software reprogramming for every steady-state
+  transition; the hrtimer path remains a fallback.
 
 Suggested figure:
 
@@ -193,6 +196,8 @@ Measurements to collect:
    - Measure rising edge phase and period on an oscilloscope or time interval
      counter.
    - Compare `OUTPUT_POLARITY=normal` and `OUTPUT_POLARITY=inverted`.
+   - Repeat with `HARDWARE_PERIODIC_OUTPUT=0` to compare hardware periodic and
+     software re-arm behavior.
 
 4. Realtime versus raw ART mode:
    - Show how timestamps differ in epoch/scale.
