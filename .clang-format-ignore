@@ -1,0 +1,3 @@
+# Files clang-format must not touch.
+# TRACE_EVENT is a macro DSL, not normal C; clang-format mangles its layout.
+src/tgpio-trace.h
