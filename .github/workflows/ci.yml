@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Fast gate: formatting + whitespace hygiene. No kernel headers needed.
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install pre-commit
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  # Build the module against kernel-devel and run the kernel analysers.
+  # The in-tree LINUX_VERSION_CODE shim handles whichever API era the image's
+  # kernel exposes, so this tracks a moving kernel rather than pinning 7.0/7.2.
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: >
+          dnf -y install kernel-devel gcc make bc flex bison
+          elfutils-libelf-devel openssl-devel perl diffutils python3
+
+      - name: Build module
+        run: |
+          KDIR=$(ls -d /usr/src/kernels/* | sort -V | tail -1)
+          test -n "$KDIR" || { echo "no kernel-devel found"; exit 1; }
+          echo "Building against $(basename "$KDIR")"
+          make -C "$KDIR" M="$PWD/src" modules
+
+      # Runs from the repo root, so checkpatch picks up .checkpatch.conf, which
+      # carries the three justified --ignore types (documented there).
+      - name: checkpatch
+        run: |
+          KDIR=$(ls -d /usr/src/kernels/* | sort -V | tail -1)
+          perl "$KDIR/scripts/checkpatch.pl" --no-tree --terse \
+            -f src/tgpio-ptp-input.c src/tgpio-trace.h
+
+      # Advisory: kernel headers trip a few of these without being real defects.
+      - name: sparse
+        continue-on-error: true
+        run: |
+          dnf -y install sparse
+          KDIR=$(ls -d /usr/src/kernels/* | sort -V | tail -1)
+          make -C "$KDIR" M="$PWD/src" C=2 modules
+
+      - name: clang-tidy
+        continue-on-error: true
+        run: |
+          dnf -y install clang-tools-extra
+          KDIR=$(ls -d /usr/src/kernels/* | sort -V | tail -1)
+          make -C "$KDIR" M="$PWD/src" modules
+          python3 "$KDIR/scripts/clang-tools/gen_compile_commands.py" -d "$PWD/src" || true
+          clang-tidy -p "$PWD/src" src/tgpio-ptp-input.c
