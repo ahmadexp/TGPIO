@@ -378,47 +378,43 @@ static const char *tgpio_mode_name(enum tgpio_mode mode)
 	}
 }
 
-static int tgpio_parse_mode(const char *value, enum tgpio_mode *mode)
+struct tgpio_mode_result {
+	enum tgpio_status status;
+	enum tgpio_mode mode;
+};
+
+static struct tgpio_mode_result tgpio_parse_mode(const char *value)
 {
-	if (sysfs_streq(value, "input") || sysfs_streq(value, "in")) {
-		*mode = TGPIO_MODE_INPUT;
-		return 0;
-	}
-
+	if (sysfs_streq(value, "input") || sysfs_streq(value, "in"))
+		return (struct tgpio_mode_result){ TGPIO_OK, TGPIO_MODE_INPUT };
 	if (sysfs_streq(value, "output") || sysfs_streq(value, "out") ||
-	    sysfs_streq(value, "pps")) {
-		*mode = TGPIO_MODE_OUTPUT;
-		return 0;
-	}
-
+	    sysfs_streq(value, "pps"))
+		return (struct tgpio_mode_result){ TGPIO_OK,
+						   TGPIO_MODE_OUTPUT };
 	if (sysfs_streq(value, "off") || sysfs_streq(value, "none") ||
-	    sysfs_streq(value, "disabled")) {
-		*mode = TGPIO_MODE_OFF;
-		return 0;
-	}
-
-	return -EINVAL;
+	    sysfs_streq(value, "disabled"))
+		return (struct tgpio_mode_result){ TGPIO_OK, TGPIO_MODE_OFF };
+	return (struct tgpio_mode_result){ .status = TGPIO_E_INVAL };
 }
 
-static int tgpio_parse_edge(const char *value, u32 *edge_bits)
+struct tgpio_edge_result {
+	enum tgpio_status status;
+	u32 edge_bits;
+};
+
+static struct tgpio_edge_result tgpio_parse_edge(const char *value)
 {
-	if (sysfs_streq(value, "rising") || sysfs_streq(value, "rise")) {
-		*edge_bits = TGPIOCTL_EP_RISING;
-		return 0;
-	}
-
-	if (sysfs_streq(value, "falling") || sysfs_streq(value, "fall")) {
-		*edge_bits = TGPIOCTL_EP_FALLING;
-		return 0;
-	}
-
+	if (sysfs_streq(value, "rising") || sysfs_streq(value, "rise"))
+		return (struct tgpio_edge_result){ TGPIO_OK,
+						   TGPIOCTL_EP_RISING };
+	if (sysfs_streq(value, "falling") || sysfs_streq(value, "fall"))
+		return (struct tgpio_edge_result){ TGPIO_OK,
+						   TGPIOCTL_EP_FALLING };
 	if (sysfs_streq(value, "both") || sysfs_streq(value, "toggle") ||
-	    sysfs_streq(value, "all")) {
-		*edge_bits = TGPIOCTL_EP_TOGGLE;
-		return 0;
-	}
-
-	return -EINVAL;
+	    sysfs_streq(value, "all"))
+		return (struct tgpio_edge_result){ TGPIO_OK,
+						   TGPIOCTL_EP_TOGGLE };
+	return (struct tgpio_edge_result){ .status = TGPIO_E_INVAL };
 }
 
 static const char *tgpio_clock_mode_name(enum tgpio_clock_mode mode)
@@ -433,23 +429,22 @@ static const char *tgpio_clock_mode_name(enum tgpio_clock_mode mode)
 	}
 }
 
-static int tgpio_parse_clock_mode(const char *value,
-				  enum tgpio_clock_mode *mode)
+struct tgpio_clock_mode_result {
+	enum tgpio_status status;
+	enum tgpio_clock_mode mode;
+};
+
+static struct tgpio_clock_mode_result tgpio_parse_clock_mode(const char *value)
 {
 	if (sysfs_streq(value, "realtime") ||
-	    sysfs_streq(value, "clock_realtime") ||
-	    sysfs_streq(value, "real")) {
-		*mode = TGPIO_CLOCK_REALTIME;
-		return 0;
-	}
-
+	    sysfs_streq(value, "clock_realtime") || sysfs_streq(value, "real"))
+		return (struct tgpio_clock_mode_result){ TGPIO_OK,
+							 TGPIO_CLOCK_REALTIME };
 	if (sysfs_streq(value, "phc") || sysfs_streq(value, "adjustable") ||
-	    sysfs_streq(value, "adjusted")) {
-		*mode = TGPIO_CLOCK_PHC;
-		return 0;
-	}
-
-	return -EINVAL;
+	    sysfs_streq(value, "adjusted"))
+		return (struct tgpio_clock_mode_result){ TGPIO_OK,
+							 TGPIO_CLOCK_PHC };
+	return (struct tgpio_clock_mode_result){ .status = TGPIO_E_INVAL };
 }
 
 static const char *tgpio_timestamp_mode_name(enum tgpio_timestamp_mode mode)
@@ -464,22 +459,24 @@ static const char *tgpio_timestamp_mode_name(enum tgpio_timestamp_mode mode)
 	}
 }
 
-static int tgpio_parse_timestamp_mode(const char *value,
-				      enum tgpio_timestamp_mode *mode)
+struct tgpio_timestamp_mode_result {
+	enum tgpio_status status;
+	enum tgpio_timestamp_mode mode;
+};
+
+static struct tgpio_timestamp_mode_result
+tgpio_parse_timestamp_mode(const char *value)
 {
 	if (sysfs_streq(value, "realtime") ||
-	    sysfs_streq(value, "clock_realtime") ||
-	    sysfs_streq(value, "real")) {
-		*mode = TGPIO_TIMESTAMP_REALTIME;
-		return 0;
-	}
-
-	if (sysfs_streq(value, "art") || sysfs_streq(value, "raw")) {
-		*mode = TGPIO_TIMESTAMP_ART;
-		return 0;
-	}
-
-	return -EINVAL;
+	    sysfs_streq(value, "clock_realtime") || sysfs_streq(value, "real"))
+		return (struct tgpio_timestamp_mode_result){
+			TGPIO_OK, TGPIO_TIMESTAMP_REALTIME
+		};
+	if (sysfs_streq(value, "art") || sysfs_streq(value, "raw"))
+		return (struct tgpio_timestamp_mode_result){
+			TGPIO_OK, TGPIO_TIMESTAMP_ART
+		};
+	return (struct tgpio_timestamp_mode_result){ .status = TGPIO_E_INVAL };
 }
 
 static const char *
@@ -495,21 +492,24 @@ tgpio_output_polarity_name(enum tgpio_output_polarity polarity)
 	}
 }
 
-static int tgpio_parse_output_polarity(const char *value,
-				       enum tgpio_output_polarity *polarity)
+struct tgpio_output_polarity_result {
+	enum tgpio_status status;
+	enum tgpio_output_polarity polarity;
+};
+
+static struct tgpio_output_polarity_result
+tgpio_parse_output_polarity(const char *value)
 {
-	if (sysfs_streq(value, "normal") || sysfs_streq(value, "active_high")) {
-		*polarity = TGPIO_OUTPUT_NORMAL;
-		return 0;
-	}
-
+	if (sysfs_streq(value, "normal") || sysfs_streq(value, "active_high"))
+		return (struct tgpio_output_polarity_result){
+			TGPIO_OK, TGPIO_OUTPUT_NORMAL
+		};
 	if (sysfs_streq(value, "inverted") || sysfs_streq(value, "invert") ||
-	    sysfs_streq(value, "active_low")) {
-		*polarity = TGPIO_OUTPUT_INVERTED;
-		return 0;
-	}
-
-	return -EINVAL;
+	    sysfs_streq(value, "active_low"))
+		return (struct tgpio_output_polarity_result){
+			TGPIO_OK, TGPIO_OUTPUT_INVERTED
+		};
+	return (struct tgpio_output_polarity_result){ .status = TGPIO_E_INVAL };
 }
 
 static u32 tgpio_output_edge_bits(enum tgpio_logical_edge edge)
@@ -2096,19 +2096,22 @@ static int tgpio_configure_mmio_blocks(struct tgpio_device *dev)
 		hrtimer_setup(&mmio_block->output_timer, tgpio_output_timer,
 			      CLOCK_REALTIME, HRTIMER_MODE_ABS);
 
-		ret = tgpio_parse_mode(modes[i], &mmio_block->mode);
-		if (ret) {
+		struct tgpio_mode_result mode = tgpio_parse_mode(modes[i]);
+		struct tgpio_edge_result edge = tgpio_parse_edge(edges[i]);
+
+		if (mode.status < 0) {
 			pr_err("invalid mode%u=%s; use input, output, or off\n",
 			       i, modes[i]);
-			return ret;
+			return mode.status;
 		}
+		mmio_block->mode = mode.mode;
 
-		ret = tgpio_parse_edge(edges[i], &mmio_block->input_edge_bits);
-		if (ret) {
+		if (edge.status < 0) {
 			pr_err("invalid edge%u=%s; use rising, falling, or both\n",
 			       i, edges[i]);
-			return ret;
+			return edge.status;
 		}
+		mmio_block->input_edge_bits = edge.edge_bits;
 	}
 
 	if (!use_second)
@@ -2342,6 +2345,9 @@ static void tgpio_observability_exit(void)
 
 static int __init tgpio_input_init(void)
 {
+	struct tgpio_clock_mode_result clock;
+	struct tgpio_timestamp_mode_result timestamp;
+	struct tgpio_output_polarity_result polarity;
 	int ret;
 
 	if (!mmio_size)
@@ -2353,27 +2359,32 @@ static int __init tgpio_input_init(void)
 
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
 
-	ret = tgpio_parse_clock_mode(clock_mode_param, &clock_mode);
-	if (ret) {
+	clock = tgpio_parse_clock_mode(clock_mode_param);
+	if (clock.status < 0) {
 		pr_err("invalid clock_mode=%s; use realtime or phc\n",
 		       clock_mode_param);
+		ret = clock.status;
 		goto err_cleanup;
 	}
+	clock_mode = clock.mode;
 
-	ret = tgpio_parse_timestamp_mode(timestamp_mode_param, &timestamp_mode);
-	if (ret) {
+	timestamp = tgpio_parse_timestamp_mode(timestamp_mode_param);
+	if (timestamp.status < 0) {
 		pr_err("invalid timestamp_mode=%s; use realtime or art\n",
 		       timestamp_mode_param);
+		ret = timestamp.status;
 		goto err_cleanup;
 	}
+	timestamp_mode = timestamp.mode;
 
-	ret = tgpio_parse_output_polarity(output_polarity_param,
-					  &output_polarity);
-	if (ret) {
+	polarity = tgpio_parse_output_polarity(output_polarity_param);
+	if (polarity.status < 0) {
 		pr_err("invalid output_polarity=%s; use normal or inverted\n",
 		       output_polarity_param);
+		ret = polarity.status;
 		goto err_cleanup;
 	}
+	output_polarity = polarity.polarity;
 
 	ret = tgpio_configure_mmio_blocks(tgpio);
 	if (ret)
