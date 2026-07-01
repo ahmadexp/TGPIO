@@ -392,7 +392,7 @@ static struct tgpio_mode_result tgpio_parse_mode(const char *value)
 		return (struct tgpio_mode_result){ TGPIO_OK,
 						   TGPIO_MODE_OUTPUT };
 	if (sysfs_streq(value, "off") || sysfs_streq(value, "none") ||
-	    sysfs_streq(value, "disabled"))
+	    sysfs_streq(value, "disable") || sysfs_streq(value, "disabled"))
 		return (struct tgpio_mode_result){ TGPIO_OK, TGPIO_MODE_OFF };
 	return (struct tgpio_mode_result){ .status = TGPIO_E_INVAL };
 }
