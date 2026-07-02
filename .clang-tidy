@@ -1,0 +1,34 @@
+---
+# clang-tidy for the TGPIO out-of-tree kernel module.
+#
+# Needs a compile_commands.json with the kernel include paths, so it runs in CI
+# against the module build, not in the local pre-commit hook. Formatting is
+# owned by .clang-format; this is purely the bug/analysis pass (the clang-tidy
+# analog of `cargo clippy`).
+#
+# Disabled checks are either C++-only, kernel-hostile (the kernel has its own
+# idioms for these), or pure noise on driver code.
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-narrowing-conversions,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -cert-err33-c,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -misc-unused-parameters,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+
+# Advisory, not a hard gate: kernel headers trip a few analyzer checks that are
+# not real defects in driver code. CI reports them; it does not fail the build.
+WarningsAsErrors: ''
+HeaderFilterRegex: 'tgpio'
+FormatStyle: file
+...
