@@ -45,14 +45,14 @@ jobs:
           perl "$KDIR/scripts/checkpatch.pl" --no-tree --terse \
             -f src/tgpio-ptp-input.c src/tgpio-trace.h
 
-      # Advisory: kernel headers trip a few of these without being real defects.
       - name: sparse
-        continue-on-error: true
         run: |
           dnf -y install sparse
           KDIR=$(ls -d /usr/src/kernels/* | sort -V | tail -1)
           make -C "$KDIR" M="$PWD/src" C=2 modules
 
+      # Advisory: kernel headers can trip a few analyzer checks that are not real
+      # defects in driver code.
       - name: clang-tidy
         continue-on-error: true
         run: |

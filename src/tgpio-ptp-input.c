@@ -19,6 +19,7 @@
 #include <linux/debugfs.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/kobject.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
@@ -89,6 +90,7 @@ tgpio_get_realtime_snapshot(struct system_time_snapshot *snapshot)
 #define TGPIO_CPUID_ART_LEAF	  0x15
 #define TGPIO_PHC_MAX_ADJ_PPB	  100000000L
 #define TGPIO_MIN_POLL_MS	  1u
+#define TGPIO_MIN_MMIO_SIZE	  0x38u
 #define TGPIO_INPUT_DESIRED_ON	  BIT(1) /* edge bits live in TGPIOCTL_EP */
 
 enum tgpio_mode {
@@ -226,7 +228,7 @@ MODULE_PARM_DESC(output_polarity,
 module_param(poll_ms, uint, 0644);
 MODULE_PARM_DESC(poll_ms, "Polling interval for captured input events");
 
-module_param(art_frequency, ulong, 0644);
+module_param(art_frequency, ulong, 0444);
 MODULE_PARM_DESC(
 	art_frequency,
 	"ART frequency in Hz used to convert capture cycles to nanoseconds; 0 auto-detects from CPUID leaf 0x15");
@@ -317,6 +319,7 @@ struct tgpio_mmio_block {
 	unsigned long mmio_phys;
 	enum tgpio_mode mode;
 	void __iomem *regs;
+	struct resource *mem_region;
 	u32 input_edge_bits;	/* default edge from module param */
 	atomic_t input_desired; /* published by enable: ON bit | edge bits */
 	int input_applied; /* reconciler-private: last programmed desired */
@@ -562,7 +565,7 @@ static u32 tgpio_input_edge_bits(struct tgpio_mmio_block *mmio_block,
 
 static int tgpio_check_addr(unsigned long addr)
 {
-	if (!addr || !mmio_size)
+	if (!addr || mmio_size < TGPIO_MIN_MMIO_SIZE)
 		return -EINVAL;
 
 	if (addr + mmio_size - 1 < addr)
@@ -592,9 +595,9 @@ static struct tgpio_u64_result tgpio_rescale(u64 count, u64 src_hz, u64 dst_hz)
 	u64 sub_second; /* leftover src-domain units, < src_hz */
 	u64 result;
 
-	/* Guard the rates we were handed, not the global: the caller reads
-	 * art_frequency once, so a concurrent sysfs write can't slip a zero past
-	 * this check into the divisor below.
+	/*
+	 * Guard the rates we were handed, not the global: callers read
+	 * art_frequency once, so each conversion uses one consistent value.
 	 */
 	if (!src_hz || !dst_hz)
 		return tgpio_err_u64(TGPIO_E_NODEV);
@@ -1069,7 +1072,6 @@ static int tgpio_phc_init_clock(struct tgpio_device *dev)
 	if (!ktime_real_to_base_clock(realtime, CSID_X86_ART, &art))
 		return -ENODEV;
 
-	seqlock_init(&dev->phc_seqlock);
 	dev->phc = tgpio_phc_params_make(art, ktime_to_ns(realtime), 0);
 	return 0;
 }
@@ -2049,11 +2051,14 @@ static void tgpio_unmap_mmio_blocks(struct tgpio_device *dev)
 	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
 		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
 
-		if (!mmio_block->regs)
-			continue;
-
-		iounmap(mmio_block->regs);
-		mmio_block->regs = NULL;
+		if (mmio_block->regs) {
+			iounmap(mmio_block->regs);
+			mmio_block->regs = NULL;
+		}
+		if (mmio_block->mem_region) {
+			release_mem_region(mmio_block->mmio_phys, mmio_size);
+			mmio_block->mem_region = NULL;
+		}
 	}
 }
 
@@ -2066,9 +2071,20 @@ static int tgpio_map_mmio_block(struct tgpio_device *dev, unsigned int index)
 	if (ret)
 		return ret;
 
+	mmio_block->mem_region = request_mem_region(mmio_block->mmio_phys,
+						    mmio_size, KBUILD_MODNAME);
+	if (!mmio_block->mem_region) {
+		pr_err("MMIO range %#lx-%#lx is busy\n", mmio_block->mmio_phys,
+		       mmio_block->mmio_phys + mmio_size - 1);
+		return -EBUSY;
+	}
+
 	mmio_block->regs = ioremap(mmio_block->mmio_phys, mmio_size);
-	if (!mmio_block->regs)
+	if (!mmio_block->regs) {
+		release_mem_region(mmio_block->mmio_phys, mmio_size);
+		mmio_block->mem_region = NULL;
 		return -ENOMEM;
+	}
 
 	dev->n_ptp_pins = max(dev->n_ptp_pins, index + 1);
 	pr_info("block %u %s at %#lx-%#lx\n", index,
@@ -2350,13 +2366,17 @@ static int __init tgpio_input_init(void)
 	struct tgpio_output_polarity_result polarity;
 	int ret;
 
-	if (!mmio_size)
+	if (mmio_size < TGPIO_MIN_MMIO_SIZE) {
+		pr_err("mmio_size must be at least %#x bytes\n",
+		       TGPIO_MIN_MMIO_SIZE);
 		return -EINVAL;
+	}
 
 	tgpio = kzalloc(sizeof(*tgpio), GFP_KERNEL);
 	if (!tgpio)
 		return -ENOMEM;
 
+	seqlock_init(&tgpio->phc_seqlock);
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
 
 	clock = tgpio_parse_clock_mode(clock_mode_param);
