@@ -78,6 +78,28 @@ edge defaults.
 Before proceeding with Input and Output, make sure testptp is installed. If not, here is a repo:
 https://github.com/Time-Appliances-Project/Incubation-Projects/tree/master/Software/testptp
 
+## Python Control With PyPTM
+
+PyPTM is a companion Python library and CLI for TSC/PTP/TGPIO experiments:
+
+https://github.com/ahmadexp/PyPTM
+
+It wraps the same Linux PTP character-device ioctls used by `testptp`, so it can
+list PTP clocks, map TGPIO pins, enable external timestamp input, start periodic
+output, and read timestamp events from Python.
+
+Example:
+
+```sh
+pyptm list
+sudo pyptm caps -d /dev/ptpX
+sudo pyptm input -d /dev/ptpX --pin 1 --channel 0 --edge rising
+sudo pyptm output -d /dev/ptpX --pin 0 --channel 0 --period-ns 1000000000
+```
+
+PyPTM also exposes `RDTSC`, ordered `RDTSC`, `RDTSCP`, CPUID feature checks, and
+`TPAUSE` when the CPU reports WAITPKG support.
+
 ## Input With testptp
 
 Find the PTP device:

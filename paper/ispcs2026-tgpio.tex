@@ -35,7 +35,7 @@ A concrete example is a small system that needs accurate time from a GPS receive
 
 Some commodity platforms contain timed I/O resources that are not exposed to the operating system through normal firmware enumeration. In that case, standard platform-driver discovery fails even when the underlying MMIO register block is present and functional. The result is an awkward gap: the hardware can be useful for synchronization experiments and measurement, but applications have no standard way to reach it.
 
-This paper describes an out-of-tree Linux driver that bridges that gap for Intel Time-Aware GPIO (TGPIO) blocks on a tested desktop platform. The driver maps known static MMIO resources, exposes each block as a PTP pin, and allows the block to be configured as an external timestamp input, a periodic output generator, or unused. It is designed around the Linux PHC interface rather than a custom userspace ABI, so existing tools such as \texttt{testptp} can configure pins, enable external timestamp events, and request periodic output.
+This paper describes an out-of-tree Linux driver that bridges that gap for Intel Time-Aware GPIO (TGPIO) blocks on a tested desktop platform. The driver maps known static MMIO resources, exposes each block as a PTP pin, and allows the block to be configured as an external timestamp input, a periodic output generator, or unused. It is designed around the Linux PHC interface rather than a custom userspace ABI, so existing tools such as \texttt{testptp} can configure pins, enable external timestamp events, and request periodic output. A companion Python library, PyPTM, wraps the same public PTP character-device interface for scripted experiments and combines it with CPU timing primitives such as \texttt{RDTSC}, \texttt{RDTSCP}, CPUID feature checks, and \texttt{TPAUSE} where supported \cite{pyptm-repo}.
 
 The central design problem is not only register access. TGPIO capture and compare values are expressed in the platform ART domain, while the PTP clock interface normally presents timestamps in a PTP clock domain. The driver therefore defaults to an ART-backed adjustable PHC and also provides explicit realtime and raw ART-derived modes for compatibility and diagnostics. The implementation also handles practical bring-up issues that are easy to miss in a purely architectural description, including default input edge selection, deterministic output startup, and output polarity.
 
@@ -102,6 +102,12 @@ At load time, the driver maps all enabled blocks and registers a single PTP cloc
 
 Channel mapping follows the PTP pin assignment model. A physical TGPIO block may be assigned to an external timestamp or periodic-output channel through \texttt{testptp -L}. If userspace does not create an explicit assignment, the driver falls back to a direct channel-to-block mapping where possible. This keeps the common two-block setup simple while still exercising the standard PTP pin API.
 
+\subsection{Userspace Control}
+
+The primary control surface is the standard PTP character device, not a private driver-specific ABI. This allows both existing command-line tools and custom measurement software to use the same kernel interface. During bring-up, \texttt{testptp} provided a useful reference for pin assignment, external timestamp enablement, and periodic-output requests. PyPTM provides the same operations as a Python API and command-line tool, making it easier to combine TGPIO configuration, event capture, and CPU-local timing measurements in one experiment script.
+
+One compatibility detail discovered during userspace testing is that some kernel and driver combinations accept the legacy \texttt{PTP\_EXTTS\_REQUEST} ioctl while returning \texttt{EOPNOTSUPP} for \texttt{PTP\_EXTTS\_REQUEST2}. PyPTM therefore attempts the newer ioctl first and falls back to the legacy request when appropriate. This preserves the standard PTP control model while avoiding a dependency on one particular userspace tool implementation.
+
 \begin{figure}[t]
 \centering
 \fbox{\begin{minipage}{0.45\textwidth}
@@ -166,7 +172,7 @@ Finally, periodic output startup required a deterministic preconditioning step. 
 
 \section{Evaluation Plan}
 
-This draft does not yet include final measurement results. The evaluation should establish that the driver loads reproducibly, emits coherent external timestamp events, generates periodic output with the requested polarity, preserves the intended relationship between realtime, ART, and PHC modes, exposes usable adjustment behavior in the default PHC mode, supports a minimal-hardware GPS PPS input path, and makes disciplined time available to OS components that participate in a TSN system.
+This draft does not yet include final measurement results. The evaluation should establish that the driver loads reproducibly, emits coherent external timestamp events, generates periodic output with the requested polarity, preserves the intended relationship between realtime, ART, and PHC modes, exposes usable adjustment behavior in the default PHC mode, supports a minimal-hardware GPS PPS input path, and makes disciplined time available to OS components that participate in a TSN system. The evaluation should include both \texttt{testptp} and PyPTM runs so the reported results cover the kernel interface and the scripted measurement workflow.
 
 The tested platform is an ASUS ProArt Z890-CREATOR WIFI motherboard with BIOS version 3202 running Ubuntu 26.04 LTS with Linux \texttt{7.0.0-22-generic}. The default static TGPIO addresses and two-block setup were validated on that system. Table~\ref{tab:eval} lists the measurements that should be collected before submission.
 
@@ -179,11 +185,11 @@ The tested platform is an ASUS ProArt Z890-CREATOR WIFI motherboard with BIOS ve
 Experiment & Method & Reported metric\\
 \midrule
 Load status & \texttt{make status}, \texttt{dmesg} & modes, PTP device\\
-Input capture & PPS or signal generator + \texttt{testptp -e} & interval error, misses\\
-Output period & \texttt{testptp -p} + oscilloscope & period error, jitter\\
+Input capture & PPS or signal generator + \texttt{testptp -e}/PyPTM & interval error, misses\\
+Output period & \texttt{testptp -p}/PyPTM + oscilloscope & period error, jitter\\
 Startup phase & repeated reloads + scope trigger & first-edge correctness\\
 Timestamp mode & realtime vs. ART logs & epoch and scale behavior\\
-PHC adjustment & \texttt{testptp} or \texttt{ts2phc} & set, step, frequency response\\
+PHC adjustment & \texttt{testptp}, PyPTM, or \texttt{ts2phc} & set, step, frequency response\\
 GPS PPS input & GPS PPS + \texttt{ts2phc}/system clock & host time availability\\
 TSN host timing & disciplined PHC + OS clock & OS timing-domain participation\\
 \bottomrule
