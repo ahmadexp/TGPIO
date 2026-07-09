@@ -1,5 +1,9 @@
 # TGPIO
 
+<p align="center">
+  <img src="assets/tgpio-logo.svg" alt="TGPIO logo" width="760">
+</p>
+
 Author: Ahmad Byagowi
 
 Linux kernel module that exposes Time-Aware GPIO / Timed I/O blocks on systems.
@@ -42,7 +46,18 @@ timestamp_mode=realtime
 output_polarity=normal
 poll_ms=10
 art_frequency=0
+hardware_timestamps=Y
 hardware_periodic_output=Y
+activity_log=N
+input0_enable=N
+input1_enable=N
+input0_channel=0
+input1_channel=1
+output0_channel=0
+output1_channel=1
+output0_period_ns=0
+output1_period_ns=0
+output_start_delay_ns=0
 ```
 
 `art_frequency=0` means auto-detect the ART/crystal frequency from CPUID leaf
@@ -207,6 +222,36 @@ sudo make reload MODE0=output HARDWARE_PERIODIC_OUTPUT=0
 If your board or measurement path inverts the output, reload with
 `OUTPUT_POLARITY=inverted`.
 
+## Activity Log With journalctl
+
+The driver can optionally log GPIO activity to the kernel journal. This is off
+by default because input events and software output edges can be frequent.
+
+Enable it at load time:
+
+```sh
+sudo make reload MODE0=output MODE1=input ACTIVITY_LOG=1
+```
+
+Or toggle it on a loaded module:
+
+```sh
+echo 1 | sudo tee /sys/module/tgpio_ptp_input/parameters/activity_log
+```
+
+Follow the activity stream:
+
+```sh
+sudo journalctl -k -f -g 'tgpio_ptp_input: activity='
+```
+
+Input lines include the block, PTP channel, edge selection, event counter,
+event-counter delta, raw ART capture value, and emitted timestamp. Output lines
+include perout arming, requested period, the integer half-period, ART-cycle
+quantization, actual half-period, and rounding/split error fields. In hardware
+periodic mode the hardware free-runs after arming, so the journal records the
+programmed periodic setup rather than every physical edge.
+
 ## Persistent Install
 
 Install for the running kernel:
@@ -214,6 +259,36 @@ Install for the running kernel:
 ```sh
 sudo make install MODE0=output MODE1=input EDGE1=rising
 ```
+
+`install` persists the module and its load-time options through
+`/etc/modprobe.d/tgpio-ptp-input.conf` and
+`/etc/modules-load.d/tgpio-ptp-input.conf`.
+
+To also restore pin operation after reboot, pass the operation options when
+installing. For example, this brings block 0 back as a 1 Hz output and block 1
+back as an enabled rising-edge input whenever the module loads:
+
+```sh
+sudo make persist MODE0=output MODE1=input EDGE1=rising \
+  OUTPUT0_PERIOD_NS=1000000000 INPUT1_ENABLE=1
+```
+
+The persisted operation options are:
+
+- `INPUT0_ENABLE=1` or `INPUT1_ENABLE=1`: enable external timestamp capture at
+  module load for an input-mode block.
+- `INPUT0_CHANNEL` and `INPUT1_CHANNEL`: PTP external timestamp channels for
+  those inputs; defaults are `0` and `1`.
+- `OUTPUT0_PERIOD_NS` and `OUTPUT1_PERIOD_NS`: start periodic output at module
+  load for an output-mode block; `0` disables restored output.
+- `OUTPUT0_CHANNEL` and `OUTPUT1_CHANNEL`: PTP periodic-output channels for
+  those outputs; defaults are `0` and `1`.
+- `OUTPUT_START_DELAY_NS`: optional delay from current PTP time to the first
+  restored output edge. With the default `0`, the driver chooses a safe start
+  time shortly after module load.
+
+The output period is restored after boot, but an exact absolute waveform phase
+is not preserved across a restart.
 
 Remove the persistent install:
 

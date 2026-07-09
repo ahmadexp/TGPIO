@@ -18,6 +18,16 @@ POLL_MS ?= 10
 ART_FREQUENCY ?= 0
 HARDWARE_TIMESTAMPS ?= 1
 HARDWARE_PERIODIC_OUTPUT ?= 1
+ACTIVITY_LOG ?= 0
+INPUT0_ENABLE ?= 0
+INPUT1_ENABLE ?= 0
+INPUT0_CHANNEL ?= 0
+INPUT1_CHANNEL ?= 1
+OUTPUT0_CHANNEL ?= 0
+OUTPUT1_CHANNEL ?= 1
+OUTPUT0_PERIOD_NS ?= 0
+OUTPUT1_PERIOD_NS ?= 0
+OUTPUT_START_DELAY_NS ?= 0
 
 LOAD_ENV := ADDR0="$(ADDR0)" ADDR1="$(ADDR1)" MMIO_SIZE="$(MMIO_SIZE)"
 LOAD_ENV += USE_SECOND="$(USE_SECOND)" MODE0="$(MODE0)" MODE1="$(MODE1)"
@@ -28,8 +38,15 @@ LOAD_ENV += OUTPUT_POLARITY="$(OUTPUT_POLARITY)" POLL_MS="$(POLL_MS)"
 LOAD_ENV += ART_FREQUENCY="$(ART_FREQUENCY)"
 LOAD_ENV += HARDWARE_TIMESTAMPS="$(HARDWARE_TIMESTAMPS)"
 LOAD_ENV += HARDWARE_PERIODIC_OUTPUT="$(HARDWARE_PERIODIC_OUTPUT)"
+LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)"
+LOAD_ENV += INPUT0_ENABLE="$(INPUT0_ENABLE)" INPUT1_ENABLE="$(INPUT1_ENABLE)"
+LOAD_ENV += INPUT0_CHANNEL="$(INPUT0_CHANNEL)" INPUT1_CHANNEL="$(INPUT1_CHANNEL)"
+LOAD_ENV += OUTPUT0_CHANNEL="$(OUTPUT0_CHANNEL)" OUTPUT1_CHANNEL="$(OUTPUT1_CHANNEL)"
+LOAD_ENV += OUTPUT0_PERIOD_NS="$(OUTPUT0_PERIOD_NS)"
+LOAD_ENV += OUTPUT1_PERIOD_NS="$(OUTPUT1_PERIOD_NS)"
+LOAD_ENV += OUTPUT_START_DELAY_NS="$(OUTPUT_START_DELAY_NS)"
 
-.PHONY: all clean help load reload unload status install uninstall
+.PHONY: all clean help load reload unload status install persist uninstall
 
 help:
 	@echo "Targets:"
@@ -39,6 +56,7 @@ help:
 	@echo "  make unload          Unload the TGPIO add-on"
 	@echo "  make status          Show module and PTP status"
 	@echo "  make install         Install persistently for the running kernel"
+	@echo "  make persist         Alias for install, including persisted operations"
 	@echo "  make uninstall       Remove persistent install"
 	@echo
 	@echo "Common overrides:"
@@ -57,6 +75,16 @@ help:
 	@echo "  ART_FREQUENCY=$(ART_FREQUENCY)"
 	@echo "  HARDWARE_TIMESTAMPS=$(HARDWARE_TIMESTAMPS)"
 	@echo "  HARDWARE_PERIODIC_OUTPUT=$(HARDWARE_PERIODIC_OUTPUT)"
+	@echo "  ACTIVITY_LOG=$(ACTIVITY_LOG)"
+	@echo "  INPUT0_ENABLE=$(INPUT0_ENABLE)"
+	@echo "  INPUT1_ENABLE=$(INPUT1_ENABLE)"
+	@echo "  INPUT0_CHANNEL=$(INPUT0_CHANNEL)"
+	@echo "  INPUT1_CHANNEL=$(INPUT1_CHANNEL)"
+	@echo "  OUTPUT0_CHANNEL=$(OUTPUT0_CHANNEL)"
+	@echo "  OUTPUT1_CHANNEL=$(OUTPUT1_CHANNEL)"
+	@echo "  OUTPUT0_PERIOD_NS=$(OUTPUT0_PERIOD_NS)"
+	@echo "  OUTPUT1_PERIOD_NS=$(OUTPUT1_PERIOD_NS)"
+	@echo "  OUTPUT_START_DELAY_NS=$(OUTPUT_START_DELAY_NS)"
 
 all:
 	$(MAKE) -C $(KDIR) M=$(SRC_DIR) modules
@@ -79,6 +107,8 @@ status:
 
 install: all
 	$(SUDO) $(LOAD_ENV) ./scripts/install.sh
+
+persist: install
 
 uninstall:
 	$(SUDO) ./scripts/uninstall.sh

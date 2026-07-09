@@ -20,8 +20,18 @@ echo
 echo "== tgpio parameters =="
 for param in clock_mode timestamp_mode output_polarity art_frequency \
 	tsc_art_numerator tsc_art_denominator hardware_timestamps \
-	hardware_periodic_output; do
+	hardware_periodic_output activity_log input0_enable input1_enable \
+	input0_channel input1_channel output0_channel output1_channel \
+	output0_period_ns output1_period_ns output_start_delay_ns; do
 	path="/sys/module/tgpio_ptp_input/parameters/${param}"
 	[ -r "${path}" ] || continue
 	printf '%s=%s\n' "${param}" "$(cat "${path}")"
 done
+
+echo
+echo "== tgpio activity status =="
+if [ -r /sys/kernel/debug/tgpio/status ]; then
+	cat /sys/kernel/debug/tgpio/status
+else
+	echo "/sys/kernel/debug/tgpio/status unavailable"
+fi
