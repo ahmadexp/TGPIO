@@ -181,9 +181,17 @@ In PHC mode:
   converted back to ART compare values before programming hardware.
 - If a tool such as `phc2sys` steps the TGPIO PHC while periodic output is
   active, the driver re-primes and re-arms the output in the adjusted PHC
-  domain so a stale compare value does not stop the waveform.
-- If `phc2sys` only changes PHC frequency with `adjfine`, running hardware
-  periodic output refreshes `PIV` without restarting the waveform.
+  domain so a stale compare value does not stop the waveform. The re-armed
+  first edge stays on the requested period grid (`start + k * period`), so a
+  step never shifts the waveform phase.
+- If `phc2sys` only changes PHC frequency with `adjfine`, the driver never
+  hot-writes the running hardware block: `PIV`/`COMPV` writes to an enabled
+  block corrupt the free-running waveform. Instead it tracks the phase error
+  the stale interval accumulates against the requested grid (the pending edge
+  is always `first_art + k * PIV`, no readback needed) and performs a full
+  grid-aligned re-arm once the error exceeds 10 us
+  (`activity=output_phase_rearm` in the activity log). Expect a few re-arms
+  while the servo converges, then none.
 
 `TIMESTAMP_MODE=art` is intended for explicit `CLOCK_MODE=realtime` debugging.
 In the default PHC mode, hardware input events are emitted in adjusted PHC time
@@ -276,9 +284,12 @@ For a quick frequency sanity check while an output is running:
 sudo cat /sys/kernel/debug/tgpio/status
 ```
 
-The output status shows `high_time`, `low_time`, and the PHC `base_art_hz`; for
-hardware periodic output it also includes `art_half_cycles`, `actual_period`,
-and `period_error`.
+The output status shows `art_snapshot`, `high_time`, `low_time`, and the PHC
+`base_art_hz`; for hardware periodic output it also includes
+`art_half_cycles`, `actual_period`, `period_error`, and — while the block is
+armed — `armed_piv` and the live `phase_error` against the requested grid. In PHC mode,
+`art_snapshot` must be `present`; otherwise the driver refuses PHC mode instead
+of deriving the current ART value from `CLOCK_REALTIME`.
 
 ## Persistent Install
 
@@ -365,8 +376,9 @@ scale.
 In PHC mode, the driver converts between ART cycles and adjusted PHC
 nanoseconds with a stable `base_art_hz` captured when the PHC is created. This
 keeps `phc2sys`/`ts2phc` frequency discipline from feeding back through
-`CLOCK_REALTIME`. A non-zero `ART_FREQUENCY=<Hz>` overrides that captured base
-rate.
+`CLOCK_REALTIME`. Current PHC reads use ART cycles from the kernel timekeeping
+snapshot, not an inverse conversion from realtime. A non-zero
+`ART_FREQUENCY=<Hz>` overrides the captured base rate.
 
 In realtime mode, hardware periodic output does not use the CPUID-reported
 `art_frequency` for the free-running interval. It converts the requested period

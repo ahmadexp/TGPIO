@@ -52,14 +52,42 @@ tgpio_get_realtime_snapshot(struct system_time_snapshot *snapshot)
 {
 	ktime_get_snapshot_id(CLOCK_REALTIME, snapshot);
 }
+static inline bool
+tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
+			  u64 *cycles)
+{
+	if (!snapshot->valid)
+		return false;
+	if (snapshot->hw_csid == CSID_X86_ART) {
+		*cycles = snapshot->hw_cycles;
+		return true;
+	}
+	if (snapshot->cs_id == CSID_X86_ART) {
+		*cycles = snapshot->cycles;
+		return true;
+	}
+	return false;
+}
 #define tgpio_xtstamp_realtime(xtstamp) ((xtstamp).sys_systime)
+#define tgpio_snapshot_realtime(snapshot) ((snapshot).systime)
 #else
 static inline void
 tgpio_get_realtime_snapshot(struct system_time_snapshot *snapshot)
 {
 	ktime_get_snapshot(snapshot);
 }
+static inline bool
+tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
+			  u64 *cycles)
+{
+	if (snapshot->cs_id != CSID_X86_ART)
+		return false;
+
+	*cycles = snapshot->cycles;
+	return true;
+}
 #define tgpio_xtstamp_realtime(xtstamp) ((xtstamp).sys_realtime)
+#define tgpio_snapshot_realtime(snapshot) ((snapshot).real)
 #endif
 
 #define CREATE_TRACE_POINTS
@@ -89,6 +117,7 @@ tgpio_get_realtime_snapshot(struct system_time_snapshot *snapshot)
 
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (10 * NSEC_PER_MSEC)
+#define TGPIO_OUTPUT_REARM_PHASE_NS 10000
 #define TGPIO_CPUID_ART_LEAF	  0x15
 #define TGPIO_PHC_MAX_ADJ_PPB	  100000000L
 #define TGPIO_MIN_POLL_MS	  1u
@@ -413,6 +442,8 @@ struct tgpio_mmio_block {
 	unsigned int output_applied_gen; /* output_work-private from here down */
 	unsigned int output_applied_freq_gen;
 	enum tgpio_output_phase output_phase;
+	u64 output_hw_first_art; /* armed COMPV; edges at first + k * piv */
+	u64 output_hw_piv;	 /* armed PIV; 0 = not in hardware periodic */
 	u64 output_high_time_ns;
 	u64 output_low_time_ns;
 	enum tgpio_logical_edge output_next_edge_type;
@@ -1263,11 +1294,21 @@ static void tgpio_probe_art_parameters_for_status(void)
 
 static struct tgpio_u64_result tgpio_get_current_art(void)
 {
+	struct system_time_snapshot snapshot;
 	u64 art;
+
+	tgpio_get_realtime_snapshot(&snapshot);
+	if (tgpio_snapshot_art_cycles(&snapshot, &art))
+		return tgpio_ok_u64(art);
+
+	if (clock_mode == TGPIO_CLOCK_PHC) {
+		pr_warn_ratelimited(
+			"current ART snapshot unavailable; PHC mode cannot safely use CLOCK_REALTIME inversion\n");
+		return tgpio_err_u64(TGPIO_E_NODEV);
+	}
 
 	if (!ktime_real_to_base_clock(ktime_get_real(), CSID_X86_ART, &art))
 		return tgpio_err_u64(TGPIO_E_NODEV);
-
 	return tgpio_ok_u64(art);
 }
 
@@ -1471,12 +1512,16 @@ tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
 static int tgpio_phc_init_clock(struct tgpio_device *dev)
 {
 	struct tgpio_u64_result base_art_hz;
+	struct system_time_snapshot snapshot;
 	ktime_t realtime;
 	u64 art;
 
-	realtime = ktime_get_real();
-	if (!ktime_real_to_base_clock(realtime, CSID_X86_ART, &art))
+	tgpio_get_realtime_snapshot(&snapshot);
+	if (!tgpio_snapshot_art_cycles(&snapshot, &art)) {
+		pr_err("PHC mode requires current ART cycles from the timekeeping snapshot\n");
 		return -ENODEV;
+	}
+	realtime = tgpio_snapshot_realtime(snapshot);
 
 	if (art_frequency) {
 		base_art_hz = tgpio_ok_u64(art_frequency);
@@ -1861,9 +1906,41 @@ static struct tgpio_output_timing tgpio_output_timing_err(enum tgpio_status e)
 	return (struct tgpio_output_timing){ .status = e };
 }
 
+/*
+ * A stale start time must stay on its own period grid: an output re-armed
+ * after a PHC step (or started with a past or zero start) fires at
+ * start + k * period, never at an arbitrary "now plus lead" phase.
+ */
+static s64 tgpio_output_align_first_edge(s64 requested_ns, s64 min_first_ns,
+					 u64 period_ns)
+{
+	struct tgpio_s64_result aligned;
+	u64 delta;
+	u64 periods;
+	u64 rem;
+
+	if (requested_ns >= min_first_ns)
+		return requested_ns;
+	if (!period_ns || period_ns > (u64)S64_MAX || requested_ns < 0)
+		return min_first_ns;
+
+	delta = (u64)(min_first_ns - requested_ns);
+	periods = div64_u64_rem(delta, period_ns, &rem);
+	if (rem)
+		periods++;
+	if (periods > div64_u64((u64)S64_MAX, period_ns))
+		return min_first_ns;
+
+	aligned = tgpio_add_s64(requested_ns, (s64)(periods * period_ns));
+	if (aligned.status < 0)
+		return min_first_ns;
+
+	return aligned.val;
+}
+
 static struct tgpio_output_timing
 tgpio_prepare_output_timing(struct tgpio_device *dev, u64 min_interval_ns,
-			    enum tgpio_output_mode mode,
+			    u64 period_ns, enum tgpio_output_mode mode,
 			    s64 requested_first_edge_ns)
 {
 	struct tgpio_s64_result now = tgpio_clock_now_ns(dev);
@@ -1894,9 +1971,8 @@ tgpio_prepare_output_timing(struct tgpio_device *dev, u64 min_interval_ns,
 	min_first = tgpio_add_s64(now.val, 3 * lead_ns_s64);
 	if (min_first.status < 0)
 		return tgpio_output_timing_err(min_first.status);
-	first_edge_ns = requested_first_edge_ns < min_first.val ?
-				min_first.val :
-				requested_first_edge_ns;
+	first_edge_ns = tgpio_output_align_first_edge(requested_first_edge_ns,
+						      min_first.val, period_ns);
 
 	prime = tgpio_add_s64(first_edge_ns, -2 * lead_ns_s64);
 	timer_start_ns = tgpio_add_s64(first_edge_ns, -lead_ns_s64);
@@ -1933,16 +2009,17 @@ static void tgpio_disable_output_hw(struct tgpio_mmio_block *mmio_block)
 	tgpio_write_ctl(mmio_block,
 			tgpio_ctl_without(ctrl, TGPIOCTL_EN | TGPIOCTL_PM));
 	mmio_block->output_phase = TGPIO_OUTPUT_TOGGLE;
+	mmio_block->output_hw_first_art = 0;
+	mmio_block->output_hw_piv = 0;
 }
 
 static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 					 struct tgpio_mmio_block *mmio_block,
 					 s64 first_edge_ns, u64 half_period_ns,
 					 u64 first_art, u64 half_period_art);
-static void tgpio_log_output_freq_update(struct tgpio_device *dev,
+static void tgpio_log_output_phase_rearm(struct tgpio_device *dev,
 					 struct tgpio_mmio_block *mmio_block,
-					 u64 half_period_ns,
-					 u64 half_period_art);
+					 s64 phase_error_ns);
 
 /* output_work-only: switch the block to autonomous hardware periodic output. */
 static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
@@ -1975,6 +2052,8 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	mmio_block->output_low_time_ns = half_period_ns;
 	mmio_block->output_next_edge = ns_to_ktime(first_edge_ns);
 	mmio_block->output_phase = TGPIO_OUTPUT_HARDWARE_PERIODIC;
+	mmio_block->output_hw_first_art = first_art.val;
+	mmio_block->output_hw_piv = half_period_art.val;
 
 	tgpio_log_output_hw_periodic(dev, mmio_block, first_edge_ns,
 				     half_period_ns, first_art.val,
@@ -1983,21 +2062,55 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	return 0;
 }
 
-static int tgpio_update_hardware_periodic_interval(
-	struct tgpio_device *dev, struct tgpio_mmio_block *mmio_block)
+/*
+ * Phase error of the free-running hardware output against the requested
+ * period grid, computed without touching the hardware: the compare engine
+ * advances COMPV by exactly PIV per edge, so the pending edge sits at
+ * first_art + k * piv. Registers of a running block are deliberately never
+ * read or hot-written; on this hardware such accesses corrupt the waveform.
+ */
+static struct tgpio_s64_result
+tgpio_hw_periodic_phase_error_ns(struct tgpio_device *dev,
+				 struct tgpio_mmio_block *mmio_block,
+				 s64 grid_start_ns, u64 half_ns)
 {
-	struct tgpio_u64_result half_period_art =
-		tgpio_clock_delta_to_art_cycles(
-			dev, mmio_block->output_high_time_ns);
+	u64 first_art = mmio_block->output_hw_first_art;
+	u64 piv = mmio_block->output_hw_piv;
+	struct tgpio_u64_result now_art;
+	struct tgpio_s64_result pending;
+	u64 pending_art;
+	u64 periods;
+	u64 rem;
 
-	if (half_period_art.status < 0 || !half_period_art.val)
-		return -ENODEV;
+	if (clock_mode != TGPIO_CLOCK_PHC || !piv || !half_ns ||
+	    half_ns > (u64)S64_MAX || grid_start_ns < 0)
+		return tgpio_err_s64(TGPIO_E_INVAL);
 
-	tgpio_write_piv(mmio_block, half_period_art.val);
-	tgpio_log_output_freq_update(dev, mmio_block,
-				     mmio_block->output_high_time_ns,
-				     half_period_art.val);
-	return 0;
+	now_art = tgpio_get_current_art();
+	if (now_art.status < 0)
+		return tgpio_err_s64(now_art.status);
+
+	if (now_art.val <= first_art) {
+		pending_art = first_art;
+	} else {
+		periods = div64_u64(now_art.val - first_art, piv) + 1;
+		if (periods > div64_u64(U64_MAX - first_art, piv))
+			return tgpio_err_s64(TGPIO_E_RANGE);
+		pending_art = first_art + periods * piv;
+	}
+
+	if (pending_art > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES)
+		return tgpio_err_s64(TGPIO_E_RANGE);
+	pending = tgpio_clock_phc_art_to_ns(
+		dev, pending_art + TGPIO_ART_HW_DELAY_CYCLES);
+	if (pending.status < 0)
+		return pending;
+	if (pending.val < grid_start_ns)
+		return tgpio_err_s64(TGPIO_E_RANGE);
+
+	div64_u64_rem((u64)(pending.val - grid_start_ns), half_ns, &rem);
+	return tgpio_ok_s64(rem >= half_ns - rem ? (s64)rem - (s64)half_ns :
+						   (s64)rem);
 }
 
 /* output_work-only: prime the block and set the initial software-periodic phase. */
@@ -2031,6 +2144,8 @@ static int tgpio_arm_output(struct tgpio_device *dev,
 	mmio_block->output_phase = mode == TGPIO_OUTPUT_HARDWARE ?
 					   TGPIO_OUTPUT_ARM_PERIODIC :
 					   TGPIO_OUTPUT_FIRST_RISING;
+	mmio_block->output_hw_first_art = 0;
+	mmio_block->output_hw_piv = 0;
 
 	ctrl = tgpio_read_ctl(mmio_block);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
@@ -2137,27 +2252,19 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 		half_error_ns, period_error_ns);
 }
 
-static void tgpio_log_output_freq_update(struct tgpio_device *dev,
+static void tgpio_log_output_phase_rearm(struct tgpio_device *dev,
 					 struct tgpio_mmio_block *mmio_block,
-					 u64 half_period_ns,
-					 u64 half_period_art)
+					 s64 phase_error_ns)
 {
-	struct tgpio_ns_result actual_half;
 	unsigned int channel;
-	s64 half_error_ns = 0;
 
 	if (!READ_ONCE(activity_log))
 		return;
 
-	actual_half = tgpio_clock_art_cycles_to_delta_ns(dev, half_period_art);
-	if (actual_half.status >= 0 && actual_half.ns <= S64_MAX)
-		half_error_ns = (s64)actual_half.ns - (s64)half_period_ns;
-
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
 					       PTP_PF_PEROUT);
-	pr_info("activity=output_freq_update block=%u channel=%u half_period_ns=%llu art_half_cycles=%llu actual_half_ns=%llu half_error_ns=%lld\n",
-		mmio_block->index, channel, half_period_ns, half_period_art,
-		actual_half.status < 0 ? 0 : actual_half.ns, half_error_ns);
+	pr_info("activity=output_phase_rearm block=%u channel=%u phase_error_ns=%lld\n",
+		mmio_block->index, channel, phase_error_ns);
 }
 
 static void tgpio_log_output_edge(struct tgpio_device *dev,
@@ -2209,6 +2316,36 @@ static void tgpio_output_wake_at(struct tgpio_mmio_block *mmio_block,
 	hrtimer_start(&mmio_block->output_timer, when, HRTIMER_MODE_ABS);
 }
 
+/*
+ * output_work-only: full disable/prime/arm cycle against the current PHC
+ * mapping, with the first edge kept on the requested period grid. This is
+ * the only programming sequence the hardware honors, so both new configs and
+ * phase corrections funnel through it.
+ */
+static void tgpio_reconcile_arm(struct tgpio_device *dev,
+				struct tgpio_mmio_block *mmio_block,
+				const struct tgpio_output_desired *desired)
+{
+	struct tgpio_output_timing timing = tgpio_prepare_output_timing(
+		dev,
+		tgpio_output_min_interval_ns(desired->high_time_ns,
+					     desired->low_time_ns),
+		desired->period_ns, desired->mode, desired->first_edge_ns);
+
+	if (timing.status < 0 ||
+	    tgpio_arm_output(dev, mmio_block, timing.first_edge_ns,
+			     timing.prime_edge_ns, desired->high_time_ns,
+			     desired->low_time_ns, desired->mode)) {
+		hrtimer_cancel(&mmio_block->output_timer);
+		tgpio_disable_output_hw(mmio_block);
+		return;
+	}
+	mmio_block->output_applied_gen = desired->gen;
+	mmio_block->output_applied_freq_gen = desired->freq_gen;
+	tgpio_log_output_arm(dev, mmio_block, desired, &timing);
+	tgpio_output_wake_at(mmio_block, timing.timer_start);
+}
+
 /* Sole writer of output hardware + the per-edge timer. */
 static void tgpio_output_work(struct work_struct *work)
 {
@@ -2237,36 +2374,34 @@ static void tgpio_output_work(struct work_struct *work)
 	 * corrects it. Eventually consistent, never wrong indefinitely.
 	 */
 	if (desired.gen != mmio_block->output_applied_gen) {
-		struct tgpio_output_timing timing = tgpio_prepare_output_timing(
-			dev,
-			tgpio_output_min_interval_ns(desired.high_time_ns,
-						    desired.low_time_ns),
-			desired.mode,
-			desired.first_edge_ns);
-
-		if (timing.status < 0 ||
-		    tgpio_arm_output(dev, mmio_block, timing.first_edge_ns,
-				     timing.prime_edge_ns,
-				     desired.high_time_ns, desired.low_time_ns,
-				     desired.mode)) {
-			hrtimer_cancel(&mmio_block->output_timer);
-			tgpio_disable_output_hw(mmio_block);
-			return;
-		}
-		mmio_block->output_applied_gen = desired.gen;
-		mmio_block->output_applied_freq_gen = desired.freq_gen;
-		tgpio_log_output_arm(dev, mmio_block, &desired, &timing);
-		tgpio_output_wake_at(mmio_block, timing.timer_start);
+		tgpio_reconcile_arm(dev, mmio_block, &desired);
 		return;
 	}
 
+	/*
+	 * PHC frequency changed. The running hardware block is never
+	 * hot-written: its registers only latch through the full disable/arm
+	 * sequence. Instead, track the phase error the stale PIV accumulates
+	 * against the requested grid and re-arm once it exceeds the
+	 * threshold; the re-arm picks up both the corrected frequency and
+	 * the grid phase.
+	 */
 	if (desired.freq_gen != mmio_block->output_applied_freq_gen) {
 		mmio_block->output_applied_freq_gen = desired.freq_gen;
 		if (mmio_block->output_phase ==
 		    TGPIO_OUTPUT_HARDWARE_PERIODIC) {
-			if (tgpio_update_hardware_periodic_interval(
-				    dev, mmio_block))
-				tgpio_disable_output_hw(mmio_block);
+			struct tgpio_s64_result err =
+				tgpio_hw_periodic_phase_error_ns(
+					dev, mmio_block,
+					desired.first_edge_ns,
+					desired.high_time_ns);
+
+			if (err.status < 0 ||
+			    (err.val >= -TGPIO_OUTPUT_REARM_PHASE_NS &&
+			     err.val <= TGPIO_OUTPUT_REARM_PHASE_NS))
+				return;
+			tgpio_log_output_phase_rearm(dev, mmio_block, err.val);
+			tgpio_reconcile_arm(dev, mmio_block, &desired);
 			return;
 		}
 		if (mmio_block->output_phase == TGPIO_OUTPUT_ARM_PERIODIC &&
@@ -2409,7 +2544,7 @@ static int tgpio_config_output_values(struct tgpio_device *dev,
 					tgpio_output_min_interval_ns(
 						times.high_time_ns,
 						times.low_time_ns),
-					mode, first_edge_ns)
+					times.period_ns, mode, first_edge_ns)
 		    .status < 0)
 		return -ENODEV;
 
@@ -3147,7 +3282,11 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 {
 	struct tgpio_device *dev = m->private;
 	struct tgpio_phc_params phc = tgpio_phc_params_get(dev);
+	struct system_time_snapshot snapshot;
+	u64 snapshot_art;
 	unsigned int i;
+
+	tgpio_get_realtime_snapshot(&snapshot);
 
 	seq_printf(m, "clock_mode: %s\n", tgpio_clock_mode_name(clock_mode));
 	seq_printf(m, "art_frequency: %lu Hz\n", art_frequency);
@@ -3156,6 +3295,10 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "art_base_clock: %s\n",
 		   timekeeping_clocksource_has_base(CSID_X86_ART) ? "present" :
 								    "absent");
+	seq_printf(m, "art_snapshot: %s\n",
+		   tgpio_snapshot_art_cycles(&snapshot, &snapshot_art) ?
+			   "present" :
+			   "absent");
 	seq_printf(m,
 		   "phc: anchor_art=%llu anchor_ns=%lld base_art_hz=%llu scaled_ppm=%ld\n",
 		   phc.anchor_art, phc.anchor_ns, phc.base_art_hz,
@@ -3213,6 +3356,20 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 					seq_printf(m,
 						   " quantization_status=%d",
 						   quant.status);
+
+				if (READ_ONCE(mmio_block->output_hw_piv)) {
+					struct tgpio_s64_result phase_err =
+						tgpio_hw_periodic_phase_error_ns(
+							dev, mmio_block,
+							desired.first_edge_ns,
+							output_high_time_ns);
+
+					if (phase_err.status >= 0)
+						seq_printf(m,
+							   " armed_piv=%llu phase_error=%lldns",
+							   READ_ONCE(mmio_block->output_hw_piv),
+							   phase_err.val);
+				}
 			}
 		}
 		seq_putc(m, '\n');
