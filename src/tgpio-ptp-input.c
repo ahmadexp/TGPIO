@@ -1226,6 +1226,51 @@ static struct tgpio_u64_result tgpio_get_current_art(void)
 	return tgpio_ok_u64(art);
 }
 
+static struct tgpio_u64_result tgpio_realtime_delta_to_art_cycles(u64 delta_ns)
+{
+	ktime_t start;
+	ktime_t end;
+	s64 start_ns;
+	struct tgpio_s64_result end_ns;
+	u64 start_art;
+	u64 end_art;
+
+	if (!delta_ns || delta_ns > S64_MAX)
+		return tgpio_err_u64(TGPIO_E_RANGE);
+
+	start = ktime_get_real();
+	start_ns = ktime_to_ns(start);
+	if (start_ns < 0)
+		return tgpio_err_u64(TGPIO_E_RANGE);
+
+	end_ns = tgpio_add_s64(start_ns, (s64)delta_ns);
+	if (end_ns.status < 0)
+		return tgpio_err_u64(end_ns.status);
+
+	end = ns_to_ktime(end_ns.val);
+	if (!ktime_real_to_base_clock(start, CSID_X86_ART, &start_art) ||
+	    !ktime_real_to_base_clock(end, CSID_X86_ART, &end_art))
+		return tgpio_err_u64(TGPIO_E_NODEV);
+
+	if (end_art <= start_art)
+		return tgpio_err_u64(TGPIO_E_RANGE);
+
+	return tgpio_ok_u64(end_art - start_art);
+}
+
+static struct tgpio_ns_result tgpio_art_cycles_to_realtime_delta_ns(u64 cycles)
+{
+	struct tgpio_u64_result cycles_per_sec =
+		tgpio_realtime_delta_to_art_cycles(NSEC_PER_SEC);
+	struct tgpio_u64_result ns;
+
+	if (cycles_per_sec.status < 0)
+		return (struct tgpio_ns_result){ .status = cycles_per_sec.status };
+
+	ns = tgpio_rescale_nearest(cycles, cycles_per_sec.val, NSEC_PER_SEC);
+	return (struct tgpio_ns_result){ .status = ns.status, .ns = ns.val };
+}
+
 static struct tgpio_phc_params tgpio_phc_params_get(struct tgpio_device *dev)
 {
 	struct tgpio_phc_params phc;
@@ -1295,16 +1340,19 @@ tgpio_clock_delta_to_art_cycles(struct tgpio_device *dev, s64 clock_delta_ns)
 {
 	struct tgpio_u64_result real =
 		tgpio_clock_delta_to_real_ns(dev, clock_delta_ns);
-	struct tgpio_s64_result cycles;
+	struct tgpio_u64_result cycles;
 
 	if (real.status < 0 || real.val > S64_MAX)
+		return tgpio_err_u64(real.status < 0 ? real.status :
+							TGPIO_E_RANGE);
+
+	cycles = tgpio_realtime_delta_to_art_cycles(real.val);
+	if (cycles.status < 0)
+		return cycles;
+	if (!cycles.val)
 		return tgpio_err_u64(TGPIO_E_RANGE);
 
-	cycles = tgpio_ns_delta_to_art_nearest(real.val);
-	if (cycles.status < 0 || cycles.val <= 0)
-		return tgpio_err_u64(TGPIO_E_RANGE);
-
-	return tgpio_ok_u64(cycles.val);
+	return cycles;
 }
 
 static struct tgpio_output_quantization
@@ -1319,7 +1367,7 @@ tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
 {
 	struct tgpio_u64_result real_half =
 		tgpio_clock_delta_to_real_ns(dev, half_period_ns);
-	struct tgpio_s64_result art_half;
+	struct tgpio_u64_result art_half;
 	struct tgpio_ns_result actual_half;
 	struct tgpio_s64_result period_error;
 	s64 half_error;
@@ -1330,12 +1378,12 @@ tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
 			real_half.status < 0 ? real_half.status :
 					       TGPIO_E_RANGE);
 
-	art_half = tgpio_ns_delta_to_art_nearest(real_half.val);
-	if (art_half.status < 0 || art_half.val <= 0)
+	art_half = tgpio_realtime_delta_to_art_cycles(real_half.val);
+	if (art_half.status < 0 || !art_half.val)
 		return tgpio_output_quantization_err(
 			art_half.status < 0 ? art_half.status : TGPIO_E_RANGE);
 
-	actual_half = tgpio_cycles_to_ns((u64)art_half.val);
+	actual_half = tgpio_art_cycles_to_realtime_delta_ns(art_half.val);
 	if (actual_half.status < 0 || actual_half.ns > S64_MAX)
 		return tgpio_output_quantization_err(
 			actual_half.status < 0 ? actual_half.status :
@@ -1353,7 +1401,7 @@ tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
 	return (struct tgpio_output_quantization){
 		.status = TGPIO_OK,
 		.real_half_period_ns = real_half.val,
-		.art_half_period_cycles = (u64)art_half.val,
+		.art_half_period_cycles = art_half.val,
 		.actual_half_period_ns = actual_half.ns,
 		.actual_period_ns = actual_half.ns * 2,
 		.half_period_error_ns = half_error,
@@ -1976,7 +2024,7 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 	if (!READ_ONCE(activity_log))
 		return;
 
-	actual_half = tgpio_cycles_to_ns(half_period_art);
+	actual_half = tgpio_art_cycles_to_realtime_delta_ns(half_period_art);
 	if (actual_half.status >= 0 && actual_half.ns <= S64_MAX) {
 		struct tgpio_u64_result real_half =
 			tgpio_clock_delta_to_real_ns(dev, half_period_ns);
@@ -2751,7 +2799,7 @@ tgpio_needs_art_frequency(struct tgpio_device *dev)
 {
 	unsigned int i;
 
-	if (hardware_periodic_output) {
+	if (hardware_periodic_output && clock_mode == TGPIO_CLOCK_PHC) {
 		for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
 			if (dev->mmio_blocks[i].mode == TGPIO_MODE_OUTPUT)
 				return TGPIO_REQUIRED;

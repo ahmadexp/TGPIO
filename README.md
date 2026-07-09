@@ -206,9 +206,11 @@ sudo testptp -i 1 -p 1000000000 -d /dev/ptpX
 1-second period output. By default, the driver first primes the output low,
 then arms TGPIO hardware periodic mode: `COMPV` holds the first active edge,
 `PIV` holds the half-period in ART cycles, and `TGPIOCTL.PM` lets hardware
-generate the steady toggle edges. This avoids reprogramming every transition
-from software and supports faster periodic transitions than the hrtimer re-arm
-path can reliably sustain.
+generate the steady toggle edges. The periodic interval is derived through the
+kernel's ART base-clock conversion so the free-running hardware cadence follows
+the same calibrated timebase used for absolute realtime edge programming. This
+avoids reprogramming every transition from software and supports faster periodic
+transitions than the hrtimer re-arm path can reliably sustain.
 
 Modern `testptp` can set pulse width with `-w`, which maps to the Linux
 `PTP_PEROUT_DUTY_CYCLE` request. For example, this generates a 1 ms period with
@@ -358,10 +360,15 @@ In PHC mode, `art_frequency` is required so the driver can convert between ART
 cycles and adjusted PHC nanoseconds. `ART_FREQUENCY=0` still means auto-detect
 from CPUID leaf `0x15` when the CPU reports it.
 
-Hardware periodic output also requires `art_frequency`, because the TGPIO
-periodic interval register is programmed in ART cycles. If CPUID does not
-report the crystal frequency, set `ART_FREQUENCY=<Hz>` manually or load with
-`HARDWARE_PERIODIC_OUTPUT=0` to use the software re-arm fallback.
+In realtime mode, hardware periodic output does not use the CPUID-reported
+`art_frequency` for the free-running interval. It converts the requested period
+through the kernel's ART base-clock relationship, avoiding drift from a nominal
+crystal value that differs from the calibrated system timebase.
+
+In PHC mode, hardware periodic output still requires `art_frequency` because
+the adjustable PHC itself is converted to and from ART cycles. If CPUID does
+not report the crystal frequency, set `ART_FREQUENCY=<Hz>` manually or load
+with `HARDWARE_PERIODIC_OUTPUT=0` to use the software re-arm fallback.
 
 The CPUID `0x15` ratio is the TSC-to-ART ratio:
 `TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for
