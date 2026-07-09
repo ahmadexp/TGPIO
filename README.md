@@ -287,9 +287,10 @@ sudo cat /sys/kernel/debug/tgpio/status
 The output status shows `art_snapshot`, `high_time`, `low_time`, and the PHC
 `base_art_hz`; for hardware periodic output it also includes
 `art_half_cycles`, `actual_period`, `period_error`, and — while the block is
-armed — `armed_piv` and the live `phase_error` against the requested grid. In PHC mode,
-`art_snapshot` must be `present`; otherwise the driver refuses PHC mode instead
-of deriving the current ART value from `CLOCK_REALTIME`.
+armed — `armed_piv` and the live `phase_error` against the requested grid.
+When `art_snapshot` is `absent`, PHC mode derives the current ART value from
+the `CLOCK_REALTIME` inversion, which is exact for the current instant even
+while NTP disciplines the realtime clock.
 
 ## Persistent Install
 

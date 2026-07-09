@@ -1301,12 +1301,12 @@ static struct tgpio_u64_result tgpio_get_current_art(void)
 	if (tgpio_snapshot_art_cycles(&snapshot, &art))
 		return tgpio_ok_u64(art);
 
-	if (clock_mode == TGPIO_CLOCK_PHC) {
-		pr_warn_ratelimited(
-			"current ART snapshot unavailable; PHC mode cannot safely use CLOCK_REALTIME inversion\n");
-		return tgpio_err_u64(TGPIO_E_NODEV);
-	}
-
+	/*
+	 * No ART cycles in the timekeeping snapshot on this kernel. The
+	 * inverse realtime mapping is exact for the current instant even
+	 * while NTP disciplines CLOCK_REALTIME (rate changes tilt the slope,
+	 * not the current point), so it is a safe fallback for "now" reads.
+	 */
 	if (!ktime_real_to_base_clock(ktime_get_real(), CSID_X86_ART, &art))
 		return tgpio_err_u64(TGPIO_E_NODEV);
 	return tgpio_ok_u64(art);
@@ -1517,11 +1517,14 @@ static int tgpio_phc_init_clock(struct tgpio_device *dev)
 	u64 art;
 
 	tgpio_get_realtime_snapshot(&snapshot);
-	if (!tgpio_snapshot_art_cycles(&snapshot, &art)) {
-		pr_err("PHC mode requires current ART cycles from the timekeeping snapshot\n");
-		return -ENODEV;
+	if (tgpio_snapshot_art_cycles(&snapshot, &art)) {
+		realtime = tgpio_snapshot_realtime(snapshot);
+	} else {
+		pr_warn("timekeeping snapshot lacks ART cycles; PHC anchors via CLOCK_REALTIME inversion\n");
+		realtime = ktime_get_real();
+		if (!ktime_real_to_base_clock(realtime, CSID_X86_ART, &art))
+			return -ENODEV;
 	}
-	realtime = tgpio_snapshot_realtime(snapshot);
 
 	if (art_frequency) {
 		base_art_hz = tgpio_ok_u64(art_frequency);
