@@ -13,6 +13,12 @@ Each static TGPIO block can be selected independently as:
 
 The default is both blocks as inputs, matching the first working input setup.
 
+## Pre Req
+
+```
+sudo apt install make gcc
+```
+
 ## Build And Load
 
 ```sh
