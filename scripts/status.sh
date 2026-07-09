@@ -22,7 +22,8 @@ for param in clock_mode timestamp_mode output_polarity art_frequency \
 	tsc_art_numerator tsc_art_denominator hardware_timestamps \
 	hardware_periodic_output activity_log input0_enable input1_enable \
 	input0_channel input1_channel output0_channel output1_channel \
-	output0_period_ns output1_period_ns output_start_delay_ns; do
+	output0_period_ns output1_period_ns output0_duty_ns output1_duty_ns \
+	output_start_delay_ns; do
 	path="/sys/module/tgpio_ptp_input/parameters/${param}"
 	[ -r "${path}" ] || continue
 	printf '%s=%s\n' "${param}" "$(cat "${path}")"

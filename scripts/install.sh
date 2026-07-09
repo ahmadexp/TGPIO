@@ -32,6 +32,8 @@ OUTPUT0_CHANNEL="${OUTPUT0_CHANNEL:-0}"
 OUTPUT1_CHANNEL="${OUTPUT1_CHANNEL:-1}"
 OUTPUT0_PERIOD_NS="${OUTPUT0_PERIOD_NS:-0}"
 OUTPUT1_PERIOD_NS="${OUTPUT1_PERIOD_NS:-0}"
+OUTPUT0_DUTY_NS="${OUTPUT0_DUTY_NS:-0}"
+OUTPUT1_DUTY_NS="${OUTPUT1_DUTY_NS:-0}"
 OUTPUT_START_DELAY_NS="${OUTPUT_START_DELAY_NS:-0}"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -74,6 +76,8 @@ depmod "${KREL}"
 	printf ' output1_channel=%s' "${OUTPUT1_CHANNEL}"
 	printf ' output0_period_ns=%s' "${OUTPUT0_PERIOD_NS}"
 	printf ' output1_period_ns=%s' "${OUTPUT1_PERIOD_NS}"
+	printf ' output0_duty_ns=%s' "${OUTPUT0_DUTY_NS}"
+	printf ' output1_duty_ns=%s' "${OUTPUT1_DUTY_NS}"
 	printf ' output_start_delay_ns=%s\n' "${OUTPUT_START_DELAY_NS}"
 } >/etc/modprobe.d/tgpio-ptp-input.conf
 

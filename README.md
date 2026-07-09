@@ -51,6 +51,8 @@ output0_channel=0
 output1_channel=1
 output0_period_ns=0
 output1_period_ns=0
+output0_duty_ns=0
+output1_duty_ns=0
 output_start_delay_ns=0
 ```
 
@@ -82,6 +84,7 @@ sudo make reload MODE0=output MODE1=off
 sudo make reload MODE0=output MODE1=input EDGE1=rising
 sudo make reload MODE0=input TIMESTAMP_MODE=art
 sudo make reload MODE0=output OUTPUT_POLARITY=inverted
+sudo make reload MODE0=output OUTPUT0_PERIOD_NS=1000000 OUTPUT0_DUTY_NS=250000
 sudo make reload MODE0=output HARDWARE_PERIODIC_OUTPUT=0
 sudo make reload MODE0=input MODE1=off
 sudo make reload CLOCK_MODE=realtime MODE0=input MODE1=off
@@ -207,6 +210,18 @@ generate the steady toggle edges. This avoids reprogramming every transition
 from software and supports faster periodic transitions than the hrtimer re-arm
 path can reliably sustain.
 
+Modern `testptp` can set pulse width with `-w`, which maps to the Linux
+`PTP_PEROUT_DUTY_CYCLE` request. For example, this generates a 1 ms period with
+250 us on-time:
+
+```sh
+sudo testptp -i 0 -p 1000000 -w 250000 -d /dev/ptpX
+```
+
+The hardware periodic engine is fixed to 50% duty. When the requested on-time is
+not exactly half the period, the driver automatically uses the software re-arm
+path and programs explicit rising and falling edges.
+
 Use `HARDWARE_PERIODIC_OUTPUT=0` to return to the older software re-arm path:
 
 ```sh
@@ -241,10 +256,21 @@ sudo journalctl -k -f -g 'tgpio_ptp_input: activity='
 
 Input lines include the block, PTP channel, edge selection, event counter,
 event-counter delta, raw ART capture value, and emitted timestamp. Output lines
-include perout arming, requested period, the integer half-period, ART-cycle
-quantization, actual half-period, and rounding/split error fields. In hardware
-periodic mode the hardware free-runs after arming, so the journal records the
-programmed periodic setup rather than every physical edge.
+include perout arming, requested period, high/on time, low/off time, ART-cycle
+quantization for hardware periodic output, calculated full period, and
+rounding/split error fields. In hardware periodic mode the hardware free-runs
+after arming, so the journal records the programmed periodic setup rather than
+every physical edge. In software mode, the journal can record each programmed
+transition.
+
+For a quick frequency sanity check while an output is running:
+
+```sh
+sudo cat /sys/kernel/debug/tgpio/status
+```
+
+The output status shows `high_time` and `low_time`; for hardware periodic output
+it also includes `art_half_cycles`, `actual_period`, and `period_error`.
 
 ## Persistent Install
 
@@ -275,6 +301,9 @@ The persisted operation options are:
   those inputs; defaults are `0` and `1`.
 - `OUTPUT0_PERIOD_NS` and `OUTPUT1_PERIOD_NS`: start periodic output at module
   load for an output-mode block; `0` disables restored output.
+- `OUTPUT0_DUTY_NS` and `OUTPUT1_DUTY_NS`: optional output on/high time in
+  nanoseconds for restored output. `0` means 50% duty. Non-50% duty uses the
+  software re-arm path.
 - `OUTPUT0_CHANNEL` and `OUTPUT1_CHANNEL`: PTP periodic-output channels for
   those outputs; defaults are `0` and `1`.
 - `OUTPUT_START_DELAY_NS`: optional delay from current PTP time to the first
