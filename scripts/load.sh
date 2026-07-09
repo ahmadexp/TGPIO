@@ -19,6 +19,16 @@ POLL_MS="${POLL_MS:-10}"
 ART_FREQUENCY="${ART_FREQUENCY:-0}"
 HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
 HARDWARE_PERIODIC_OUTPUT="${HARDWARE_PERIODIC_OUTPUT:-1}"
+ACTIVITY_LOG="${ACTIVITY_LOG:-0}"
+INPUT0_ENABLE="${INPUT0_ENABLE:-0}"
+INPUT1_ENABLE="${INPUT1_ENABLE:-0}"
+INPUT0_CHANNEL="${INPUT0_CHANNEL:-0}"
+INPUT1_CHANNEL="${INPUT1_CHANNEL:-1}"
+OUTPUT0_CHANNEL="${OUTPUT0_CHANNEL:-0}"
+OUTPUT1_CHANNEL="${OUTPUT1_CHANNEL:-1}"
+OUTPUT0_PERIOD_NS="${OUTPUT0_PERIOD_NS:-0}"
+OUTPUT1_PERIOD_NS="${OUTPUT1_PERIOD_NS:-0}"
+OUTPUT_START_DELAY_NS="${OUTPUT_START_DELAY_NS:-0}"
 
 tgpio_input_loaded()
 {
@@ -71,6 +81,13 @@ insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	timestamp_mode="${TIMESTAMP_MODE}" \
 	output_polarity="${OUTPUT_POLARITY}" poll_ms="${POLL_MS}" \
 	art_frequency="${ART_FREQUENCY}" hardware_timestamps="${HARDWARE_TIMESTAMPS}" \
-	hardware_periodic_output="${HARDWARE_PERIODIC_OUTPUT}"
+	hardware_periodic_output="${HARDWARE_PERIODIC_OUTPUT}" \
+	activity_log="${ACTIVITY_LOG}" \
+	input0_enable="${INPUT0_ENABLE}" input1_enable="${INPUT1_ENABLE}" \
+	input0_channel="${INPUT0_CHANNEL}" input1_channel="${INPUT1_CHANNEL}" \
+	output0_channel="${OUTPUT0_CHANNEL}" output1_channel="${OUTPUT1_CHANNEL}" \
+	output0_period_ns="${OUTPUT0_PERIOD_NS}" \
+	output1_period_ns="${OUTPUT1_PERIOD_NS}" \
+	output_start_delay_ns="${OUTPUT_START_DELAY_NS}"
 
 "${SCRIPT_DIR}/status.sh"

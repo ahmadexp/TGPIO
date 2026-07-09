@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 /*
  * Intel Time-Aware GPIO PTP input/output add-on driver.
  * Copyright (c) 2026 Ahmad Byagowi
@@ -185,6 +187,16 @@ static enum tgpio_timestamp_mode timestamp_mode;
 static enum tgpio_output_polarity output_polarity;
 static bool hardware_timestamps = true;
 static bool hardware_periodic_output = true;
+static bool activity_log;
+static bool input0_enable;
+static bool input1_enable;
+static unsigned int input0_channel;
+static unsigned int input1_channel = 1;
+static unsigned int output0_channel;
+static unsigned int output1_channel = 1;
+static unsigned long output0_period_ns;
+static unsigned long output1_period_ns;
+static unsigned long output_start_delay_ns;
 
 module_param(addr0, ulong, 0444);
 MODULE_PARM_DESC(addr0, "MMIO base for first TGPIO block");
@@ -249,6 +261,46 @@ module_param(hardware_periodic_output, bool, 0444);
 MODULE_PARM_DESC(hardware_periodic_output,
 		 "Use TGPIO hardware periodic mode for PTP periodic output");
 
+module_param(activity_log, bool, 0644);
+MODULE_PARM_DESC(activity_log,
+		 "Log input captures and output activity to the kernel journal");
+
+module_param(input0_enable, bool, 0444);
+MODULE_PARM_DESC(input0_enable,
+		 "Enable external timestamp capture on input block 0 at load");
+
+module_param(input1_enable, bool, 0444);
+MODULE_PARM_DESC(input1_enable,
+		 "Enable external timestamp capture on input block 1 at load");
+
+module_param(input0_channel, uint, 0444);
+MODULE_PARM_DESC(input0_channel,
+		 "PTP external timestamp channel for persisted input block 0");
+
+module_param(input1_channel, uint, 0444);
+MODULE_PARM_DESC(input1_channel,
+		 "PTP external timestamp channel for persisted input block 1");
+
+module_param(output0_channel, uint, 0444);
+MODULE_PARM_DESC(output0_channel,
+		 "PTP periodic-output channel for persisted output block 0");
+
+module_param(output1_channel, uint, 0444);
+MODULE_PARM_DESC(output1_channel,
+		 "PTP periodic-output channel for persisted output block 1");
+
+module_param(output0_period_ns, ulong, 0444);
+MODULE_PARM_DESC(output0_period_ns,
+		 "Start block 0 periodic output at load with this period in ns; 0 disables");
+
+module_param(output1_period_ns, ulong, 0444);
+MODULE_PARM_DESC(output1_period_ns,
+		 "Start block 1 periodic output at load with this period in ns; 0 disables");
+
+module_param(output_start_delay_ns, ulong, 0444);
+MODULE_PARM_DESC(output_start_delay_ns,
+		 "Optional delay from current PTP time to first persisted output edge");
+
 /* PHC time = anchor_ns + (ART cycles since anchor_art) scaled by scaled_ppm. */
 struct tgpio_phc_params {
 	u64 anchor_art;
@@ -292,6 +344,15 @@ struct tgpio_output_timing {
 	ktime_t timer_start;
 };
 
+struct tgpio_output_quantization {
+	enum tgpio_status status;
+	u64 real_half_period_ns;
+	u64 art_half_period_cycles;
+	u64 actual_half_period_ns;
+	s64 half_period_error_ns;
+	s64 period_split_error_ns;
+};
+
 struct tgpio_crosststamp_capture {
 	enum tgpio_snapshot_state state;
 	struct system_time_snapshot snapshot;
@@ -305,6 +366,7 @@ struct tgpio_output_desired {
 	unsigned int gen;
 	enum tgpio_output_run run;
 	enum tgpio_output_mode mode;
+	u64 period_ns;
 	u64 half_period_ns;
 	s64 first_edge_ns;
 };
@@ -379,6 +441,52 @@ static const char *tgpio_mode_name(enum tgpio_mode mode)
 	default:
 		return "off";
 	}
+}
+
+static const char *tgpio_edge_bits_name(u32 edge_bits)
+{
+	switch (edge_bits & TGPIOCTL_EP) {
+	case TGPIOCTL_EP_RISING:
+		return "rising";
+	case TGPIOCTL_EP_FALLING:
+		return "falling";
+	case TGPIOCTL_EP_TOGGLE:
+		return "both";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *tgpio_output_mode_name(enum tgpio_output_mode mode)
+{
+	switch (mode) {
+	case TGPIO_OUTPUT_SOFTWARE:
+		return "software";
+	case TGPIO_OUTPUT_HARDWARE:
+		return "hardware";
+	default:
+		return "unknown";
+	}
+}
+
+static bool tgpio_persistent_input_enabled(unsigned int block_index)
+{
+	return block_index == 0 ? input0_enable : input1_enable;
+}
+
+static unsigned int tgpio_persistent_input_channel(unsigned int block_index)
+{
+	return block_index == 0 ? input0_channel : input1_channel;
+}
+
+static u64 tgpio_persistent_output_period_ns(unsigned int block_index)
+{
+	return block_index == 0 ? output0_period_ns : output1_period_ns;
+}
+
+static unsigned int tgpio_persistent_output_channel(unsigned int block_index)
+{
+	return block_index == 0 ? output0_channel : output1_channel;
 }
 
 struct tgpio_mode_result {
@@ -845,6 +953,14 @@ tgpio_ptp_time_to_s64_ns(const struct ptp_clock_time *time)
 	return tgpio_ok_s64(time->sec * NSEC_PER_SEC + time->nsec);
 }
 
+static void tgpio_ptp_time_from_ns(u64 ns, struct ptp_clock_time *time)
+{
+	u64 nsec;
+
+	time->sec = div64_u64_rem(ns, NSEC_PER_SEC, &nsec);
+	time->nsec = nsec;
+}
+
 static inline u32 tgpio_readl(struct tgpio_mmio_block *mmio_block, u32 offset)
 {
 	return readl(mmio_block->regs + offset);
@@ -1063,6 +1179,48 @@ tgpio_clock_delta_to_art_cycles(struct tgpio_device *dev, s64 clock_delta_ns)
 	return tgpio_ok_u64(cycles.val);
 }
 
+static struct tgpio_output_quantization
+tgpio_output_quantization_err(enum tgpio_status status)
+{
+	return (struct tgpio_output_quantization){ .status = status };
+}
+
+static struct tgpio_output_quantization
+tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
+			      u64 half_period_ns)
+{
+	struct tgpio_u64_result real_half =
+		tgpio_clock_delta_to_real_ns(dev, half_period_ns);
+	struct tgpio_s64_result art_half;
+	struct tgpio_ns_result actual_half;
+
+	if (real_half.status < 0 || real_half.val > S64_MAX)
+		return tgpio_output_quantization_err(
+			real_half.status < 0 ? real_half.status :
+					       TGPIO_E_RANGE);
+
+	art_half = tgpio_ns_delta_to_art(real_half.val);
+	if (art_half.status < 0 || art_half.val <= 0)
+		return tgpio_output_quantization_err(
+			art_half.status < 0 ? art_half.status : TGPIO_E_RANGE);
+
+	actual_half = tgpio_cycles_to_ns((u64)art_half.val);
+	if (actual_half.status < 0 || actual_half.ns > S64_MAX)
+		return tgpio_output_quantization_err(
+			actual_half.status < 0 ? actual_half.status :
+						 TGPIO_E_RANGE);
+
+	return (struct tgpio_output_quantization){
+		.status = TGPIO_OK,
+		.real_half_period_ns = real_half.val,
+		.art_half_period_cycles = (u64)art_half.val,
+		.actual_half_period_ns = actual_half.ns,
+		.half_period_error_ns =
+			(s64)actual_half.ns - (s64)real_half.val,
+		.period_split_error_ns = period_ns & 1 ? -1 : 0,
+	};
+}
+
 static int tgpio_phc_init_clock(struct tgpio_device *dev)
 {
 	ktime_t realtime;
@@ -1189,9 +1347,27 @@ static unsigned int tgpio_channel_for_mmio_block(struct tgpio_device *dev,
 	return block_index;
 }
 
+static void tgpio_log_input_event(struct tgpio_mmio_block *mmio_block,
+				  unsigned int channel, u64 event_count,
+				  u64 event_delta, u64 art_cycles,
+				  s64 timestamp_ns, bool fallback)
+{
+	if (!READ_ONCE(activity_log))
+		return;
+
+	pr_info("activity=input_event block=%u channel=%u edge=%s event_count=%llu event_delta=%llu art=%llu timestamp_ns=%lld clock_mode=%s timestamp_mode=%s hardware_timestamps=%c fallback=%c\n",
+		mmio_block->index, channel,
+		tgpio_edge_bits_name(mmio_block->input_applied),
+		event_count, event_delta, art_cycles, timestamp_ns,
+		tgpio_clock_mode_name(clock_mode),
+		tgpio_timestamp_mode_name(timestamp_mode),
+		hardware_timestamps ? 'Y' : 'N', fallback ? 'Y' : 'N');
+}
+
 static void tgpio_emit_event(struct tgpio_device *dev,
 			     struct tgpio_mmio_block *mmio_block,
-			     unsigned int index, u64 art_cycles)
+			     unsigned int index, u64 art_cycles,
+			     u64 event_count, u64 event_delta)
 {
 	struct ptp_clock_event event = {
 		.type = PTP_CLOCK_EXTTS,
@@ -1199,6 +1375,7 @@ static void tgpio_emit_event(struct tgpio_device *dev,
 	};
 
 	struct tgpio_s64_result ts;
+	bool fallback = false;
 
 	if (!dev->ptp_clock)
 		return;
@@ -1213,6 +1390,7 @@ static void tgpio_emit_event(struct tgpio_device *dev,
 			trace_tgpio_timestamp_fallback(mmio_block->index,
 						       art_cycles);
 			atomic64_inc(&dev->stats.fallbacks);
+			fallback = true;
 			pr_warn_ratelimited(
 				"ART->PHC convert failed; used poll time\n");
 			ts = tgpio_clock_now_ns(dev);
@@ -1227,6 +1405,7 @@ static void tgpio_emit_event(struct tgpio_device *dev,
 			trace_tgpio_timestamp_fallback(mmio_block->index,
 						       art_cycles);
 			atomic64_inc(&dev->stats.fallbacks);
+			fallback = true;
 			pr_warn_ratelimited(
 				"ART->CLOCK_REALTIME convert failed; used poll time\n");
 			ts = tgpio_ok_s64(ktime_get_real_ns());
@@ -1239,6 +1418,8 @@ static void tgpio_emit_event(struct tgpio_device *dev,
 
 	event.timestamp = ts.val;
 	atomic64_inc(&dev->stats.events);
+	tgpio_log_input_event(mmio_block, index, event_count, event_delta,
+			      art_cycles, ts.val, fallback);
 	ptp_clock_event(dev->ptp_clock, &event);
 }
 
@@ -1323,12 +1504,15 @@ static void tgpio_poll_work(struct work_struct *work)
 
 		if (cap.event_count != mmio_block->last_event_count) {
 			unsigned int channel;
+			u64 event_delta = cap.event_count -
+					  mmio_block->last_event_count;
 
 			mmio_block->last_event_count = cap.event_count;
 			channel = tgpio_channel_for_mmio_block(dev, i,
 							       PTP_PF_EXTTS);
 			tgpio_emit_event(dev, mmio_block, channel,
-					 cap.art_cycles);
+					 cap.art_cycles, cap.event_count,
+					 event_delta);
 		}
 
 		mmio_block->crosststamp_snapshot = snap.snapshot;
@@ -1345,6 +1529,7 @@ static int tgpio_config_input(struct tgpio_device *dev, unsigned int channel,
 {
 	struct tgpio_mmio_block *mmio_block;
 	int block_index;
+	u32 edge_bits = 0;
 
 	block_index =
 		tgpio_find_mmio_block_for_channel(dev, PTP_PF_EXTTS, channel);
@@ -1355,11 +1540,16 @@ static int tgpio_config_input(struct tgpio_device *dev, unsigned int channel,
 	if (mmio_block->mode != TGPIO_MODE_INPUT || !mmio_block->regs)
 		return -EOPNOTSUPP;
 
+	if (on)
+		edge_bits = tgpio_input_edge_bits(mmio_block, flags);
+
 	atomic_set(&mmio_block->input_desired,
-		   on ? tgpio_input_desired(TGPIO_CAPTURE_ON,
-					    tgpio_input_edge_bits(mmio_block,
-								  flags)) :
+		   on ? tgpio_input_desired(TGPIO_CAPTURE_ON, edge_bits) :
 			tgpio_input_desired(TGPIO_CAPTURE_OFF, 0));
+	if (READ_ONCE(activity_log))
+		pr_info("activity=input_config block=%u channel=%u state=%s edge=%s flags=%#x\n",
+			mmio_block->index, channel, on ? "on" : "off",
+			on ? tgpio_edge_bits_name(edge_bits) : "none", flags);
 	/*
 	 * Reconcile now, not a poll period from now: a deferred disable would keep
 	 * delivering EXTTS events until the next tick, and schedule_delayed_work()
@@ -1483,6 +1673,11 @@ static void tgpio_disable_output_hw(struct tgpio_mmio_block *mmio_block)
 	mmio_block->output_phase = TGPIO_OUTPUT_TOGGLE;
 }
 
+static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
+					 struct tgpio_mmio_block *mmio_block,
+					 s64 first_edge_ns, u64 half_period_ns,
+					 u64 first_art, u64 half_period_art);
+
 /* output_work-only: switch the block to autonomous hardware periodic output. */
 static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 				       struct tgpio_mmio_block *mmio_block,
@@ -1514,6 +1709,9 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	mmio_block->output_next_edge = ns_to_ktime(first_edge_ns);
 	mmio_block->output_phase = TGPIO_OUTPUT_HARDWARE_PERIODIC;
 
+	tgpio_log_output_hw_periodic(dev, mmio_block, first_edge_ns,
+				     half_period_ns, first_art.val,
+				     half_period_art.val);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
 	return 0;
 }
@@ -1566,6 +1764,106 @@ tgpio_output_desired_get(struct tgpio_mmio_block *mmio_block)
 	return desired;
 }
 
+static void tgpio_log_output_arm(struct tgpio_device *dev,
+				 struct tgpio_mmio_block *mmio_block,
+				 const struct tgpio_output_desired *desired,
+				 const struct tgpio_output_timing *timing)
+{
+	struct tgpio_output_quantization quant;
+	unsigned int channel;
+	s64 start_adjust_ns;
+
+	if (!READ_ONCE(activity_log))
+		return;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	start_adjust_ns = timing->first_edge_ns - desired->first_edge_ns;
+	quant = tgpio_output_quantization_get(dev, desired->period_ns,
+					       desired->half_period_ns);
+
+	if (quant.status < 0) {
+		pr_info("activity=output_arm block=%u channel=%u mode=%s requested_period_ns=%llu requested_half_ns=%llu quantization_status=%d requested_first_edge_ns=%lld armed_first_edge_ns=%lld start_adjust_ns=%lld prime_edge_ns=%lld\n",
+			mmio_block->index, channel,
+			tgpio_output_mode_name(desired->mode),
+			desired->period_ns, desired->half_period_ns,
+			quant.status, desired->first_edge_ns,
+			timing->first_edge_ns, start_adjust_ns,
+			timing->prime_edge_ns);
+		return;
+	}
+
+	pr_info("activity=output_arm block=%u channel=%u mode=%s requested_period_ns=%llu requested_half_ns=%llu real_half_ns=%llu art_half_cycles=%llu actual_half_ns=%llu half_error_ns=%lld period_split_error_ns=%lld requested_first_edge_ns=%lld armed_first_edge_ns=%lld start_adjust_ns=%lld prime_edge_ns=%lld\n",
+		mmio_block->index, channel,
+		tgpio_output_mode_name(desired->mode), desired->period_ns,
+		desired->half_period_ns, quant.real_half_period_ns,
+		quant.art_half_period_cycles, quant.actual_half_period_ns,
+		quant.half_period_error_ns, quant.period_split_error_ns,
+		desired->first_edge_ns, timing->first_edge_ns, start_adjust_ns,
+		timing->prime_edge_ns);
+}
+
+static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
+					 struct tgpio_mmio_block *mmio_block,
+					 s64 first_edge_ns, u64 half_period_ns,
+					 u64 first_art, u64 half_period_art)
+{
+	struct tgpio_ns_result actual_half;
+	unsigned int channel;
+	s64 half_error_ns = 0;
+
+	if (!READ_ONCE(activity_log))
+		return;
+
+	actual_half = tgpio_cycles_to_ns(half_period_art);
+	if (actual_half.status >= 0 && actual_half.ns <= S64_MAX) {
+		struct tgpio_u64_result real_half =
+			tgpio_clock_delta_to_real_ns(dev, half_period_ns);
+
+		if (real_half.status >= 0 && real_half.val <= S64_MAX)
+			half_error_ns =
+				(s64)actual_half.ns - (s64)real_half.val;
+	}
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("activity=output_hw_periodic block=%u channel=%u first_edge_ns=%lld first_art=%llu half_period_ns=%llu art_half_cycles=%llu actual_half_ns=%llu half_error_ns=%lld\n",
+		mmio_block->index, channel, first_edge_ns, first_art,
+		half_period_ns, half_period_art,
+		actual_half.status < 0 ? 0 : actual_half.ns, half_error_ns);
+}
+
+static void tgpio_log_output_edge(struct tgpio_device *dev,
+				  struct tgpio_mmio_block *mmio_block,
+				  ktime_t edge_time, u32 edge_bits,
+				  u64 interval_ns)
+{
+	unsigned int channel;
+
+	if (!READ_ONCE(activity_log))
+		return;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("activity=output_edge block=%u channel=%u programmed_edge=%s edge_time_ns=%lld next_interval_ns=%llu\n",
+		mmio_block->index, channel, tgpio_edge_bits_name(edge_bits),
+		ktime_to_ns(edge_time), interval_ns);
+}
+
+static void tgpio_log_output_stop(struct tgpio_device *dev,
+				  struct tgpio_mmio_block *mmio_block)
+{
+	unsigned int channel;
+
+	if (!READ_ONCE(activity_log))
+		return;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("activity=output_stop block=%u channel=%u\n",
+		mmio_block->index, channel);
+}
+
 /* Precise wake only: hand off to process context, touch no hardware. */
 static enum hrtimer_restart tgpio_output_timer(struct hrtimer *timer)
 {
@@ -1598,6 +1896,7 @@ static void tgpio_output_work(struct work_struct *work)
 
 	if (desired.run == TGPIO_OUTPUT_STOPPED) {
 		hrtimer_cancel(&mmio_block->output_timer);
+		tgpio_log_output_stop(dev, mmio_block);
 		tgpio_disable_output_hw(mmio_block);
 		return;
 	}
@@ -1622,6 +1921,7 @@ static void tgpio_output_work(struct work_struct *work)
 			return;
 		}
 		mmio_block->output_applied_gen = desired.gen;
+		tgpio_log_output_arm(dev, mmio_block, &desired, &timing);
 		tgpio_output_wake_at(mmio_block, timing.timer_start);
 		return;
 	}
@@ -1667,6 +1967,8 @@ static void tgpio_output_work(struct work_struct *work)
 
 	mmio_block->output_next_edge = next_edge;
 	mmio_block->output_phase = TGPIO_OUTPUT_TOGGLE;
+	tgpio_log_output_edge(dev, mmio_block, next_edge, edge_bits,
+			      interval.val);
 	/*
 	 * Advance the cadence from the previous wake, not from now, so workqueue
 	 * latency doesn't erode the lead time period over period.
@@ -1694,7 +1996,8 @@ static void tgpio_disable_output(struct tgpio_mmio_block *mmio_block)
 static void tgpio_output_publish(struct tgpio_mmio_block *mmio_block,
 				 enum tgpio_output_run run,
 				 enum tgpio_output_mode mode,
-				 u64 half_period_ns, s64 first_edge_ns)
+				 u64 period_ns, u64 half_period_ns,
+				 s64 first_edge_ns)
 {
 	unsigned long flags;
 
@@ -1703,6 +2006,7 @@ static void tgpio_output_publish(struct tgpio_mmio_block *mmio_block,
 		.gen = mmio_block->output_desired.gen + 1,
 		.run = run,
 		.mode = mode,
+		.period_ns = period_ns,
 		.half_period_ns = half_period_ns,
 		.first_edge_ns = first_edge_ns,
 	};
@@ -1770,7 +2074,93 @@ static int tgpio_config_output(struct tgpio_device *dev,
 		return -ENODEV;
 
 	tgpio_output_publish(mmio_block, TGPIO_OUTPUT_RUNNING, mode,
-			     half_period_ns, first_edge.val);
+			     period.val, half_period_ns, first_edge.val);
+	return 0;
+}
+
+static int tgpio_start_persistent_input(struct tgpio_device *dev,
+					unsigned int block_index)
+{
+	unsigned int channel = tgpio_persistent_input_channel(block_index);
+	int ret;
+
+	ret = tgpio_config_input(dev, channel, 0, 1);
+	if (ret)
+		return ret;
+
+	pr_info("persisted input capture enabled block=%u channel=%u edge=%s\n",
+		block_index, channel,
+		tgpio_edge_bits_name(dev->mmio_blocks[block_index].input_edge_bits));
+	return 0;
+}
+
+static int tgpio_start_persistent_output(struct tgpio_device *dev,
+					 unsigned int block_index)
+{
+	struct ptp_perout_request perout = {};
+	struct tgpio_s64_result now;
+	struct tgpio_s64_result first_edge;
+	u64 period_ns = tgpio_persistent_output_period_ns(block_index);
+	unsigned int channel = tgpio_persistent_output_channel(block_index);
+	int ret;
+
+	perout.index = channel;
+	tgpio_ptp_time_from_ns(period_ns, &perout.period);
+
+	if (output_start_delay_ns) {
+		if (output_start_delay_ns > S64_MAX)
+			return -ERANGE;
+
+		now = tgpio_clock_now_ns(dev);
+		if (now.status < 0 || now.val < 0)
+			return -ENODEV;
+
+		first_edge = tgpio_add_s64(now.val,
+					   (s64)output_start_delay_ns);
+		if (first_edge.status < 0 || first_edge.val < 0)
+			return -ERANGE;
+
+		tgpio_ptp_time_from_ns((u64)first_edge.val, &perout.start);
+	}
+
+	ret = tgpio_config_output(dev, &perout, 1);
+	if (ret)
+		return ret;
+
+	pr_info("persisted output enabled block=%u channel=%u period_ns=%llu start_delay_ns=%lu\n",
+		block_index, channel, period_ns, output_start_delay_ns);
+	return 0;
+}
+
+static int tgpio_start_persistent_operations(struct tgpio_device *dev)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		if (!tgpio_persistent_input_enabled(i))
+			continue;
+
+		ret = tgpio_start_persistent_input(dev, i);
+		if (ret) {
+			pr_err("failed to start persisted input%u: %d\n", i,
+			       ret);
+			return ret;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		if (!tgpio_persistent_output_period_ns(i))
+			continue;
+
+		ret = tgpio_start_persistent_output(dev, i);
+		if (ret) {
+			pr_err("failed to start persisted output%u: %d\n", i,
+			       ret);
+			return ret;
+		}
+	}
+
 	return 0;
 }
 
@@ -2197,6 +2587,82 @@ tgpio_needs_art_base_clock(struct tgpio_device *dev)
 	return TGPIO_NOT_REQUIRED;
 }
 
+static int tgpio_validate_persistent_operations(struct tgpio_device *dev)
+{
+	unsigned int i;
+	unsigned int j;
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
+		bool input_enabled = tgpio_persistent_input_enabled(i);
+		u64 output_period_ns = tgpio_persistent_output_period_ns(i);
+
+		if (input_enabled && output_period_ns) {
+			pr_err("block %u cannot persist both input capture and output generation\n",
+			       i);
+			return -EINVAL;
+		}
+
+		if (output_period_ns > S64_MAX) {
+			pr_err("output%u_period_ns=%llu is too large\n", i,
+			       output_period_ns);
+			return -ERANGE;
+		}
+
+		if (input_enabled && mmio_block->mode != TGPIO_MODE_INPUT) {
+			pr_err("input%u_enable requires mode%u=input\n", i, i);
+			return -EINVAL;
+		}
+
+		if (output_period_ns &&
+		    mmio_block->mode != TGPIO_MODE_OUTPUT) {
+			pr_err("output%u_period_ns requires mode%u=output\n",
+			       i, i);
+			return -EINVAL;
+		}
+
+		if (input_enabled &&
+		    tgpio_persistent_input_channel(i) >= dev->n_ptp_pins) {
+			pr_err("input%u_channel=%u exceeds available PTP channels\n",
+			       i, tgpio_persistent_input_channel(i));
+			return -EINVAL;
+		}
+
+		if (output_period_ns &&
+		    tgpio_persistent_output_channel(i) >= dev->n_ptp_pins) {
+			pr_err("output%u_channel=%u exceeds available PTP channels\n",
+			       i, tgpio_persistent_output_channel(i));
+			return -EINVAL;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		for (j = i + 1; j < ARRAY_SIZE(dev->mmio_blocks); j++) {
+			if (tgpio_persistent_input_enabled(i) &&
+			    tgpio_persistent_input_enabled(j) &&
+			    tgpio_persistent_input_channel(i) ==
+				    tgpio_persistent_input_channel(j)) {
+				pr_err("input%u_channel and input%u_channel both use PTP channel %u\n",
+				       i, j,
+				       tgpio_persistent_input_channel(i));
+				return -EINVAL;
+			}
+
+			if (tgpio_persistent_output_period_ns(i) &&
+			    tgpio_persistent_output_period_ns(j) &&
+			    tgpio_persistent_output_channel(i) ==
+				    tgpio_persistent_output_channel(j)) {
+				pr_err("output%u_channel and output%u_channel both use PTP channel %u\n",
+				       i, j,
+				       tgpio_persistent_output_channel(i));
+				return -EINVAL;
+			}
+		}
+	}
+
+	return 0;
+}
+
 static void tgpio_setup_pin_descs(struct tgpio_device *dev)
 {
 	unsigned int i;
@@ -2208,6 +2674,16 @@ static void tgpio_setup_pin_descs(struct tgpio_device *dev)
 		dev->pin_config[i].index = i;
 		dev->pin_config[i].func = PTP_PF_NONE;
 		dev->pin_config[i].chan = i;
+
+		if (tgpio_persistent_input_enabled(i)) {
+			dev->pin_config[i].func = PTP_PF_EXTTS;
+			dev->pin_config[i].chan =
+				tgpio_persistent_input_channel(i);
+		} else if (tgpio_persistent_output_period_ns(i)) {
+			dev->pin_config[i].func = PTP_PF_PEROUT;
+			dev->pin_config[i].chan =
+				tgpio_persistent_output_channel(i);
+		}
 	}
 }
 
@@ -2256,6 +2732,8 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "clock_mode: %s\n", tgpio_clock_mode_name(clock_mode));
 	seq_printf(m, "art_frequency: %lu Hz\n", art_frequency);
+	seq_printf(m, "activity_log: %s\n",
+		   READ_ONCE(activity_log) ? "on" : "off");
 	seq_printf(m, "art_base_clock: %s\n",
 		   timekeeping_clocksource_has_base(CSID_X86_ART) ? "present" :
 								    "absent");
@@ -2275,13 +2753,17 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 					   "on" :
 					   "off",
 				   mmio_block->last_event_count);
-		else if (mmio_block->mode == TGPIO_MODE_OUTPUT)
-			seq_printf(m, " %s half_period=%lluns",
-				   tgpio_output_desired_get(mmio_block).run ==
-						   TGPIO_OUTPUT_RUNNING ?
+		else if (mmio_block->mode == TGPIO_MODE_OUTPUT) {
+			struct tgpio_output_desired desired =
+				tgpio_output_desired_get(mmio_block);
+
+			seq_printf(m, " %s period=%lluns half_period=%lluns",
+				   desired.run == TGPIO_OUTPUT_RUNNING ?
 					   "running" :
 					   "stopped",
+				   desired.period_ns,
 				   mmio_block->output_half_period_ns);
+		}
 		seq_putc(m, '\n');
 	}
 
@@ -2410,6 +2892,10 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
+	ret = tgpio_validate_persistent_operations(tgpio);
+	if (ret)
+		goto err_cleanup;
+
 	if (clock_mode == TGPIO_CLOCK_PHC) {
 		if (!timekeeping_clocksource_has_base(CSID_X86_ART)) {
 			pr_err("clock_mode=phc requires a timekeeper clocksource based on ART\n");
@@ -2448,13 +2934,18 @@ static int __init tgpio_input_init(void)
 
 	tgpio_observability_init(tgpio);
 
-	pr_info("loaded with mode0=%s mode1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s hardware_periodic_output=%c\n",
+	ret = tgpio_start_persistent_operations(tgpio);
+	if (ret)
+		goto err_cleanup;
+
+	pr_info("loaded with mode0=%s mode1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s hardware_periodic_output=%c activity_log=%c\n",
 		tgpio_mode_name(tgpio->mmio_blocks[0].mode),
 		tgpio_mode_name(tgpio->mmio_blocks[1].mode),
 		tgpio_clock_mode_name(clock_mode),
 		tgpio_timestamp_mode_name(timestamp_mode),
 		tgpio_output_polarity_name(output_polarity),
-		hardware_periodic_output ? 'Y' : 'N');
+		hardware_periodic_output ? 'Y' : 'N',
+		activity_log ? 'Y' : 'N');
 	return 0;
 
 err_cleanup:
