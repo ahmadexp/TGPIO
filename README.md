@@ -184,14 +184,19 @@ In PHC mode:
   domain so a stale compare value does not stop the waveform. The re-armed
   first edge stays on the requested period grid (`start + k * period`), so a
   step never shifts the waveform phase.
-- If `phc2sys` only changes PHC frequency with `adjfine`, the driver never
-  hot-writes the running hardware block: `PIV`/`COMPV` writes to an enabled
-  block corrupt the free-running waveform. Instead it tracks the phase error
-  the stale interval accumulates against the requested grid (the pending edge
-  is always `first_art + k * PIV`, no readback needed) and performs a full
-  grid-aligned re-arm once the error exceeds 10 us
-  (`activity=output_phase_rearm` in the activity log). Expect a few re-arms
-  while the servo converges, then none.
+- If `phc2sys` only changes PHC frequency with `adjfine`, the driver
+  hot-refreshes `PIV` to the current servo rate (verified safe on this
+  hardware: a `PIV` write latches for the following periods) and, when the
+  pending edge has drifted more than 1 us off the requested grid, rewrites
+  `COMPV` to pull it back (`activity=output_phase_nudge`). No waveform
+  restart happens in steady state; a full grid-aligned re-arm
+  (`activity=output_phase_rearm`) is only the backstop for errors beyond a
+  quarter period.
+- Output polarity is deterministic: single-shot output compares never fire
+  on this hardware, so instead of a prime edge the driver loads the output
+  level flop low (a brief enable with `EP=rising`, which survives the
+  subsequent disable) before arming toggle mode. The `COMPV` match is
+  therefore always the rising edge, on every arm and re-arm.
 
 `TIMESTAMP_MODE=art` is intended for explicit `CLOCK_MODE=realtime` debugging.
 In the default PHC mode, hardware input events are emitted in adjusted PHC time

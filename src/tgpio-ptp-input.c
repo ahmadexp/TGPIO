@@ -117,7 +117,7 @@ tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
 
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (10 * NSEC_PER_MSEC)
-#define TGPIO_OUTPUT_REARM_PHASE_NS 10000
+#define TGPIO_OUTPUT_PHASE_NUDGE_NS 1000
 #define TGPIO_CPUID_ART_LEAF	  0x15
 #define TGPIO_PHC_MAX_ADJ_PPB	  100000000L
 #define TGPIO_MIN_POLL_MS	  1u
@@ -1201,6 +1201,27 @@ static inline void tgpio_write_piv(struct tgpio_mmio_block *mmio_block,
 	tgpio_writel(mmio_block, TGPIOPIV31_0, lower_32_bits(value));
 }
 
+/*
+ * COMPV reads back live: hardware periodic mode advances it by PIV on each
+ * generated edge (verified: COMPV == TCV + PIV on running blocks), so the
+ * value can change between the two 32-bit reads. Retry until the high word
+ * is stable across the low-word read.
+ */
+static u64 tgpio_read_compv(struct tgpio_mmio_block *mmio_block)
+{
+	u32 hi = tgpio_readl(mmio_block, TGPIOCOMPV63_32);
+	u32 lo;
+	u32 prev_hi;
+
+	do {
+		prev_hi = hi;
+		lo = tgpio_readl(mmio_block, TGPIOCOMPV31_0);
+		hi = tgpio_readl(mmio_block, TGPIOCOMPV63_32);
+	} while (hi != prev_hi);
+
+	return ((u64)hi << 32) | lo;
+}
+
 static struct tgpio_capture
 tgpio_read_capture(struct tgpio_mmio_block *mmio_block)
 {
@@ -2043,8 +2064,19 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	tgpio_write_compv(mmio_block, 0);
 	tgpio_write_piv(mmio_block, 0);
 
+	/*
+	 * Load the output level flop deterministically: enabling with
+	 * EP_RISING drives the line low and the flop survives the disable
+	 * (verified on hardware). Toggle mode then starts from low, so the
+	 * COMPV match is always the rising edge. Without this, toggle mode
+	 * resumes from whatever level the previous waveform happened to stop
+	 * at, and the polarity comes up inverted at random.
+	 */
 	ctrl = tgpio_ctl_without(ctrl,
 				 TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
+	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
+	tgpio_write_ctl(mmio_block, ctrl);
+
 	ctrl = tgpio_ctl_with(ctrl, TGPIOCTL_EP_TOGGLE | TGPIOCTL_PM);
 	tgpio_write_ctl(mmio_block, ctrl);
 
@@ -2065,55 +2097,59 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	return 0;
 }
 
+struct tgpio_hw_phase {
+	enum tgpio_status status;
+	s64 pending_ns; /* next hardware edge, PHC time */
+	s64 error_ns;	/* pending_ns minus nearest half-period grid point */
+	bool nudge_safe; /* pending far enough away to rewrite COMPV */
+};
+
 /*
- * Phase error of the free-running hardware output against the requested
- * period grid, computed without touching the hardware: the compare engine
- * advances COMPV by exactly PIV per edge, so the pending edge sits at
- * first_art + k * piv. Registers of a running block are deliberately never
- * read or hot-written; on this hardware such accesses corrupt the waveform.
+ * Phase of the free-running hardware output against the requested period
+ * grid, from the live COMPV readback (COMPV always holds the next pending
+ * edge; hardware adds PIV to it on each generated edge).
  */
-static struct tgpio_s64_result
-tgpio_hw_periodic_phase_error_ns(struct tgpio_device *dev,
-				 struct tgpio_mmio_block *mmio_block,
-				 s64 grid_start_ns, u64 half_ns)
+static struct tgpio_hw_phase
+tgpio_hw_periodic_phase_get(struct tgpio_device *dev,
+			    struct tgpio_mmio_block *mmio_block,
+			    s64 grid_start_ns, u64 half_ns)
 {
-	u64 first_art = mmio_block->output_hw_first_art;
-	u64 piv = mmio_block->output_hw_piv;
-	struct tgpio_u64_result now_art;
 	struct tgpio_s64_result pending;
-	u64 pending_art;
-	u64 periods;
+	struct tgpio_s64_result now;
+	u64 compv;
 	u64 rem;
+	s64 err_ns;
 
-	if (clock_mode != TGPIO_CLOCK_PHC || !piv || !half_ns ||
-	    half_ns > (u64)S64_MAX || grid_start_ns < 0)
-		return tgpio_err_s64(TGPIO_E_INVAL);
+	if (clock_mode != TGPIO_CLOCK_PHC || !half_ns ||
+	    half_ns > (u64)S64_MAX / 4 || grid_start_ns < 0)
+		return (struct tgpio_hw_phase){ .status = TGPIO_E_INVAL };
 
-	now_art = tgpio_get_current_art();
-	if (now_art.status < 0)
-		return tgpio_err_s64(now_art.status);
+	compv = tgpio_read_compv(mmio_block);
+	if (!compv || compv > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES)
+		return (struct tgpio_hw_phase){ .status = TGPIO_E_RANGE };
 
-	if (now_art.val <= first_art) {
-		pending_art = first_art;
-	} else {
-		periods = div64_u64(now_art.val - first_art, piv) + 1;
-		if (periods > div64_u64(U64_MAX - first_art, piv))
-			return tgpio_err_s64(TGPIO_E_RANGE);
-		pending_art = first_art + periods * piv;
-	}
+	pending = tgpio_clock_phc_art_to_ns(dev,
+					    compv + TGPIO_ART_HW_DELAY_CYCLES);
+	now = tgpio_clock_now_ns(dev);
+	if (pending.status < 0 || now.status < 0 || now.val < 0 ||
+	    pending.val < grid_start_ns)
+		return (struct tgpio_hw_phase){ .status = TGPIO_E_RANGE };
 
-	if (pending_art > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES)
-		return tgpio_err_s64(TGPIO_E_RANGE);
-	pending = tgpio_clock_phc_art_to_ns(
-		dev, pending_art + TGPIO_ART_HW_DELAY_CYCLES);
-	if (pending.status < 0)
-		return pending;
-	if (pending.val < grid_start_ns)
-		return tgpio_err_s64(TGPIO_E_RANGE);
+	/* A pending edge more than two periods out is not a live edge time. */
+	if (pending.val < now.val - (s64)half_ns ||
+	    pending.val - now.val > (s64)(4 * half_ns))
+		return (struct tgpio_hw_phase){ .status = TGPIO_E_RANGE };
 
 	div64_u64_rem((u64)(pending.val - grid_start_ns), half_ns, &rem);
-	return tgpio_ok_s64(rem >= half_ns - rem ? (s64)rem - (s64)half_ns :
-						   (s64)rem);
+	err_ns = rem >= half_ns - rem ? (s64)rem - (s64)half_ns : (s64)rem;
+
+	return (struct tgpio_hw_phase){
+		.status = TGPIO_OK,
+		.pending_ns = pending.val,
+		.error_ns = err_ns,
+		.nudge_safe = pending.val >=
+			      now.val + (s64)TGPIO_OUTPUT_SAFE_TIME_NS,
+	};
 }
 
 /* output_work-only: prime the block and set the initial software-periodic phase. */
@@ -2133,7 +2169,15 @@ static int tgpio_arm_output(struct tgpio_device *dev,
 				 TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
 	tgpio_write_ctl(mmio_block, ctrl);
 
-	if (tgpio_program_output_edge(
+	/*
+	 * Hardware mode needs no prime edge: single-shot compares never fire
+	 * on this hardware, and programming the falling prime loads the level
+	 * flop high, parking the line high until the periodic arm. Leave the
+	 * block disabled (line low) until tgpio_arm_hardware_periodic sets
+	 * the flop and enables toggle mode.
+	 */
+	if (mode != TGPIO_OUTPUT_HARDWARE &&
+	    tgpio_program_output_edge(
 		    dev, mmio_block, ns_to_ktime(prime_edge_ns),
 		    tgpio_output_edge_bits(TGPIO_EDGE_FALL)) != TGPIO_OK) {
 		tgpio_disable_output_hw(mmio_block);
@@ -2150,8 +2194,10 @@ static int tgpio_arm_output(struct tgpio_device *dev,
 	mmio_block->output_hw_first_art = 0;
 	mmio_block->output_hw_piv = 0;
 
-	ctrl = tgpio_read_ctl(mmio_block);
-	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
+	if (mode != TGPIO_OUTPUT_HARDWARE) {
+		ctrl = tgpio_read_ctl(mmio_block);
+		tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
+	}
 	return 0;
 }
 
@@ -2270,6 +2316,21 @@ static void tgpio_log_output_phase_rearm(struct tgpio_device *dev,
 		mmio_block->index, channel, phase_error_ns);
 }
 
+static void tgpio_log_output_phase_nudge(struct tgpio_device *dev,
+					 struct tgpio_mmio_block *mmio_block,
+					 s64 phase_error_ns, s64 aligned_ns)
+{
+	unsigned int channel;
+
+	if (!READ_ONCE(activity_log))
+		return;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("activity=output_phase_nudge block=%u channel=%u phase_error_ns=%lld aligned_edge_ns=%lld\n",
+		mmio_block->index, channel, phase_error_ns, aligned_ns);
+}
+
 static void tgpio_log_output_edge(struct tgpio_device *dev,
 				  struct tgpio_mmio_block *mmio_block,
 				  ktime_t edge_time, u32 edge_bits,
@@ -2349,6 +2410,68 @@ static void tgpio_reconcile_arm(struct tgpio_device *dev,
 	tgpio_output_wake_at(mmio_block, timing.timer_start);
 }
 
+/*
+ * output_work-only: apply a PHC frequency change to a running hardware
+ * periodic block. PIV and COMPV hot-writes are verified safe on this
+ * hardware: a PIV write latches for the following periods, and a COMPV
+ * rewrite moves only the pending edge. Refresh the interval to the current
+ * servo rate every update and nudge the pending edge back onto the grid
+ * once it drifts past the tolerance, so no waveform restart is ever needed
+ * in steady state.
+ */
+static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
+					 struct tgpio_mmio_block *mmio_block,
+					 const struct tgpio_output_desired *desired)
+{
+	struct tgpio_u64_result piv = tgpio_clock_delta_to_art_cycles(
+		dev, mmio_block->output_high_time_ns);
+	struct tgpio_hw_phase phase;
+	struct tgpio_u64_result nudged_art;
+	s64 aligned_ns;
+
+	/*
+	 * Hot PIV writes are two 32-bit stores; only apply one when the high
+	 * word is unchanged so a concurrent hardware reload cannot see a
+	 * torn value. Mismatches fall back to the phase-error re-arm below.
+	 */
+	if (piv.status >= 0 && piv.val &&
+	    piv.val != mmio_block->output_hw_piv &&
+	    upper_32_bits(piv.val) ==
+		    upper_32_bits(mmio_block->output_hw_piv)) {
+		tgpio_write_piv(mmio_block, piv.val);
+		mmio_block->output_hw_piv = piv.val;
+	}
+
+	phase = tgpio_hw_periodic_phase_get(dev, mmio_block,
+					    desired->first_edge_ns,
+					    desired->high_time_ns);
+	if (phase.status < 0)
+		return;
+
+	if (tgpio_abs_s64(phase.error_ns) > desired->high_time_ns / 4) {
+		/* Too close to the wrong half-grid slot: restart on the grid. */
+		tgpio_log_output_phase_rearm(dev, mmio_block, phase.error_ns);
+		tgpio_reconcile_arm(dev, mmio_block, desired);
+		return;
+	}
+
+	if (phase.error_ns >= -TGPIO_OUTPUT_PHASE_NUDGE_NS &&
+	    phase.error_ns <= TGPIO_OUTPUT_PHASE_NUDGE_NS)
+		return;
+	if (!phase.nudge_safe)
+		return; /* edge imminent; retry on the next frequency update */
+
+	aligned_ns = phase.pending_ns - phase.error_ns;
+	nudged_art = tgpio_clock_ns_to_compare_art(dev, aligned_ns);
+	if (nudged_art.status < 0)
+		return;
+
+	tgpio_write_compv(mmio_block, nudged_art.val);
+	mmio_block->output_next_edge = ns_to_ktime(aligned_ns);
+	tgpio_log_output_phase_nudge(dev, mmio_block, phase.error_ns,
+				     aligned_ns);
+}
+
 /* Sole writer of output hardware + the per-edge timer. */
 static void tgpio_output_work(struct work_struct *work)
 {
@@ -2382,29 +2505,16 @@ static void tgpio_output_work(struct work_struct *work)
 	}
 
 	/*
-	 * PHC frequency changed. The running hardware block is never
-	 * hot-written: its registers only latch through the full disable/arm
-	 * sequence. Instead, track the phase error the stale PIV accumulates
-	 * against the requested grid and re-arm once it exceeds the
-	 * threshold; the re-arm picks up both the corrected frequency and
-	 * the grid phase.
+	 * PHC frequency changed: hot-refresh PIV to the current servo rate
+	 * and nudge the pending compare back onto the grid if it drifted.
+	 * Both writes are verified safe on a running block.
 	 */
 	if (desired.freq_gen != mmio_block->output_applied_freq_gen) {
 		mmio_block->output_applied_freq_gen = desired.freq_gen;
 		if (mmio_block->output_phase ==
 		    TGPIO_OUTPUT_HARDWARE_PERIODIC) {
-			struct tgpio_s64_result err =
-				tgpio_hw_periodic_phase_error_ns(
-					dev, mmio_block,
-					desired.first_edge_ns,
-					desired.high_time_ns);
-
-			if (err.status < 0 ||
-			    (err.val >= -TGPIO_OUTPUT_REARM_PHASE_NS &&
-			     err.val <= TGPIO_OUTPUT_REARM_PHASE_NS))
-				return;
-			tgpio_log_output_phase_rearm(dev, mmio_block, err.val);
-			tgpio_reconcile_arm(dev, mmio_block, &desired);
+			tgpio_hw_periodic_apply_freq(dev, mmio_block,
+						     &desired);
 			return;
 		}
 		if (mmio_block->output_phase == TGPIO_OUTPUT_ARM_PERIODIC &&
@@ -3361,17 +3471,17 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 						   quant.status);
 
 				if (READ_ONCE(mmio_block->output_hw_piv)) {
-					struct tgpio_s64_result phase_err =
-						tgpio_hw_periodic_phase_error_ns(
+					struct tgpio_hw_phase phase =
+						tgpio_hw_periodic_phase_get(
 							dev, mmio_block,
 							desired.first_edge_ns,
 							output_high_time_ns);
 
-					if (phase_err.status >= 0)
+					if (phase.status >= 0)
 						seq_printf(m,
 							   " armed_piv=%llu phase_error=%lldns",
 							   READ_ONCE(mmio_block->output_hw_piv),
-							   phase_err.val);
+							   phase.error_ns);
 				}
 			}
 		}
