@@ -19,6 +19,7 @@
 #include <linux/bitfield.h>
 #include <linux/clocksource_ids.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
@@ -2044,6 +2045,9 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 static void tgpio_log_output_phase_rearm(struct tgpio_device *dev,
 					 struct tgpio_mmio_block *mmio_block,
 					 s64 phase_error_ns);
+static void tgpio_log_output_late_push(struct tgpio_device *dev,
+				       struct tgpio_mmio_block *mmio_block,
+				       u64 periods);
 
 /* output_work-only: switch the block to autonomous hardware periodic output. */
 static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
@@ -2054,10 +2058,41 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 		tgpio_clock_ns_to_compare_art(dev, first_edge_ns);
 	struct tgpio_u64_result half_period_art =
 		tgpio_clock_delta_to_art_cycles(dev, half_period_ns);
+	struct tgpio_u64_result now_art;
+	struct tgpio_u64_result margin;
 	u32 ctrl;
 
-	if (first_art.status < 0 || half_period_art.status < 0)
+	if (first_art.status < 0 || half_period_art.status < 0 ||
+	    !half_period_art.val || half_period_art.val > U64_MAX / 2)
 		return -ENODEV;
+
+	/*
+	 * Late-arm guard: if this work ran late, the compare could already be
+	 * in the past when the block is enabled, making hardware fire the
+	 * first toggle immediately -- which inverts the waveform polarity.
+	 * Push the first edge forward by whole periods (parity-preserving)
+	 * until it sits safely ahead of the counter.
+	 */
+	now_art = tgpio_get_current_art();
+	margin = tgpio_clock_delta_to_art_cycles(dev, 2 * NSEC_PER_MSEC);
+	if (now_art.status >= 0 && margin.status >= 0 &&
+	    now_art.val <= U64_MAX - margin.val) {
+		u64 deadline = now_art.val + margin.val;
+		u64 period_cycles = 2 * half_period_art.val;
+
+		if (first_art.val < deadline) {
+			u64 periods = div64_u64(deadline - first_art.val,
+						period_cycles) +
+				      1;
+
+			if (periods > div64_u64(U64_MAX - first_art.val,
+						period_cycles))
+				return -ENODEV;
+			first_art.val += periods * period_cycles;
+			tgpio_log_output_late_push(dev, mmio_block,
+						   periods);
+		}
+	}
 
 	ctrl = tgpio_ctl_without(tgpio_read_ctl(mmio_block), TGPIOCTL_EN);
 	tgpio_write_ctl(mmio_block, ctrl);
@@ -2070,11 +2105,15 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	 * (verified on hardware). Toggle mode then starts from low, so the
 	 * COMPV match is always the rising edge. Without this, toggle mode
 	 * resumes from whatever level the previous waveform happened to stop
-	 * at, and the polarity comes up inverted at random.
+	 * at, and the polarity comes up inverted at random. The readback
+	 * posts the enable write and gives the device clock domain time to
+	 * latch the flop before the disable follows.
 	 */
 	ctrl = tgpio_ctl_without(ctrl,
 				 TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
+	(void)tgpio_read_ctl(mmio_block);
+	usleep_range(20, 50);
 	tgpio_write_ctl(mmio_block, ctrl);
 
 	ctrl = tgpio_ctl_with(ctrl, TGPIOCTL_EP_TOGGLE | TGPIOCTL_PM);
@@ -2329,6 +2368,21 @@ static void tgpio_log_output_phase_nudge(struct tgpio_device *dev,
 					       PTP_PF_PEROUT);
 	pr_info("activity=output_phase_nudge block=%u channel=%u phase_error_ns=%lld aligned_edge_ns=%lld\n",
 		mmio_block->index, channel, phase_error_ns, aligned_ns);
+}
+
+static void tgpio_log_output_late_push(struct tgpio_device *dev,
+				       struct tgpio_mmio_block *mmio_block,
+				       u64 periods)
+{
+	unsigned int channel;
+
+	if (!READ_ONCE(activity_log))
+		return;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("activity=output_late_push block=%u channel=%u pushed_periods=%llu\n",
+		mmio_block->index, channel, periods);
 }
 
 static void tgpio_log_output_edge(struct tgpio_device *dev,
