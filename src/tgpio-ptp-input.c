@@ -117,7 +117,7 @@ tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
 #define TGPIOCTL_PM	    BIT(4)
 
 #define TGPIO_ART_HW_DELAY_CYCLES 2
-#define TGPIO_OUTPUT_SAFE_TIME_NS (10 * NSEC_PER_MSEC)
+#define TGPIO_OUTPUT_SAFE_TIME_NS (20 * NSEC_PER_MSEC)
 #define TGPIO_OUTPUT_PHASE_NUDGE_NS 1000
 #define TGPIO_CPUID_ART_LEAF	  0x15
 #define TGPIO_PHC_MAX_ADJ_PPB	  100000000L
@@ -2066,34 +2066,6 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	    !half_period_art.val || half_period_art.val > U64_MAX / 2)
 		return -ENODEV;
 
-	/*
-	 * Late-arm guard: if this work ran late, the compare could already be
-	 * in the past when the block is enabled, making hardware fire the
-	 * first toggle immediately -- which inverts the waveform polarity.
-	 * Push the first edge forward by whole periods (parity-preserving)
-	 * until it sits safely ahead of the counter.
-	 */
-	now_art = tgpio_get_current_art();
-	margin = tgpio_clock_delta_to_art_cycles(dev, 2 * NSEC_PER_MSEC);
-	if (now_art.status >= 0 && margin.status >= 0 &&
-	    now_art.val <= U64_MAX - margin.val) {
-		u64 deadline = now_art.val + margin.val;
-		u64 period_cycles = 2 * half_period_art.val;
-
-		if (first_art.val < deadline) {
-			u64 periods = div64_u64(deadline - first_art.val,
-						period_cycles) +
-				      1;
-
-			if (periods > div64_u64(U64_MAX - first_art.val,
-						period_cycles))
-				return -ENODEV;
-			first_art.val += periods * period_cycles;
-			tgpio_log_output_late_push(dev, mmio_block,
-						   periods);
-		}
-	}
-
 	ctrl = tgpio_ctl_without(tgpio_read_ctl(mmio_block), TGPIOCTL_EN);
 	tgpio_write_ctl(mmio_block, ctrl);
 	tgpio_write_compv(mmio_block, 0);
@@ -2113,8 +2085,37 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 				 TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
 	(void)tgpio_read_ctl(mmio_block);
-	usleep_range(20, 50);
+	usleep_range(3000, 4000);
 	tgpio_write_ctl(mmio_block, ctrl);
+	(void)tgpio_read_ctl(mmio_block);
+	usleep_range(3000, 4000);
+
+	/*
+	 * Late-arm guard, evaluated after the dance sleeps: if the compare
+	 * were already in the past at enable, hardware would fire the first
+	 * toggle immediately and invert the waveform polarity. Push the
+	 * first edge forward by whole periods (parity-preserving) until it
+	 * sits safely ahead of the counter.
+	 */
+	now_art = tgpio_get_current_art();
+	margin = tgpio_clock_delta_to_art_cycles(dev, 2 * NSEC_PER_MSEC);
+	if (now_art.status >= 0 && margin.status >= 0 &&
+	    now_art.val <= U64_MAX - margin.val) {
+		u64 deadline = now_art.val + margin.val;
+		u64 period_cycles = 2 * half_period_art.val;
+
+		if (first_art.val < deadline) {
+			u64 periods = div64_u64(deadline - first_art.val,
+						period_cycles) +
+				      1;
+
+			if (periods > div64_u64(U64_MAX - first_art.val,
+						period_cycles))
+				return -ENODEV;
+			first_art.val += periods * period_cycles;
+			tgpio_log_output_late_push(dev, mmio_block, periods);
+		}
+	}
 
 	ctrl = tgpio_ctl_with(ctrl, TGPIOCTL_EP_TOGGLE | TGPIOCTL_PM);
 	tgpio_write_ctl(mmio_block, ctrl);
