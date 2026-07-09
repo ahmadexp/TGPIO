@@ -315,6 +315,7 @@ MODULE_PARM_DESC(output_start_delay_ns,
 struct tgpio_phc_params {
 	u64 anchor_art;
 	s64 anchor_ns;
+	u64 base_art_hz;
 	long scaled_ppm;
 };
 
@@ -331,10 +332,6 @@ struct tgpio_u64_result {
 struct tgpio_ns_result {
 	enum tgpio_status status;
 	u64 ns;
-};
-struct tgpio_cycles_result {
-	enum tgpio_status status;
-	u64 cycles;
 };
 
 struct tgpio_capture {
@@ -356,7 +353,7 @@ struct tgpio_output_timing {
 
 struct tgpio_output_quantization {
 	enum tgpio_status status;
-	u64 real_half_period_ns;
+	u64 clock_half_period_ns;
 	u64 art_half_period_cycles;
 	u64 actual_half_period_ns;
 	u64 actual_period_ns;
@@ -376,6 +373,7 @@ struct tgpio_crosststamp_capture {
  */
 struct tgpio_output_desired {
 	unsigned int gen;
+	unsigned int freq_gen;
 	enum tgpio_output_run run;
 	enum tgpio_output_mode mode;
 	u64 period_ns;
@@ -413,6 +411,7 @@ struct tgpio_mmio_block {
 	seqlock_t output_seqlock;	/* guards output_desired writers */
 	struct tgpio_output_desired output_desired;
 	unsigned int output_applied_gen; /* output_work-private from here down */
+	unsigned int output_applied_freq_gen;
 	enum tgpio_output_phase output_phase;
 	u64 output_high_time_ns;
 	u64 output_low_time_ns;
@@ -434,6 +433,9 @@ struct tgpio_device {
 };
 
 static struct tgpio_device *tgpio;
+
+static struct tgpio_u64_result tgpio_realtime_delta_to_art_cycles(u64 delta_ns);
+static struct tgpio_ns_result tgpio_art_cycles_to_realtime_delta_ns(u64 cycles);
 
 static inline struct tgpio_s64_result tgpio_ok_s64(s64 v)
 {
@@ -842,25 +844,6 @@ static struct tgpio_ns_result tgpio_cycles_to_ns(u64 cycles)
 	return (struct tgpio_ns_result){ .status = r.status, .ns = r.val };
 }
 
-static struct tgpio_cycles_result tgpio_ns_to_cycles(u64 ns)
-{
-	struct tgpio_u64_result r =
-		tgpio_rescale(ns, NSEC_PER_SEC, READ_ONCE(art_frequency));
-
-	return (struct tgpio_cycles_result){ .status = r.status,
-					     .cycles = r.val };
-}
-
-static struct tgpio_cycles_result tgpio_ns_to_cycles_nearest(u64 ns)
-{
-	struct tgpio_u64_result r =
-		tgpio_rescale_nearest(ns, NSEC_PER_SEC,
-				      READ_ONCE(art_frequency));
-
-	return (struct tgpio_cycles_result){ .status = r.status,
-					     .cycles = r.val };
-}
-
 static u64 tgpio_art_to_ns(u64 art)
 {
 	struct tgpio_ns_result ns = tgpio_cycles_to_ns(art);
@@ -886,30 +869,41 @@ static struct tgpio_s64_result tgpio_add_s64(s64 lhs, s64 rhs)
 	return tgpio_ok_s64(lhs + rhs);
 }
 
-static struct tgpio_s64_result tgpio_ns_delta_to_art(s64 ns)
+static struct tgpio_s64_result
+tgpio_cycles_delta_to_ns(s64 cycles, u64 cycles_per_sec, bool round_nearest)
 {
-	struct tgpio_cycles_result cycles =
-		tgpio_ns_to_cycles(tgpio_abs_s64(ns));
-	s64 magnitude;
+	struct tgpio_u64_result ns;
 
-	if (cycles.status < 0)
-		return tgpio_err_s64(cycles.status);
+	ns = round_nearest ?
+		     tgpio_rescale_nearest(tgpio_abs_s64(cycles),
+					   cycles_per_sec, NSEC_PER_SEC) :
+		     tgpio_rescale(tgpio_abs_s64(cycles), cycles_per_sec,
+				   NSEC_PER_SEC);
+	if (ns.status < 0)
+		return tgpio_err_s64(ns.status);
+	if (ns.val > S64_MAX)
+		return tgpio_err_s64(TGPIO_E_RANGE);
 
-	magnitude = cycles.cycles;
-	return tgpio_ok_s64(ns < 0 ? -magnitude : magnitude);
+	return tgpio_ok_s64(cycles < 0 ? -(s64)ns.val : (s64)ns.val);
 }
 
-static struct tgpio_s64_result tgpio_ns_delta_to_art_nearest(s64 ns)
+static struct tgpio_s64_result
+tgpio_ns_delta_to_cycles(s64 ns, u64 cycles_per_sec, bool round_nearest)
 {
-	struct tgpio_cycles_result cycles =
-		tgpio_ns_to_cycles_nearest(tgpio_abs_s64(ns));
-	s64 magnitude;
+	struct tgpio_u64_result cycles;
 
+	cycles = round_nearest ?
+			 tgpio_rescale_nearest(tgpio_abs_s64(ns),
+					       NSEC_PER_SEC,
+					       cycles_per_sec) :
+			 tgpio_rescale(tgpio_abs_s64(ns), NSEC_PER_SEC,
+				       cycles_per_sec);
 	if (cycles.status < 0)
 		return tgpio_err_s64(cycles.status);
+	if (cycles.val > S64_MAX)
+		return tgpio_err_s64(TGPIO_E_RANGE);
 
-	magnitude = cycles.cycles;
-	return tgpio_ok_s64(ns < 0 ? -magnitude : magnitude);
+	return tgpio_ok_s64(ns < 0 ? -(s64)cycles.val : (s64)cycles.val);
 }
 
 static s64 tgpio_scaled_ppm_to_ppb(long scaled_ppm)
@@ -976,11 +970,13 @@ static struct tgpio_s64_result tgpio_phc_adjusted_to_base_delta(s64 adjusted_ns,
 }
 
 static struct tgpio_phc_params
-tgpio_phc_params_make(u64 anchor_art, s64 anchor_ns, long scaled_ppm)
+tgpio_phc_params_make(u64 anchor_art, s64 anchor_ns, u64 base_art_hz,
+		      long scaled_ppm)
 {
 	return (struct tgpio_phc_params){
 		.anchor_art = anchor_art,
 		.anchor_ns = anchor_ns,
+		.base_art_hz = base_art_hz,
 		.scaled_ppm = scaled_ppm,
 	};
 }
@@ -988,24 +984,26 @@ tgpio_phc_params_make(u64 anchor_art, s64 anchor_ns, long scaled_ppm)
 static struct tgpio_s64_result tgpio_phc_art_to_ns(struct tgpio_phc_params phc,
 						   u64 art)
 {
-	struct tgpio_ns_result base_mag;
+	struct tgpio_s64_result base;
 	struct tgpio_s64_result adjusted;
-	s64 base_ns;
+	s64 cycles_delta;
 	s64 ppb;
 
-	if (art >= phc.anchor_art)
-		base_mag = tgpio_cycles_to_ns(art - phc.anchor_art);
-	else
-		base_mag = tgpio_cycles_to_ns(phc.anchor_art - art);
-	if (base_mag.status < 0)
-		return tgpio_err_s64(base_mag.status);
-
-	base_ns = base_mag.ns;
-	if (art < phc.anchor_art)
-		base_ns = -base_ns;
+	if (art >= phc.anchor_art) {
+		if (art - phc.anchor_art > S64_MAX)
+			return tgpio_err_s64(TGPIO_E_RANGE);
+		cycles_delta = (s64)(art - phc.anchor_art);
+	} else {
+		if (phc.anchor_art - art > S64_MAX)
+			return tgpio_err_s64(TGPIO_E_RANGE);
+		cycles_delta = -(s64)(phc.anchor_art - art);
+	}
+	base = tgpio_cycles_delta_to_ns(cycles_delta, phc.base_art_hz, false);
+	if (base.status < 0)
+		return base;
 
 	ppb = tgpio_scaled_ppm_to_ppb(phc.scaled_ppm);
-	adjusted = tgpio_phc_base_to_adjusted_delta(base_ns, ppb);
+	adjusted = tgpio_phc_base_to_adjusted_delta(base.val, ppb);
 	if (adjusted.status < 0)
 		return adjusted;
 
@@ -1029,7 +1027,8 @@ static struct tgpio_u64_result tgpio_phc_ns_to_art(struct tgpio_phc_params phc,
 	if (base_delta.status < 0)
 		return tgpio_err_u64(base_delta.status);
 
-	cycles = tgpio_ns_delta_to_art(base_delta.val);
+	cycles = tgpio_ns_delta_to_cycles(base_delta.val, phc.base_art_hz,
+					  true);
 	if (cycles.status < 0)
 		return tgpio_err_u64(cycles.status);
 
@@ -1061,6 +1060,52 @@ tgpio_phc_delta_to_real_ns(struct tgpio_phc_params phc, s64 phc_delta_ns)
 		return tgpio_err_u64(TGPIO_E_RANGE);
 
 	return tgpio_ok_u64((u64)base.val);
+}
+
+static struct tgpio_u64_result
+tgpio_phc_delta_to_art_cycles(struct tgpio_phc_params phc, s64 phc_delta_ns)
+{
+	struct tgpio_s64_result base;
+	struct tgpio_s64_result cycles;
+	s64 ppb;
+
+	if (phc_delta_ns <= 0)
+		return tgpio_ok_u64(0);
+
+	ppb = tgpio_scaled_ppm_to_ppb(phc.scaled_ppm);
+	base = tgpio_phc_adjusted_to_base_delta(phc_delta_ns, ppb);
+	if (base.status < 0 || base.val < 0)
+		return tgpio_err_u64(TGPIO_E_RANGE);
+
+	cycles = tgpio_ns_delta_to_cycles(base.val, phc.base_art_hz, true);
+	if (cycles.status < 0 || cycles.val < 0)
+		return tgpio_err_u64(cycles.status < 0 ? cycles.status :
+						      TGPIO_E_RANGE);
+
+	return tgpio_ok_u64((u64)cycles.val);
+}
+
+static struct tgpio_ns_result
+tgpio_phc_art_cycles_to_delta_ns(struct tgpio_phc_params phc, u64 cycles)
+{
+	struct tgpio_s64_result base;
+	struct tgpio_s64_result adjusted;
+	s64 ppb;
+
+	if (cycles > S64_MAX)
+		return (struct tgpio_ns_result){ .status = TGPIO_E_RANGE };
+
+	base = tgpio_cycles_delta_to_ns((s64)cycles, phc.base_art_hz, true);
+	if (base.status < 0)
+		return (struct tgpio_ns_result){ .status = base.status };
+
+	ppb = tgpio_scaled_ppm_to_ppb(phc.scaled_ppm);
+	adjusted = tgpio_phc_base_to_adjusted_delta(base.val, ppb);
+	if (adjusted.status < 0 || adjusted.val < 0)
+		return (struct tgpio_ns_result){ .status = TGPIO_E_RANGE };
+
+	return (struct tgpio_ns_result){ .status = TGPIO_OK,
+					 .ns = (u64)adjusted.val };
 }
 
 static struct tgpio_u64_result
@@ -1338,10 +1383,20 @@ tgpio_clock_delta_to_real_ns(struct tgpio_device *dev, s64 clock_delta_ns)
 static struct tgpio_u64_result
 tgpio_clock_delta_to_art_cycles(struct tgpio_device *dev, s64 clock_delta_ns)
 {
-	struct tgpio_u64_result real =
-		tgpio_clock_delta_to_real_ns(dev, clock_delta_ns);
+	struct tgpio_u64_result real;
 	struct tgpio_u64_result cycles;
 
+	if (clock_mode == TGPIO_CLOCK_PHC) {
+		cycles = tgpio_phc_delta_to_art_cycles(
+			tgpio_phc_params_get(dev), clock_delta_ns);
+		if (cycles.status < 0)
+			return cycles;
+		if (!cycles.val)
+			return tgpio_err_u64(TGPIO_E_RANGE);
+		return cycles;
+	}
+
+	real = tgpio_clock_delta_to_real_ns(dev, clock_delta_ns);
 	if (real.status < 0 || real.val > S64_MAX)
 		return tgpio_err_u64(real.status < 0 ? real.status :
 							TGPIO_E_RANGE);
@@ -1355,6 +1410,16 @@ tgpio_clock_delta_to_art_cycles(struct tgpio_device *dev, s64 clock_delta_ns)
 	return cycles;
 }
 
+static struct tgpio_ns_result
+tgpio_clock_art_cycles_to_delta_ns(struct tgpio_device *dev, u64 cycles)
+{
+	if (clock_mode == TGPIO_CLOCK_PHC)
+		return tgpio_phc_art_cycles_to_delta_ns(
+			tgpio_phc_params_get(dev), cycles);
+
+	return tgpio_art_cycles_to_realtime_delta_ns(cycles);
+}
+
 static struct tgpio_output_quantization
 tgpio_output_quantization_err(enum tgpio_status status)
 {
@@ -1365,31 +1430,24 @@ static struct tgpio_output_quantization
 tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
 			      u64 half_period_ns)
 {
-	struct tgpio_u64_result real_half =
-		tgpio_clock_delta_to_real_ns(dev, half_period_ns);
 	struct tgpio_u64_result art_half;
 	struct tgpio_ns_result actual_half;
 	struct tgpio_s64_result period_error;
 	s64 half_error;
 	s64 split_error = period_ns & 1 ? -1 : 0;
 
-	if (real_half.status < 0 || real_half.val > S64_MAX)
-		return tgpio_output_quantization_err(
-			real_half.status < 0 ? real_half.status :
-					       TGPIO_E_RANGE);
-
-	art_half = tgpio_realtime_delta_to_art_cycles(real_half.val);
+	art_half = tgpio_clock_delta_to_art_cycles(dev, half_period_ns);
 	if (art_half.status < 0 || !art_half.val)
 		return tgpio_output_quantization_err(
 			art_half.status < 0 ? art_half.status : TGPIO_E_RANGE);
 
-	actual_half = tgpio_art_cycles_to_realtime_delta_ns(art_half.val);
+	actual_half = tgpio_clock_art_cycles_to_delta_ns(dev, art_half.val);
 	if (actual_half.status < 0 || actual_half.ns > S64_MAX)
 		return tgpio_output_quantization_err(
 			actual_half.status < 0 ? actual_half.status :
 						 TGPIO_E_RANGE);
 
-	half_error = (s64)actual_half.ns - (s64)real_half.val;
+	half_error = (s64)actual_half.ns - (s64)half_period_ns;
 	period_error = tgpio_add_s64(half_error, half_error);
 	if (period_error.status < 0)
 		return tgpio_output_quantization_err(period_error.status);
@@ -1400,7 +1458,7 @@ tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
 
 	return (struct tgpio_output_quantization){
 		.status = TGPIO_OK,
-		.real_half_period_ns = real_half.val,
+		.clock_half_period_ns = half_period_ns,
 		.art_half_period_cycles = art_half.val,
 		.actual_half_period_ns = actual_half.ns,
 		.actual_period_ns = actual_half.ns * 2,
@@ -1412,6 +1470,7 @@ tgpio_output_quantization_get(struct tgpio_device *dev, u64 period_ns,
 
 static int tgpio_phc_init_clock(struct tgpio_device *dev)
 {
+	struct tgpio_u64_result base_art_hz;
 	ktime_t realtime;
 	u64 art;
 
@@ -1419,7 +1478,21 @@ static int tgpio_phc_init_clock(struct tgpio_device *dev)
 	if (!ktime_real_to_base_clock(realtime, CSID_X86_ART, &art))
 		return -ENODEV;
 
-	dev->phc = tgpio_phc_params_make(art, ktime_to_ns(realtime), 0);
+	if (art_frequency) {
+		base_art_hz = tgpio_ok_u64(art_frequency);
+		pr_info("PHC uses manual ART frequency %llu Hz\n",
+			base_art_hz.val);
+	} else {
+		base_art_hz =
+			tgpio_realtime_delta_to_art_cycles(NSEC_PER_SEC);
+		if (base_art_hz.status < 0)
+			return base_art_hz.status;
+		pr_info("PHC calibrated ART base frequency %llu Hz from timekeeper\n",
+			base_art_hz.val);
+	}
+
+	dev->phc = tgpio_phc_params_make(art, ktime_to_ns(realtime),
+					 base_art_hz.val, 0);
 	return 0;
 }
 
@@ -1866,6 +1939,10 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 					 struct tgpio_mmio_block *mmio_block,
 					 s64 first_edge_ns, u64 half_period_ns,
 					 u64 first_art, u64 half_period_art);
+static void tgpio_log_output_freq_update(struct tgpio_device *dev,
+					 struct tgpio_mmio_block *mmio_block,
+					 u64 half_period_ns,
+					 u64 half_period_art);
 
 /* output_work-only: switch the block to autonomous hardware periodic output. */
 static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
@@ -1903,6 +1980,23 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 				     half_period_ns, first_art.val,
 				     half_period_art.val);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
+	return 0;
+}
+
+static int tgpio_update_hardware_periodic_interval(
+	struct tgpio_device *dev, struct tgpio_mmio_block *mmio_block)
+{
+	struct tgpio_u64_result half_period_art =
+		tgpio_clock_delta_to_art_cycles(
+			dev, mmio_block->output_high_time_ns);
+
+	if (half_period_art.status < 0 || !half_period_art.val)
+		return -ENODEV;
+
+	tgpio_write_piv(mmio_block, half_period_art.val);
+	tgpio_log_output_freq_update(dev, mmio_block,
+				     mmio_block->output_high_time_ns,
+				     half_period_art.val);
 	return 0;
 }
 
@@ -1998,11 +2092,11 @@ static void tgpio_log_output_arm(struct tgpio_device *dev,
 		return;
 	}
 
-	pr_info("activity=output_arm block=%u channel=%u mode=%s requested_period_ns=%llu high_time_ns=%llu low_time_ns=%llu real_half_ns=%llu art_half_cycles=%llu actual_half_ns=%llu actual_period_ns=%llu half_error_ns=%lld period_error_ns=%lld period_split_error_ns=%lld requested_first_edge_ns=%lld armed_first_edge_ns=%lld start_adjust_ns=%lld prime_edge_ns=%lld\n",
+	pr_info("activity=output_arm block=%u channel=%u mode=%s requested_period_ns=%llu high_time_ns=%llu low_time_ns=%llu clock_half_ns=%llu art_half_cycles=%llu actual_half_ns=%llu actual_period_ns=%llu half_error_ns=%lld period_error_ns=%lld period_split_error_ns=%lld requested_first_edge_ns=%lld armed_first_edge_ns=%lld start_adjust_ns=%lld prime_edge_ns=%lld\n",
 		mmio_block->index, channel,
 		tgpio_output_mode_name(desired->mode), desired->period_ns,
 		desired->high_time_ns, desired->low_time_ns,
-		quant.real_half_period_ns, quant.art_half_period_cycles,
+		quant.clock_half_period_ns, quant.art_half_period_cycles,
 		quant.actual_half_period_ns, quant.actual_period_ns,
 		quant.half_period_error_ns, quant.period_error_ns,
 		quant.period_split_error_ns,
@@ -2016,6 +2110,7 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 					 u64 first_art, u64 half_period_art)
 {
 	struct tgpio_ns_result actual_half;
+	struct tgpio_s64_result period_error;
 	unsigned int channel;
 	s64 half_error_ns = 0;
 	s64 period_error_ns = 0;
@@ -2024,22 +2119,13 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 	if (!READ_ONCE(activity_log))
 		return;
 
-	actual_half = tgpio_art_cycles_to_realtime_delta_ns(half_period_art);
+	actual_half = tgpio_clock_art_cycles_to_delta_ns(dev, half_period_art);
 	if (actual_half.status >= 0 && actual_half.ns <= S64_MAX) {
-		struct tgpio_u64_result real_half =
-			tgpio_clock_delta_to_real_ns(dev, half_period_ns);
-
 		actual_period_ns = actual_half.ns * 2;
-		if (real_half.status >= 0 && real_half.val <= S64_MAX) {
-			struct tgpio_s64_result period_error;
-
-			half_error_ns =
-				(s64)actual_half.ns - (s64)real_half.val;
-			period_error = tgpio_add_s64(half_error_ns,
-						     half_error_ns);
-			if (period_error.status >= 0)
-				period_error_ns = period_error.val;
-		}
+		half_error_ns = (s64)actual_half.ns - (s64)half_period_ns;
+		period_error = tgpio_add_s64(half_error_ns, half_error_ns);
+		if (period_error.status >= 0)
+			period_error_ns = period_error.val;
 	}
 
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
@@ -2049,6 +2135,29 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 		half_period_ns, half_period_art,
 		actual_half.status < 0 ? 0 : actual_half.ns, actual_period_ns,
 		half_error_ns, period_error_ns);
+}
+
+static void tgpio_log_output_freq_update(struct tgpio_device *dev,
+					 struct tgpio_mmio_block *mmio_block,
+					 u64 half_period_ns,
+					 u64 half_period_art)
+{
+	struct tgpio_ns_result actual_half;
+	unsigned int channel;
+	s64 half_error_ns = 0;
+
+	if (!READ_ONCE(activity_log))
+		return;
+
+	actual_half = tgpio_clock_art_cycles_to_delta_ns(dev, half_period_art);
+	if (actual_half.status >= 0 && actual_half.ns <= S64_MAX)
+		half_error_ns = (s64)actual_half.ns - (s64)half_period_ns;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("activity=output_freq_update block=%u channel=%u half_period_ns=%llu art_half_cycles=%llu actual_half_ns=%llu half_error_ns=%lld\n",
+		mmio_block->index, channel, half_period_ns, half_period_art,
+		actual_half.status < 0 ? 0 : actual_half.ns, half_error_ns);
 }
 
 static void tgpio_log_output_edge(struct tgpio_device *dev,
@@ -2145,15 +2254,30 @@ static void tgpio_output_work(struct work_struct *work)
 			return;
 		}
 		mmio_block->output_applied_gen = desired.gen;
+		mmio_block->output_applied_freq_gen = desired.freq_gen;
 		tgpio_log_output_arm(dev, mmio_block, &desired, &timing);
 		tgpio_output_wake_at(mmio_block, timing.timer_start);
 		return;
 	}
 
+	if (desired.freq_gen != mmio_block->output_applied_freq_gen) {
+		mmio_block->output_applied_freq_gen = desired.freq_gen;
+		if (mmio_block->output_phase ==
+		    TGPIO_OUTPUT_HARDWARE_PERIODIC) {
+			if (tgpio_update_hardware_periodic_interval(
+				    dev, mmio_block))
+				tgpio_disable_output_hw(mmio_block);
+			return;
+		}
+		if (mmio_block->output_phase == TGPIO_OUTPUT_ARM_PERIODIC &&
+		    ktime_before(ktime_get_real(), mmio_block->output_wake_at))
+			return;
+	}
+
 	/*
-	 * Same generation, so this wake is the per-edge timer firing, not a config
-	 * kick: every config path (publish/disable/resync/teardown) bumps the
-	 * generation before scheduling us, so a same-gen wake is always a due edge.
+	 * Same generation: either the per-edge timer fired, or a PHC frequency
+	 * refresh asked us to touch the hardware without re-priming. Programming an
+	 * absolute compare early is harmless; the edge still waits for COMPV.
 	 * Deliberately no wall-clock guard -- comparing now against output_wake_at
 	 * would strand the line if CLOCK_REALTIME stepped backward between the timer
 	 * firing and this work running.
@@ -2205,6 +2329,7 @@ static void tgpio_disable_output(struct tgpio_mmio_block *mmio_block)
 	write_seqlock_irqsave(&mmio_block->output_seqlock, flags);
 	mmio_block->output_desired = (struct tgpio_output_desired){
 		.gen = mmio_block->output_desired.gen + 1,
+		.freq_gen = mmio_block->output_desired.freq_gen,
 		.run = TGPIO_OUTPUT_STOPPED,
 	};
 	write_sequnlock_irqrestore(&mmio_block->output_seqlock, flags);
@@ -2225,6 +2350,7 @@ static void tgpio_output_publish(struct tgpio_mmio_block *mmio_block,
 	write_seqlock_irqsave(&mmio_block->output_seqlock, flags);
 	mmio_block->output_desired = (struct tgpio_output_desired){
 		.gen = mmio_block->output_desired.gen + 1,
+		.freq_gen = mmio_block->output_desired.freq_gen,
 		.run = run,
 		.mode = mode,
 		.period_ns = period_ns,
@@ -2445,6 +2571,32 @@ static void tgpio_resync_outputs_after_phc_step(struct tgpio_device *dev)
 	}
 }
 
+static void tgpio_update_outputs_after_phc_freq(struct tgpio_device *dev)
+{
+	unsigned int i;
+
+	if (clock_mode != TGPIO_CLOCK_PHC)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
+		enum tgpio_output_run run;
+		unsigned long flags;
+
+		if (mmio_block->mode != TGPIO_MODE_OUTPUT)
+			continue;
+
+		write_seqlock_irqsave(&mmio_block->output_seqlock, flags);
+		run = mmio_block->output_desired.run;
+		if (run == TGPIO_OUTPUT_RUNNING)
+			mmio_block->output_desired.freq_gen++;
+		write_sequnlock_irqrestore(&mmio_block->output_seqlock, flags);
+
+		if (run == TGPIO_OUTPUT_RUNNING)
+			schedule_work(&mmio_block->output_work);
+	}
+}
+
 static int tgpio_ptp_enable(struct ptp_clock_info *ptp,
 			    struct ptp_clock_request *req, int on)
 {
@@ -2518,7 +2670,9 @@ static int tgpio_ptp_settime64(struct ptp_clock_info *ptp,
 
 	write_seqlock_irqsave(&dev->phc_seqlock, flags);
 	old = tgpio_phc_art_to_ns(dev->phc, art.val);
-	dev->phc = tgpio_phc_params_make(art.val, ns, dev->phc.scaled_ppm);
+	dev->phc = tgpio_phc_params_make(art.val, ns,
+					 dev->phc.base_art_hz,
+					 dev->phc.scaled_ppm);
 	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
 
 	trace_tgpio_phc_step(old.status < 0 ? 0 : old.val, ns);
@@ -2554,6 +2708,7 @@ static int tgpio_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
 		return -ERANGE;
 	}
 	dev->phc = tgpio_phc_params_make(art.val, adjusted.val,
+					 dev->phc.base_art_hz,
 					 dev->phc.scaled_ppm);
 	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
 
@@ -2588,11 +2743,12 @@ static int tgpio_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
 		write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
 		return -ERANGE;
 	}
-	dev->phc = tgpio_phc_params_make(art.val, now.val, scaled_ppm);
+	dev->phc = tgpio_phc_params_make(art.val, now.val,
+					 dev->phc.base_art_hz, scaled_ppm);
 	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
 
 	if (hardware_periodic_output)
-		tgpio_resync_outputs_after_phc_step(dev);
+		tgpio_update_outputs_after_phc_freq(dev);
 	return 0;
 }
 
@@ -2661,6 +2817,7 @@ static void tgpio_disable_outputs(struct tgpio_device *dev)
 		write_seqlock_irqsave(&mmio_block->output_seqlock, flags);
 		mmio_block->output_desired = (struct tgpio_output_desired){
 			.gen = mmio_block->output_desired.gen + 1,
+			.freq_gen = mmio_block->output_desired.freq_gen,
 			.run = TGPIO_OUTPUT_STOPPED,
 		};
 		write_sequnlock_irqrestore(&mmio_block->output_seqlock, flags);
@@ -2798,13 +2955,6 @@ static enum tgpio_requirement
 tgpio_needs_art_frequency(struct tgpio_device *dev)
 {
 	unsigned int i;
-
-	if (hardware_periodic_output && clock_mode == TGPIO_CLOCK_PHC) {
-		for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
-			if (dev->mmio_blocks[i].mode == TGPIO_MODE_OUTPUT)
-				return TGPIO_REQUIRED;
-		}
-	}
 
 	if (!hardware_timestamps)
 		return TGPIO_NOT_REQUIRED;
@@ -3006,8 +3156,10 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "art_base_clock: %s\n",
 		   timekeeping_clocksource_has_base(CSID_X86_ART) ? "present" :
 								    "absent");
-	seq_printf(m, "phc: anchor_art=%llu anchor_ns=%lld scaled_ppm=%ld\n",
-		   phc.anchor_art, phc.anchor_ns, phc.scaled_ppm);
+	seq_printf(m,
+		   "phc: anchor_art=%llu anchor_ns=%lld base_art_hz=%llu scaled_ppm=%ld\n",
+		   phc.anchor_art, phc.anchor_ns, phc.base_art_hz,
+		   phc.scaled_ppm);
 
 	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
 		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
@@ -3202,14 +3354,11 @@ static int __init tgpio_input_init(void)
 			goto err_cleanup;
 		}
 
-		ret = tgpio_resolve_art_frequency();
-		if (ret)
-			goto err_cleanup;
-
 		ret = tgpio_phc_init_clock(tgpio);
 		if (ret)
 			goto err_cleanup;
 
+		tgpio_probe_art_parameters_for_status();
 		pr_info("PTP clock uses adjustable ART-backed PHC mode\n");
 	} else if (tgpio_needs_art_frequency(tgpio) == TGPIO_REQUIRED) {
 		ret = tgpio_resolve_art_frequency();

@@ -153,12 +153,12 @@ Mode & PTP event timestamp & Dependency\\
 poll-time debug & poll time & realtime clock\\
 realtime & ART converted to realtime & ART base clock\\
 ART raw & ART-derived nanoseconds & ART frequency\\
-PHC & adjusted PHC time & ART frequency\\
+PHC & adjusted PHC time & stable PHC ART base rate\\
 \bottomrule
 \end{tabular}
 \end{table}
 
-For output events, clock-to-ART conversion is required because the userspace request is expressed in the PTP clock domain while the hardware compare and interval registers expect ART cycles. In realtime mode, absolute edge-time conversion uses Linux timekeeping's realtime-to-ART relationship. In PHC mode it uses the driver's adjusted PHC offset and frequency scale. Hardware periodic output also requires the ART frequency so the requested interval can be programmed into the periodic interval register. If the required timekeeping relationship or frequency is unavailable, the driver fails the request rather than scheduling an edge in the wrong domain.
+For output events, clock-to-ART conversion is required because the userspace request is expressed in the PTP clock domain while the hardware compare and interval registers expect ART cycles. In realtime mode, absolute edge-time conversion uses Linux timekeeping's realtime-to-ART relationship. In PHC mode it uses the driver's stable ART base rate plus the adjusted PHC offset and frequency scale. Hardware periodic output uses the same clock-domain conversion for the periodic interval register. If the required timekeeping relationship or base rate is unavailable, the driver fails the request rather than scheduling an edge in the wrong domain.
 
 \section{Bring-Up Lessons}
 

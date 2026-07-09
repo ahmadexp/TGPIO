@@ -57,8 +57,9 @@ output_start_delay_ns=0
 ```
 
 `art_frequency=0` means auto-detect the ART/crystal frequency from CPUID leaf
-`0x15` when PHC mode, hardware periodic output, or raw ART timestamp mode needs
-it. Set `ART_FREQUENCY=<Hz>` to override it manually.
+`0x15` when raw ART timestamp mode needs it. PHC mode normally captures a
+calibrated ART base rate from the kernel timekeeper at load time; set
+`ART_FREQUENCY=<Hz>` only when you want to override that PHC base rate manually.
 
 CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
 `tsc_art_numerator` and `tsc_art_denominator` and shows it in `make status`.
@@ -181,6 +182,8 @@ In PHC mode:
 - If a tool such as `phc2sys` steps the TGPIO PHC while periodic output is
   active, the driver re-primes and re-arms the output in the adjusted PHC
   domain so a stale compare value does not stop the waveform.
+- If `phc2sys` only changes PHC frequency with `adjfine`, running hardware
+  periodic output refreshes `PIV` without restarting the waveform.
 
 `TIMESTAMP_MODE=art` is intended for explicit `CLOCK_MODE=realtime` debugging.
 In the default PHC mode, hardware input events are emitted in adjusted PHC time
@@ -262,7 +265,9 @@ include perout arming, requested period, high/on time, low/off time, ART-cycle
 quantization for hardware periodic output, calculated full period, and
 rounding/split error fields. In hardware periodic mode the hardware free-runs
 after arming, so the journal records the programmed periodic setup rather than
-every physical edge. In software mode, the journal can record each programmed
+every physical edge. If PHC frequency is adjusted while hardware periodic
+output is running, the stream includes `activity=output_freq_update` with the
+refreshed interval. In software mode, the journal can record each programmed
 transition.
 
 For a quick frequency sanity check while an output is running:
@@ -271,8 +276,9 @@ For a quick frequency sanity check while an output is running:
 sudo cat /sys/kernel/debug/tgpio/status
 ```
 
-The output status shows `high_time` and `low_time`; for hardware periodic output
-it also includes `art_half_cycles`, `actual_period`, and `period_error`.
+The output status shows `high_time`, `low_time`, and the PHC `base_art_hz`; for
+hardware periodic output it also includes `art_half_cycles`, `actual_period`,
+and `period_error`.
 
 ## Persistent Install
 
@@ -356,19 +362,20 @@ diagnostics when CPUID exposes them, but realtime timestamp conversion uses the
 kernel timekeeping ART base-clock relationship instead of the manual frequency
 scale.
 
-In PHC mode, `art_frequency` is required so the driver can convert between ART
-cycles and adjusted PHC nanoseconds. `ART_FREQUENCY=0` still means auto-detect
-from CPUID leaf `0x15` when the CPU reports it.
+In PHC mode, the driver converts between ART cycles and adjusted PHC
+nanoseconds with a stable `base_art_hz` captured when the PHC is created. This
+keeps `phc2sys`/`ts2phc` frequency discipline from feeding back through
+`CLOCK_REALTIME`. A non-zero `ART_FREQUENCY=<Hz>` overrides that captured base
+rate.
 
 In realtime mode, hardware periodic output does not use the CPUID-reported
 `art_frequency` for the free-running interval. It converts the requested period
 through the kernel's ART base-clock relationship, avoiding drift from a nominal
 crystal value that differs from the calibrated system timebase.
 
-In PHC mode, hardware periodic output still requires `art_frequency` because
-the adjustable PHC itself is converted to and from ART cycles. If CPUID does
-not report the crystal frequency, set `ART_FREQUENCY=<Hz>` manually or load
-with `HARDWARE_PERIODIC_OUTPUT=0` to use the software re-arm fallback.
+In PHC mode, hardware periodic output uses the PHC `base_art_hz` plus the
+current `adjfine` frequency scale. PHC steps re-prime the output; PHC frequency
+changes refresh the hardware interval without restarting the waveform.
 
 The CPUID `0x15` ratio is the TSC-to-ART ratio:
 `TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for
