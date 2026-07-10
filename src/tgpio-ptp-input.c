@@ -202,8 +202,8 @@ static unsigned long addr0 = 0xFE001210;
 static unsigned long addr1 = 0xFE001310;
 static unsigned int mmio_size = 0x38;
 static bool use_second = true;
-static char mode0_param[16] = "input";
-static char mode1_param[16] = "input";
+static char tsync0_param[16] = "input";
+static char tsync1_param[16] = "input";
 static char edge0_param[16] = "rising";
 static char edge1_param[16] = "rising";
 static char clock_mode_param[16] = "phc";
@@ -244,11 +244,11 @@ MODULE_PARM_DESC(mmio_size, "MMIO size for each TGPIO block, default 0x38");
 module_param(use_second, bool, 0444);
 MODULE_PARM_DESC(use_second, "Enable the second TGPIO block");
 
-module_param_string(mode0, mode0_param, sizeof(mode0_param), 0444);
-MODULE_PARM_DESC(mode0, "Mode for block 0: input, output, or off");
+module_param_string(tsync0, tsync0_param, sizeof(tsync0_param), 0444);
+MODULE_PARM_DESC(tsync0, "Function of the TSync_0 block: input, output, or off");
 
-module_param_string(mode1, mode1_param, sizeof(mode1_param), 0444);
-MODULE_PARM_DESC(mode1, "Mode for block 1: input, output, or off");
+module_param_string(tsync1, tsync1_param, sizeof(tsync1_param), 0444);
+MODULE_PARM_DESC(tsync1, "Function of the TSync_1 block: input, output, or off");
 
 module_param_string(edge0, edge0_param, sizeof(edge0_param), 0444);
 MODULE_PARM_DESC(edge0,
@@ -3374,7 +3374,7 @@ static int tgpio_map_mmio_block(struct tgpio_device *dev, unsigned int index)
 
 static int tgpio_configure_mmio_blocks(struct tgpio_device *dev)
 {
-	const char *modes[TGPIO_MAX_BLOCKS] = { mode0_param, mode1_param };
+	const char *modes[TGPIO_MAX_BLOCKS] = { tsync0_param, tsync1_param };
 	const char *edges[TGPIO_MAX_BLOCKS] = { edge0_param, edge1_param };
 	unsigned long addrs[TGPIO_MAX_BLOCKS] = { addr0, addr1 };
 	unsigned int i;
@@ -3949,7 +3949,7 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
-	pr_info("loaded with mode0=%s mode1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s hardware_periodic_output=%c activity_log=%c\n",
+	pr_info("loaded with tsync0=%s tsync1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s hardware_periodic_output=%c activity_log=%c\n",
 		tgpio_mode_name(tgpio->mmio_blocks[0].mode),
 		tgpio_mode_name(tgpio->mmio_blocks[1].mode),
 		tgpio_clock_mode_name(clock_mode),
