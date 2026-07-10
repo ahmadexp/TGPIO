@@ -2015,7 +2015,11 @@ static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 	if (!READ_ONCE(tdc))
 		return;
 
-	if (event_delta > 1)
+	/*
+	 * The hardware event counter can restart across enables, making the
+	 * first delta a wrap artifact; only sane small deltas count as lost.
+	 */
+	if (event_delta > 1 && event_delta <= 4096)
 		dev->tdc_lost += event_delta - 1;
 
 	if (block == 0) {
