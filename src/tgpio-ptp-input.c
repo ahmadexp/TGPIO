@@ -2536,6 +2536,28 @@ static void tgpio_reconcile_arm(struct tgpio_device *dev,
 }
 
 /*
+ * output_work-only: rewrite the pending compare of a running block with the
+ * periodic engine paused. A bare COMPV rewrite can transiently satisfy the
+ * comparator, emitting a sub-sample runt on the pin and registering a
+ * phantom event that advances COMPV by one interval -- which silently flips
+ * the parity of the tracked level flop against the physical pin. Clearing PM
+ * (EN stays set, so the line holds its level) stops the compare engine for
+ * the few writes; the pending edge is guarded to be far away, so no real
+ * event can be missed. Updates the flop checkpoint to the written value.
+ */
+static void
+tgpio_hw_periodic_write_compv_paused(struct tgpio_mmio_block *mmio_block,
+				     u64 compv)
+{
+	u32 ctrl = tgpio_read_ctl(mmio_block);
+
+	tgpio_write_ctl(mmio_block, tgpio_ctl_without(ctrl, TGPIOCTL_PM));
+	tgpio_write_compv(mmio_block, compv);
+	tgpio_write_ctl(mmio_block, ctrl);
+	mmio_block->output_hw_ckpt_compv = compv;
+}
+
+/*
  * output_work-only: apply a PHC frequency change to a running hardware
  * periodic block. PIV and COMPV hot-writes are verified safe on this
  * hardware: a PIV write latches for the following periods, and a COMPV
@@ -2596,8 +2618,7 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 	if (nudged_art.status < 0)
 		return;
 
-	tgpio_write_compv(mmio_block, nudged_art.val);
-	mmio_block->output_hw_ckpt_compv = nudged_art.val;
+	tgpio_hw_periodic_write_compv_paused(mmio_block, nudged_art.val);
 	mmio_block->output_next_edge = ns_to_ktime(aligned_ns);
 	tgpio_log_output_phase_nudge(dev, mmio_block, phase.error_ns,
 				     aligned_ns);
@@ -2660,8 +2681,7 @@ static void tgpio_hw_periodic_invert(struct tgpio_device *dev,
 	if (compv > U64_MAX - mmio_block->output_hw_piv)
 		return;
 	compv += mmio_block->output_hw_piv;
-	tgpio_write_compv(mmio_block, compv);
-	mmio_block->output_hw_ckpt_compv = compv;
+	tgpio_hw_periodic_write_compv_paused(mmio_block, compv);
 	pr_info("output polarity inverted block=%u flop_high=%d\n",
 		mmio_block->index, mmio_block->output_hw_flop_high);
 }
