@@ -28,7 +28,10 @@ OUTPUT0_CHANNEL="${OUTPUT0_CHANNEL:-0}"
 OUTPUT1_CHANNEL="${OUTPUT1_CHANNEL:-1}"
 OUTPUT0_PERIOD_NS="${OUTPUT0_PERIOD_NS:-0}"
 OUTPUT1_PERIOD_NS="${OUTPUT1_PERIOD_NS:-0}"
+OUTPUT0_DUTY_NS="${OUTPUT0_DUTY_NS:-0}"
+OUTPUT1_DUTY_NS="${OUTPUT1_DUTY_NS:-0}"
 OUTPUT_START_DELAY_NS="${OUTPUT_START_DELAY_NS:-0}"
+OUTPUT_PHASE_OFFSET_NS="${OUTPUT_PHASE_OFFSET_NS:-0}"
 
 tgpio_input_loaded()
 {
@@ -88,6 +91,9 @@ insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	output0_channel="${OUTPUT0_CHANNEL}" output1_channel="${OUTPUT1_CHANNEL}" \
 	output0_period_ns="${OUTPUT0_PERIOD_NS}" \
 	output1_period_ns="${OUTPUT1_PERIOD_NS}" \
-	output_start_delay_ns="${OUTPUT_START_DELAY_NS}"
+	output0_duty_ns="${OUTPUT0_DUTY_NS}" \
+	output1_duty_ns="${OUTPUT1_DUTY_NS}" \
+	output_start_delay_ns="${OUTPUT_START_DELAY_NS}" \
+	output_phase_offset_ns="${OUTPUT_PHASE_OFFSET_NS}"
 
 "${SCRIPT_DIR}/status.sh"

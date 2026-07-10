@@ -57,12 +57,15 @@ output0_channel=0
 output1_channel=1
 output0_period_ns=0
 output1_period_ns=0
+output0_duty_ns=0
+output1_duty_ns=0
 output_start_delay_ns=0
 ```
 
 `art_frequency=0` means auto-detect the ART/crystal frequency from CPUID leaf
-`0x15` when PHC mode, hardware periodic output, or raw ART timestamp mode needs
-it. Set `ART_FREQUENCY=<Hz>` to override it manually.
+`0x15` when raw ART timestamp mode needs it. PHC mode normally captures a
+calibrated ART base rate from the kernel timekeeper at load time; set
+`ART_FREQUENCY=<Hz>` only when you want to override that PHC base rate manually.
 
 CPUID leaf `0x15` also reports the TSC/ART ratio. The driver records it as
 `tsc_art_numerator` and `tsc_art_denominator` and shows it in `make status`.
@@ -88,6 +91,7 @@ sudo make reload MODE0=output MODE1=off
 sudo make reload MODE0=output MODE1=input EDGE1=rising
 sudo make reload MODE0=input TIMESTAMP_MODE=art
 sudo make reload MODE0=output OUTPUT_POLARITY=inverted
+sudo make reload MODE0=output OUTPUT0_PERIOD_NS=1000000 OUTPUT0_DUTY_NS=250000
 sudo make reload MODE0=output HARDWARE_PERIODIC_OUTPUT=0
 sudo make reload MODE0=input MODE1=off
 sudo make reload CLOCK_MODE=realtime MODE0=input MODE1=off
@@ -183,7 +187,39 @@ In PHC mode:
   converted back to ART compare values before programming hardware.
 - If a tool such as `phc2sys` steps the TGPIO PHC while periodic output is
   active, the driver re-primes and re-arms the output in the adjusted PHC
-  domain so a stale compare value does not stop the waveform.
+  domain so a stale compare value does not stop the waveform. The re-armed
+  first edge stays on the requested period grid (`start + k * period`), so a
+  step never shifts the waveform phase.
+- If `phc2sys` only changes PHC frequency with `adjfine`, the driver
+  hot-refreshes `PIV` to the current servo rate (verified safe on this
+  hardware: a `PIV` write latches for the following periods) and, when the
+  pending edge has drifted more than 1 us off the requested grid, rewrites
+  `COMPV` to pull it back (`activity=output_phase_nudge`). No waveform
+  restart happens in steady state; a full grid-aligned re-arm
+  (`activity=output_phase_rearm`) is only the backstop for errors beyond a
+  quarter period.
+- `output_phase_offset_ns` (runtime writable under
+  `/sys/module/tgpio_ptp_input/parameters/`) shifts every programmed output
+  edge by a constant, so a one-shot external measurement can cancel
+  systematic delays such as the asymmetric PCIe read latency in
+  `phc2sys` PHC-to-PHC comparison. A running output converges onto the new
+  position within a couple of frequency updates via the nudge machinery.
+  With this calibrated (about -2.5 us on the validated platform) and
+  `phc2sys -R 8 -N 5`, the 1 PPS output measures within +/-100 ns of the
+  atomic-clock reference.
+- Output polarity is deterministic through software level tracking. The
+  hardware output level flop is write-only state: it holds the level of the
+  last generated toggle, survives disable, and cannot be loaded or read (EP
+  writes and single-shot output compares do nothing on this hardware). The
+  driver therefore mirrors the flop in software — it assumes the power-on
+  low state at load, counts every generated toggle through the live `COMPV`
+  readback, drains the flop low before stops and unloads so the assumption
+  stays true across reloads, and picks the compare slot at arm time so
+  rising edges always land on the requested grid. If the mirror is ever
+  wrong (for example after external register pokes), writing 1 to
+  `/sys/kernel/debug/tgpio/outputN_invert` flips the tracked level and
+  shifts a running waveform by half a period, glitch-free. The tracked
+  level appears as `tracked_level` in the status output.
 
 `TIMESTAMP_MODE=art` is intended for explicit `CLOCK_MODE=realtime` debugging.
 In the default PHC mode, hardware input events are emitted in adjusted PHC time
@@ -209,9 +245,23 @@ sudo testptp -i 1 -p 1000000000 -d /dev/ptpX
 1-second period output. By default, the driver first primes the output low,
 then arms TGPIO hardware periodic mode: `COMPV` holds the first active edge,
 `PIV` holds the half-period in ART cycles, and `TGPIOCTL.PM` lets hardware
-generate the steady toggle edges. This avoids reprogramming every transition
-from software and supports faster periodic transitions than the hrtimer re-arm
-path can reliably sustain.
+generate the steady toggle edges. The periodic interval is derived through the
+kernel's ART base-clock conversion so the free-running hardware cadence follows
+the same calibrated timebase used for absolute realtime edge programming. This
+avoids reprogramming every transition from software and supports faster periodic
+transitions than the hrtimer re-arm path can reliably sustain.
+
+Modern `testptp` can set pulse width with `-w`, which maps to the Linux
+`PTP_PEROUT_DUTY_CYCLE` request. For example, this generates a 1 ms period with
+250 us on-time:
+
+```sh
+sudo testptp -i 0 -p 1000000 -w 250000 -d /dev/ptpX
+```
+
+The hardware periodic engine is fixed to 50% duty. When the requested on-time is
+not exactly half the period, the driver automatically uses the software re-arm
+path and programs explicit rising and falling edges.
 
 Use `HARDWARE_PERIODIC_OUTPUT=0` to return to the older software re-arm path:
 
@@ -247,10 +297,28 @@ sudo journalctl -k -f -g 'tgpio_ptp_input: activity='
 
 Input lines include the block, PTP channel, edge selection, event counter,
 event-counter delta, raw ART capture value, and emitted timestamp. Output lines
-include perout arming, requested period, the integer half-period, ART-cycle
-quantization, actual half-period, and rounding/split error fields. In hardware
-periodic mode the hardware free-runs after arming, so the journal records the
-programmed periodic setup rather than every physical edge.
+include perout arming, requested period, high/on time, low/off time, ART-cycle
+quantization for hardware periodic output, calculated full period, and
+rounding/split error fields. In hardware periodic mode the hardware free-runs
+after arming, so the journal records the programmed periodic setup rather than
+every physical edge. If PHC frequency is adjusted while hardware periodic
+output is running, the stream includes `activity=output_freq_update` with the
+refreshed interval. In software mode, the journal can record each programmed
+transition.
+
+For a quick frequency sanity check while an output is running:
+
+```sh
+sudo cat /sys/kernel/debug/tgpio/status
+```
+
+The output status shows `art_snapshot`, `high_time`, `low_time`, and the PHC
+`base_art_hz`; for hardware periodic output it also includes
+`art_half_cycles`, `actual_period`, `period_error`, and — while the block is
+armed — `armed_piv` and the live `phase_error` against the requested grid.
+When `art_snapshot` is `absent`, PHC mode derives the current ART value from
+the `CLOCK_REALTIME` inversion, which is exact for the current instant even
+while NTP disciplines the realtime clock.
 
 ## Persistent Install
 
@@ -281,6 +349,9 @@ The persisted operation options are:
   those inputs; defaults are `0` and `1`.
 - `OUTPUT0_PERIOD_NS` and `OUTPUT1_PERIOD_NS`: start periodic output at module
   load for an output-mode block; `0` disables restored output.
+- `OUTPUT0_DUTY_NS` and `OUTPUT1_DUTY_NS`: optional output on/high time in
+  nanoseconds for restored output. `0` means 50% duty. Non-50% duty uses the
+  software re-arm path.
 - `OUTPUT0_CHANNEL` and `OUTPUT1_CHANNEL`: PTP periodic-output channels for
   those outputs; defaults are `0` and `1`.
 - `OUTPUT_START_DELAY_NS`: optional delay from current PTP time to the first
@@ -331,14 +402,21 @@ diagnostics when CPUID exposes them, but realtime timestamp conversion uses the
 kernel timekeeping ART base-clock relationship instead of the manual frequency
 scale.
 
-In PHC mode, `art_frequency` is required so the driver can convert between ART
-cycles and adjusted PHC nanoseconds. `ART_FREQUENCY=0` still means auto-detect
-from CPUID leaf `0x15` when the CPU reports it.
+In PHC mode, the driver converts between ART cycles and adjusted PHC
+nanoseconds with a stable `base_art_hz` captured when the PHC is created. This
+keeps `phc2sys`/`ts2phc` frequency discipline from feeding back through
+`CLOCK_REALTIME`. Current PHC reads use ART cycles from the kernel timekeeping
+snapshot, not an inverse conversion from realtime. A non-zero
+`ART_FREQUENCY=<Hz>` overrides the captured base rate.
 
-Hardware periodic output also requires `art_frequency`, because the TGPIO
-periodic interval register is programmed in ART cycles. If CPUID does not
-report the crystal frequency, set `ART_FREQUENCY=<Hz>` manually or load with
-`HARDWARE_PERIODIC_OUTPUT=0` to use the software re-arm fallback.
+In realtime mode, hardware periodic output does not use the CPUID-reported
+`art_frequency` for the free-running interval. It converts the requested period
+through the kernel's ART base-clock relationship, avoiding drift from a nominal
+crystal value that differs from the calibrated system timebase.
+
+In PHC mode, hardware periodic output uses the PHC `base_art_hz` plus the
+current `adjfine` frequency scale. PHC steps re-prime the output; PHC frequency
+changes refresh the hardware interval without restarting the waveform.
 
 The CPUID `0x15` ratio is the TSC-to-ART ratio:
 `TSC_Hz = ART_Hz * tsc_art_numerator / tsc_art_denominator`. It is useful for
