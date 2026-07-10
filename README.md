@@ -25,12 +25,13 @@ The default is both blocks as inputs, matching the first working input setup.
 | Asymmetric duty | Per-edge interval alternation, halves >= 50 ms, every edge hardware-timed | 25% duty: 249.998 ms / 749.995 ms |
 | One-shot pulse | `oneshotN` debugfs: single hardware-timed pulse at an absolute time | 100 ms request measured 99.9990 ms |
 | Timestamp input | Hardware ART-domain capture, per-edge selection, live statistics | capture-to-grid `phase` readout at ns level |
-| TDC mode | Start/stop duration measurement across the two pins, roles selectable | ~26 ns LSB, 64-bit range |
+| TDC mode | Bipolar start/stop duration measurement across the two pins, roles selectable, signed Stop − Start | ~26 ns LSB, 64-bit range |
 | PPS sources | RFC 2783 `/dev/ppsX` per input, no PTP awareness needed | 1/s hardware-timestamped asserts |
 | Clock modes | `phc` (adjustable), `art` (raw, unadjustable), `realtime` (steers the system clock) | chrony locked the system clock to a captured PPS at −218 ns |
 | Discipline | ts2phc in the ART domain, or phc2sys PHC-to-PHC | ~50 ns uncalibrated systematic (ART loop) |
 | Precise crosststamps | `PTP_SYS_OFFSET_PRECISE` with exact device/realtime pairing | adopted automatically by phc2sys/chrony |
-| Observability | status file, activity log, quantization + verbose rounding logs, stall watchdog | rounding self-check within ±13 ns |
+| Observability | status file, activity log, rounding log, full `verbose` mode (every feature logs details), stall watchdog | rounding self-check within ±13 ns |
+| Control Center TUI | `make tui`: live dashboard, runtime control, PTP I/O, reload, filtered journal | full driver control from one terminal |
 | Calibration & persistence | `output_phase_offset_ns`, polarity knobs, auto-polarity (loopback), `make save-config` | one-shot calibration, survives reboots |
 
 Full documentation lives in this README and the
@@ -534,6 +535,32 @@ Note that with a tool like `phc2sys -R 8` adjusting frequency eight times per
 second, interval refreshes log at the same rate — this mode is for analysis
 sessions, not steady-state operation.
 
+### Full verbose mode
+
+`VERBOSE=1` (runtime-writable as `parameters/verbose`) is the superset
+switch: it enables the activity log, the rounding log, and detail lines for
+every remaining feature, each tagged `verbose=` for filtering:
+
+```sh
+sudo journalctl -k -f -g 'verbose='
+```
+
+- `verbose=input_stats` — per capture: ART value, phase against the whole
+  second, last/min/max interval and sample count.
+- `verbose=tdc_arm` — each TDC arming or re-arming edge with its role.
+- `verbose=pps_assert` — every RFC 2783 PPS assert with its realtime stamp.
+- `verbose=crosststamp` — precise cross-timestamp triples served to
+  `PTP_SYS_OFFSET_PRECISE` callers (rate-limited).
+- `verbose=clock_settime` / `clock_adjtime` / `clock_adjfine` — every clock
+  adjustment in both `phc` and `realtime` modes with the values applied.
+- `verbose=oneshot_done` — one-shot pulse teardown completion.
+- `verbose=duty_service` — each per-edge PIV alternation of an asymmetric
+  hardware duty cycle.
+- `verbose=auto_polarity` — every auto-polarity sample verdict (on-grid,
+  half-slot with streak count, or ambiguous).
+- `verbose=watchdog` — each 10 s watchdog check per output (advancing or
+  stuck, with the stall age).
+
 For a quick frequency sanity check while an output is running:
 
 ```sh
@@ -591,6 +618,39 @@ programmed compare value read back through the clock conversion). At the
 When `art_snapshot` is `absent`, PHC mode derives the current ART value from
 the `CLOCK_REALTIME` inversion, which is exact for the current instant even
 while NTP disciplines the realtime clock.
+
+## TGPIO Control Center (TUI)
+
+A full terminal UI over everything above lives in `tools/tgpio-tui`:
+
+```sh
+sudo pip3 install textual     # one-time dependency
+sudo make tui                 # or: sudo ./tools/tgpio-tui/tgpio-tui
+```
+
+Six tabs, refreshed live once a second:
+
+- **Dashboard** — per-block cards (input events, phase against the whole
+  second, interval statistics; output run state, period and its error, duty,
+  live phase error, tracked level), the clock model, bipolar TDC statistics,
+  and sparkline trends of the input phase and output phase error.
+- **Control** — all runtime parameters as switches and fields applied
+  immediately (`verbose`, `activity_log`, `verbose_rounding`, `tdc`,
+  `tdc_start`, `auto_polarity`, `output_phase_offset_ns`, `poll_ms`, …),
+  plus one-click actions: fire a one-shot pulse, flip output polarity,
+  reset TDC statistics, and persist the configuration (save-config).
+- **I/O** — arm or stop periodic outputs (period + optional asymmetric duty)
+  and enable or disable input capture per edge, through the same PTP
+  character-device ioctls `testptp` uses.
+- **Setup** — load-time options (block roles, edges, clock mode, periods)
+  with a one-button module reload.
+- **Logs** — the live kernel journal filtered to the driver, with one-key
+  filters for activity, verbose, rounding, or warnings, and pause.
+- **Raw** — the debugfs status file and every module parameter, verbatim.
+
+The TUI requires root (it reads debugfs and writes module parameters) and
+degrades gracefully when the module is not loaded — the Setup tab can load
+it.
 
 ## Persistent Install
 

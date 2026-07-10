@@ -20,6 +20,7 @@ HARDWARE_TIMESTAMPS ?= 1
 HARDWARE_PERIODIC_OUTPUT ?= 1
 ACTIVITY_LOG ?= 0
 VERBOSE_ROUNDING ?= 0
+VERBOSE ?= 0
 TDC ?= 0
 TDC_START ?= 0
 AUTO_POLARITY ?= 0
@@ -45,7 +46,7 @@ LOAD_ENV += OUTPUT_POLARITY="$(OUTPUT_POLARITY)" POLL_MS="$(POLL_MS)"
 LOAD_ENV += ART_FREQUENCY="$(ART_FREQUENCY)"
 LOAD_ENV += HARDWARE_TIMESTAMPS="$(HARDWARE_TIMESTAMPS)"
 LOAD_ENV += HARDWARE_PERIODIC_OUTPUT="$(HARDWARE_PERIODIC_OUTPUT)"
-LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)" VERBOSE_ROUNDING="$(VERBOSE_ROUNDING)"
+LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)" VERBOSE_ROUNDING="$(VERBOSE_ROUNDING)" VERBOSE="$(VERBOSE)"
 LOAD_ENV += TDC="$(TDC)" TDC_START="$(TDC_START)"
 LOAD_ENV += AUTO_POLARITY="$(AUTO_POLARITY)"
 LOAD_ENV += INPUT0_ENABLE="$(INPUT0_ENABLE)" INPUT1_ENABLE="$(INPUT1_ENABLE)"
@@ -58,7 +59,7 @@ LOAD_ENV += OUTPUT1_DUTY_NS="$(OUTPUT1_DUTY_NS)"
 LOAD_ENV += OUTPUT_START_DELAY_NS="$(OUTPUT_START_DELAY_NS)"
 LOAD_ENV += OUTPUT_PHASE_OFFSET_NS="$(OUTPUT_PHASE_OFFSET_NS)"
 
-.PHONY: all clean help load reload unload status install persist uninstall save-config
+.PHONY: all clean help load reload unload status install persist uninstall save-config tui
 
 help:
 	@echo "TGPIO PTP driver -- build, load, and configuration"
@@ -73,6 +74,7 @@ help:
 	@echo "  make persist         Alias for install, including persisted operations"
 	@echo "  make uninstall       Remove the persistent install"
 	@echo "  make save-config     Persist the current runtime configuration"
+	@echo "  make tui             Launch the TGPIO Control Center TUI (sudo)"
 	@echo "  make clean           Clean the build"
 	@echo "  make help            This text"
 	@echo
@@ -132,11 +134,17 @@ help:
 	@echo "  ADDR0=$(ADDR0) ADDR1=$(ADDR1)"
 	@echo "  MMIO_SIZE=$(MMIO_SIZE) USE_SECOND=$(USE_SECOND)"
 	@echo
-	@echo "Diagnostics (both runtime-writable under /sys/module/tgpio_ptp_input/parameters/):"
+	@echo "Diagnostics (all runtime-writable under /sys/module/tgpio_ptp_input/parameters/):"
 	@echo "  ACTIVITY_LOG=$(ACTIVITY_LOG)       1 = log input/output activity to the kernel"
 	@echo "                       journal (journalctl -k -g 'activity=')"
 	@echo "  VERBOSE_ROUNDING=$(VERBOSE_ROUNDING)   1 = log the ART-cycle rounding of every"
 	@echo "                       output programming action"
+	@echo "  VERBOSE=$(VERBOSE)            1 = log detail lines for EVERY feature:"
+	@echo "                       input events/statistics, TDC pairing, PPS"
+	@echo "                       asserts, crosststamps, clock adjustments,"
+	@echo "                       output programming/rounding, one-shot, duty,"
+	@echo "                       auto-polarity, watchdog. Superset of the two"
+	@echo "                       above (journalctl -k -g 'verbose=')"
 	@echo
 	@echo "TDC (time-to-digital converter):"
 	@echo "  TDC=$(TDC)                1 = pair block 0 (start) and block 1 (stop)"
@@ -210,3 +218,6 @@ uninstall:
 
 save-config:
 	$(SUDO) ./scripts/save-config.sh
+
+tui:
+	$(SUDO) ./tools/tgpio-tui/tgpio-tui
