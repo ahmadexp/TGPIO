@@ -3265,6 +3265,21 @@ static void tgpio_hw_periodic_invert(struct tgpio_device *dev,
 
 	mmio_block->output_hw_flop_high = !mmio_block->output_hw_flop_high;
 
+	if (mmio_block->output_phase == TGPIO_OUTPUT_HW_DUTY) {
+		/*
+		 * An asymmetric waveform cannot be re-phased by a half-period
+		 * compare shift; re-arm with the corrected level mirror so
+		 * the slot selection places the rising edges back on the
+		 * grid with the requested duty.
+		 */
+		struct tgpio_output_desired desired =
+			tgpio_output_desired_get(mmio_block);
+
+		if (desired.run == TGPIO_OUTPUT_RUNNING)
+			tgpio_reconcile_arm(dev, mmio_block, &desired);
+		return;
+	}
+
 	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC ||
 	    !mmio_block->output_hw_piv)
 		return;
