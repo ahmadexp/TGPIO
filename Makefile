@@ -22,6 +22,7 @@ ACTIVITY_LOG ?= 0
 VERBOSE_ROUNDING ?= 0
 TDC ?= 0
 TDC_START ?= 0
+AUTO_POLARITY ?= 0
 INPUT0_ENABLE ?= 0
 INPUT1_ENABLE ?= 0
 INPUT0_CHANNEL ?= 0
@@ -46,6 +47,7 @@ LOAD_ENV += HARDWARE_TIMESTAMPS="$(HARDWARE_TIMESTAMPS)"
 LOAD_ENV += HARDWARE_PERIODIC_OUTPUT="$(HARDWARE_PERIODIC_OUTPUT)"
 LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)" VERBOSE_ROUNDING="$(VERBOSE_ROUNDING)"
 LOAD_ENV += TDC="$(TDC)" TDC_START="$(TDC_START)"
+LOAD_ENV += AUTO_POLARITY="$(AUTO_POLARITY)"
 LOAD_ENV += INPUT0_ENABLE="$(INPUT0_ENABLE)" INPUT1_ENABLE="$(INPUT1_ENABLE)"
 LOAD_ENV += INPUT0_CHANNEL="$(INPUT0_CHANNEL)" INPUT1_CHANNEL="$(INPUT1_CHANNEL)"
 LOAD_ENV += OUTPUT0_CHANNEL="$(OUTPUT0_CHANNEL)" OUTPUT1_CHANNEL="$(OUTPUT1_CHANNEL)"
@@ -56,7 +58,7 @@ LOAD_ENV += OUTPUT1_DUTY_NS="$(OUTPUT1_DUTY_NS)"
 LOAD_ENV += OUTPUT_START_DELAY_NS="$(OUTPUT_START_DELAY_NS)"
 LOAD_ENV += OUTPUT_PHASE_OFFSET_NS="$(OUTPUT_PHASE_OFFSET_NS)"
 
-.PHONY: all clean help load reload unload status install persist uninstall
+.PHONY: all clean help load reload unload status install persist uninstall save-config
 
 help:
 	@echo "TGPIO PTP driver -- build, load, and configuration"
@@ -70,6 +72,7 @@ help:
 	@echo "  make install         Install persistently for the running kernel"
 	@echo "  make persist         Alias for install, including persisted operations"
 	@echo "  make uninstall       Remove the persistent install"
+	@echo "  make save-config     Persist the current runtime configuration"
 	@echo "  make clean           Clean the build"
 	@echo "  make help            This text"
 	@echo
@@ -100,9 +103,10 @@ help:
 	@echo "                       Non-zero starts that output at load (1 PPS ="
 	@echo "                       1000000000). Otherwise use testptp/PyPTM."
 	@echo "  OUTPUT0_DUTY_NS=$(OUTPUT0_DUTY_NS) OUTPUT1_DUTY_NS=$(OUTPUT1_DUTY_NS)"
-	@echo "                       On-time per period. 0 or exactly half = 50%"
-	@echo "                       duty on the ns-precise hardware engine; any"
-	@echo "                       other value uses the ms-class software path"
+	@echo "                       On-time per period. 50% duty, and any duty"
+	@echo "                       whose halves are both >= 50 ms, run on the"
+	@echo "                       ns-precise hardware engine; shorter halves"
+	@echo "                       fall back to the ms-class software path"
 	@echo "  OUTPUT_PHASE_OFFSET_NS=$(OUTPUT_PHASE_OFFSET_NS)"
 	@echo "                       Calibration shift of every output edge in ns"
 	@echo "                       (runtime-writable via /sys/module parameters)"
@@ -143,11 +147,17 @@ help:
 	@echo "                       clear with /sys/kernel/debug/tgpio/tdc_reset"
 	@echo "  TDC_START=$(TDC_START)          Which block is Start (0 or 1); the other"
 	@echo "                       is Stop. Runtime-writable via /sys/module"
+	@echo "  AUTO_POLARITY=$(AUTO_POLARITY)      1 = with the output looped back into the"
+	@echo "                       other block's input, flip inverted output"
+	@echo "                       polarity automatically"
 	@echo
 	@echo "Runtime controls while loaded:"
 	@echo "  sudo cat /sys/kernel/debug/tgpio/status"
 	@echo "  echo 1 > /sys/kernel/debug/tgpio/outputN_invert   (flip polarity)"
 	@echo "  echo <ns> > /sys/module/tgpio_ptp_input/parameters/output_phase_offset_ns"
+	@echo "  echo '<start_ns> <width_ns>' > /sys/kernel/debug/tgpio/oneshotN"
+	@echo "                       Fire one hardware-timed pulse (start 0 = now"
+	@echo "                       +200ms; width >= 50 ms)"
 	@echo
 	@echo "Examples:"
 	@echo "  sudo make reload TGPIO0=input TGPIO1=output OUTPUT1_PERIOD_NS=1000000000"
@@ -195,3 +205,6 @@ persist: install
 
 uninstall:
 	$(SUDO) ./scripts/uninstall.sh
+
+save-config:
+	$(SUDO) ./scripts/save-config.sh

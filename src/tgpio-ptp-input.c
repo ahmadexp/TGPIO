@@ -29,6 +29,7 @@
 #include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/pps_kernel.h>
 #include <linux/ptp_clock_kernel.h>
 #include <linux/seq_file.h>
 #include <linux/seqlock.h>
@@ -122,6 +123,8 @@ tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (20 * NSEC_PER_MSEC)
 #define TGPIO_OUTPUT_PHASE_NUDGE_NS 200
+#define TGPIO_HW_DUTY_MIN_HALF_NS (50 * NSEC_PER_MSEC)
+#define TGPIO_HW_DUTY_SERVICE_DELAY_NS (10 * NSEC_PER_MSEC)
 #define TGPIO_CPUID_ART_LEAF	  0x15
 #define TGPIO_PHC_MAX_ADJ_PPB	  100000000L
 #define TGPIO_MIN_POLL_MS	  1u
@@ -148,6 +151,7 @@ enum tgpio_clock_mode {
 enum tgpio_output_phase {
 	TGPIO_OUTPUT_ARM_PERIODIC,
 	TGPIO_OUTPUT_HARDWARE_PERIODIC,
+	TGPIO_OUTPUT_HW_DUTY, /* hardware toggle engine, alternating PIV */
 	TGPIO_OUTPUT_FIRST_RISING,
 	TGPIO_OUTPUT_TOGGLE,
 };
@@ -225,6 +229,7 @@ static bool activity_log;
 static bool verbose_rounding;
 static bool tdc;
 static unsigned int tdc_start;
+static bool auto_polarity;
 static bool input0_enable;
 static bool input1_enable;
 static unsigned int input0_channel;
@@ -316,6 +321,10 @@ MODULE_PARM_DESC(tdc,
 module_param(tdc_start, uint, 0644);
 MODULE_PARM_DESC(tdc_start,
 		 "Which block is the TDC start input, 0 or 1; the other block is the stop input");
+
+module_param(auto_polarity, bool, 0644);
+MODULE_PARM_DESC(auto_polarity,
+		 "Use a reference captured on one input block to verify the other block's output polarity and flip it automatically when inverted");
 
 module_param(input0_enable, bool, 0444);
 MODULE_PARM_DESC(input0_enable,
@@ -459,6 +468,18 @@ struct tgpio_mmio_block {
 	atomic_t input_desired; /* published by enable: ON bit | edge bits */
 	int input_applied; /* reconciler-private: last programmed desired */
 	u64 last_event_count;
+	u64 input_prev_art;   /* poll_work-private input statistics */
+	bool input_have_prev;
+	s64 input_phase_ns;   /* last capture vs whole-second grid */
+	u64 interval_count;
+	s64 interval_last_ns;
+	s64 interval_min_ns;
+	s64 interval_max_ns;
+	s64 interval_sum_ns;
+	u64 wd_last_compv;    /* output stall watchdog state */
+	unsigned int wd_stalls;
+	struct pps_device *pps; /* RFC 2783 source for input captures */
+	struct delayed_work oneshot_stop_work;
 	struct system_time_snapshot crosststamp_snapshot;
 	enum tgpio_snapshot_state crosststamp_snapshot_state;
 	struct hrtimer output_timer; /* precise wake -> schedules output_work */
@@ -489,6 +510,9 @@ struct tgpio_device {
 	struct tgpio_stats stats;
 	struct delayed_work poll_work;
 	struct delayed_work art_refine_work;
+	struct delayed_work watchdog_work;
+	unsigned int autopol_streak;   /* poll_work-private */
+	unsigned int autopol_cooldown;
 	bool tdc_armed;	   /* poll_work-private TDC pairing state */
 	u64 tdc_start_art;
 	u64 tdc_count;
@@ -507,6 +531,12 @@ static struct tgpio_device *tgpio;
 static struct tgpio_u64_result tgpio_realtime_delta_to_art_cycles(u64 delta_ns);
 static struct tgpio_ns_result tgpio_art_cycles_to_realtime_delta_ns(u64 cycles);
 static void tgpio_update_outputs_after_phc_freq(struct tgpio_device *dev);
+static struct tgpio_output_desired
+tgpio_output_desired_get(struct tgpio_mmio_block *mmio_block);
+static void tgpio_output_wake_at(struct tgpio_mmio_block *mmio_block,
+				 ktime_t when);
+static void tgpio_disable_output(struct tgpio_mmio_block *mmio_block);
+static void tgpio_oneshot_stop_work_fn(struct work_struct *work);
 
 static inline struct tgpio_s64_result tgpio_ok_s64(s64 v)
 {
@@ -865,7 +895,15 @@ static u64 tgpio_output_min_interval_ns(u64 high_time_ns, u64 low_time_ns)
 
 static bool tgpio_output_can_use_hardware(const struct tgpio_output_times *times)
 {
-	return times->high_time_ns == times->low_time_ns;
+	if (times->high_time_ns == times->low_time_ns)
+		return true;
+	/*
+	 * Asymmetric duty runs on the toggle engine with the interval
+	 * register rewritten between edges; both halves must leave enough
+	 * room for the software swap.
+	 */
+	return min(times->high_time_ns, times->low_time_ns) >=
+	       TGPIO_HW_DUTY_MIN_HALF_NS;
 }
 
 static unsigned int tgpio_supported_perout_flags(void)
@@ -1294,8 +1332,24 @@ static void tgpio_hw_flop_fold(struct tgpio_mmio_block *mmio_block)
 	u64 compv;
 	u64 events;
 
-	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC ||
-	    !mmio_block->output_hw_piv)
+	if (!mmio_block->output_hw_piv)
+		return;
+
+	if (mmio_block->output_phase == TGPIO_OUTPUT_HW_DUTY) {
+		/*
+		 * Alternating intervals: the duty service visits after every
+		 * edge, so at most one edge is unaccounted here.
+		 */
+		compv = tgpio_read_compv(mmio_block);
+		if (compv != mmio_block->output_hw_ckpt_compv) {
+			mmio_block->output_hw_flop_high =
+				!mmio_block->output_hw_flop_high;
+			mmio_block->output_hw_ckpt_compv = compv;
+		}
+		return;
+	}
+
+	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC)
 		return;
 
 	compv = tgpio_read_compv(mmio_block);
@@ -1803,8 +1857,13 @@ static struct tgpio_crosststamp_capture tgpio_take_crosststamp(void)
 {
 	struct system_time_snapshot snapshot;
 
-	if (!hardware_timestamps || clock_mode != TGPIO_CLOCK_REALTIME ||
-	    timestamp_mode != TGPIO_TIMESTAMP_REALTIME)
+	/*
+	 * Needed whenever a capture may be converted to realtime: realtime
+	 * timestamp mode and the PPS sources both do, in every clock mode.
+	 * Without the history snapshot the kernel cross-timestamp rejects
+	 * cycles older than the current timekeeping interval.
+	 */
+	if (!hardware_timestamps)
 		return (struct tgpio_crosststamp_capture){
 			.state = TGPIO_SNAPSHOT_NONE
 		};
@@ -2011,6 +2070,190 @@ static void tgpio_apply_input(struct tgpio_mmio_block *mmio_block, int desired)
  * capture: extra starts mean the latest start wins, extra stops are lost
  * (counted in tdc_lost).
  */
+/*
+ * poll_work-only: automatic output polarity verification. When a reference
+ * edge captured on one block consistently lands on the half-period slot of
+ * the other block's output grid, the output level mirror is wrong and the
+ * waveform is inverted; flip it through the same path as the debugfs knob.
+ * Requires three consecutive agreeing samples, ignores ambiguous ones, and
+ * cools down after a flip while the shift takes effect.
+ */
+static void tgpio_auto_polarity_check(struct tgpio_device *dev,
+				      struct tgpio_mmio_block *in_block,
+				      s64 capture_phc_ns)
+{
+	struct tgpio_mmio_block *out =
+		&dev->mmio_blocks[in_block->index ^ 1];
+	struct tgpio_output_desired desired;
+	unsigned long flags;
+	u64 period;
+	u64 r;
+	u64 dist_grid;
+	u64 dist_half;
+
+	if (!READ_ONCE(auto_polarity) || !tgpio_clock_uses_model())
+		return;
+	if (out->mode != TGPIO_MODE_OUTPUT ||
+	    out->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC)
+		return;
+
+	desired = tgpio_output_desired_get(out);
+	if (desired.run != TGPIO_OUTPUT_RUNNING || !desired.period_ns ||
+	    desired.high_time_ns != desired.low_time_ns ||
+	    desired.first_edge_ns < 0 ||
+	    capture_phc_ns < desired.first_edge_ns)
+		return;
+
+	if (dev->autopol_cooldown) {
+		dev->autopol_cooldown--;
+		return;
+	}
+
+	period = desired.period_ns;
+	r = (u64)(capture_phc_ns - desired.first_edge_ns) % period;
+	dist_grid = min(r, period - r);
+	dist_half = r > period / 2 ? r - period / 2 : period / 2 - r;
+
+	if (dist_grid < period / 8) {
+		dev->autopol_streak = 0;
+		return;
+	}
+	if (dist_half >= period / 8) {
+		dev->autopol_streak = 0; /* ambiguous sample */
+		return;
+	}
+
+	if (++dev->autopol_streak < 3)
+		return;
+	dev->autopol_streak = 0;
+	dev->autopol_cooldown = 3;
+
+	pr_info("auto polarity: reference on block %u shows block %u output inverted; flipping\n",
+		in_block->index, out->index);
+	write_seqlock_irqsave(&out->output_seqlock, flags);
+	out->output_desired.flip_gen++;
+	write_sequnlock_irqrestore(&out->output_seqlock, flags);
+	schedule_work(&out->output_work);
+}
+
+#if IS_ENABLED(CONFIG_PPS)
+/* Feed input captures to the RFC 2783 PPS API in the realtime domain. */
+static void tgpio_pps_emit(struct tgpio_mmio_block *mmio_block,
+			   u64 art_cycles)
+{
+	struct tgpio_u64_result real;
+	struct pps_event_time pet = {};
+
+	if (!mmio_block->pps)
+		return;
+
+	real = tgpio_art_to_realtime_ns(mmio_block, art_cycles);
+	if (real.status < 0 || real.val > S64_MAX)
+		return;
+
+	pet.ts_real = ns_to_timespec64(real.val);
+#ifdef CONFIG_NTP_PPS
+	ktime_get_raw_ts64(&pet.ts_raw);
+#endif
+	pps_event(mmio_block->pps, &pet, PPS_CAPTUREASSERT, NULL);
+}
+
+static void tgpio_pps_register(struct tgpio_device *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
+		struct pps_source_info info = {
+			.mode = PPS_CAPTUREASSERT | PPS_OFFSETASSERT |
+				PPS_CANWAIT | PPS_TSFMT_TSPEC,
+			.owner = THIS_MODULE,
+		};
+
+		if (mmio_block->mode != TGPIO_MODE_INPUT)
+			continue;
+		snprintf(info.name, sizeof(info.name), "tgpio%u", i);
+		mmio_block->pps =
+			pps_register_source(&info, PPS_CAPTUREASSERT);
+		if (IS_ERR(mmio_block->pps)) {
+			pr_warn("PPS source registration failed for block %u\n",
+				i);
+			mmio_block->pps = NULL;
+		}
+	}
+}
+
+static void tgpio_pps_unregister(struct tgpio_device *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		if (dev->mmio_blocks[i].pps) {
+			pps_unregister_source(dev->mmio_blocks[i].pps);
+			dev->mmio_blocks[i].pps = NULL;
+		}
+	}
+}
+#else
+static void tgpio_pps_emit(struct tgpio_mmio_block *mmio_block,
+			   u64 art_cycles)
+{
+}
+static void tgpio_pps_register(struct tgpio_device *dev)
+{
+}
+static void tgpio_pps_unregister(struct tgpio_device *dev)
+{
+}
+#endif
+
+/*
+ * poll_work-only: per-input capture statistics. The phase is the distance of
+ * the capture from the nearest whole second of the PTP clock (meaningful for
+ * PPS-class references; it makes discipline quality visible in the status
+ * file without any external tool). The interval is the spacing between
+ * consecutive captures: with a single-edge selection it is the period, with
+ * EDGE=both it alternates between the high and low times of the signal.
+ */
+static void tgpio_input_stats_update(struct tgpio_device *dev,
+				     struct tgpio_mmio_block *mmio_block,
+				     u64 art_cycles)
+{
+	struct tgpio_s64_result phc;
+	struct tgpio_ns_result delta;
+	s64 frac;
+
+	if (tgpio_clock_uses_model()) {
+		phc = tgpio_clock_phc_art_to_ns(dev, art_cycles);
+		if (phc.status >= 0 && phc.val >= 0) {
+			frac = phc.val % NSEC_PER_SEC;
+			if (frac >= NSEC_PER_SEC / 2)
+				frac -= NSEC_PER_SEC;
+			mmio_block->input_phase_ns = frac;
+			tgpio_auto_polarity_check(dev, mmio_block, phc.val);
+		}
+	}
+
+	if (mmio_block->input_have_prev &&
+	    art_cycles > mmio_block->input_prev_art) {
+		delta = tgpio_clock_art_cycles_to_delta_ns(
+			dev, art_cycles - mmio_block->input_prev_art);
+		if (delta.status >= 0 && delta.ns <= S64_MAX) {
+			mmio_block->interval_count++;
+			mmio_block->interval_last_ns = delta.ns;
+			if (mmio_block->interval_count == 1 ||
+			    (s64)delta.ns < mmio_block->interval_min_ns)
+				mmio_block->interval_min_ns = delta.ns;
+			if (mmio_block->interval_count == 1 ||
+			    (s64)delta.ns > mmio_block->interval_max_ns)
+				mmio_block->interval_max_ns = delta.ns;
+			mmio_block->interval_sum_ns += delta.ns;
+		}
+	}
+	mmio_block->input_prev_art = art_cycles;
+	mmio_block->input_have_prev = true;
+}
+
 static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 			      u64 art_cycles, u64 event_delta)
 {
@@ -2099,8 +2342,11 @@ static void tgpio_poll_work(struct work_struct *work)
 			tgpio_emit_event(dev, mmio_block, channel,
 					 cap.art_cycles, cap.event_count,
 					 event_delta);
+			tgpio_input_stats_update(dev, mmio_block,
+						 cap.art_cycles);
 			tgpio_tdc_capture(dev, i, cap.art_cycles,
 					  event_delta);
+			tgpio_pps_emit(mmio_block, cap.art_cycles);
 		}
 
 		mmio_block->crosststamp_snapshot = snap.snapshot;
@@ -2396,22 +2642,34 @@ static void tgpio_log_output_quantization(struct tgpio_device *dev,
 /* output_work-only: switch the block to autonomous hardware periodic output. */
 static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 				       struct tgpio_mmio_block *mmio_block,
-				       s64 first_edge_ns, u64 half_period_ns)
+				       s64 first_edge_ns, u64 high_time_ns,
+				       u64 low_time_ns)
 {
 	struct tgpio_u64_result first_art =
 		tgpio_clock_ns_to_compare_art(dev, first_edge_ns);
-	struct tgpio_u64_result half_period_art =
-		tgpio_clock_delta_to_art_cycles(dev, half_period_ns);
+	struct tgpio_u64_result high_art =
+		tgpio_clock_delta_to_art_cycles(dev, high_time_ns);
+	struct tgpio_u64_result low_art =
+		tgpio_clock_delta_to_art_cycles(dev, low_time_ns);
+	bool asymmetric = high_time_ns != low_time_ns;
 	struct tgpio_u64_result now_art;
 	struct tgpio_u64_result margin;
+	u64 initial_piv;
 	u32 ctrl;
 
-	if (first_art.status < 0 || half_period_art.status < 0 ||
-	    !half_period_art.val || half_period_art.val > U64_MAX / 2)
+	if (first_art.status < 0 || high_art.status < 0 ||
+	    low_art.status < 0 || !high_art.val || !low_art.val ||
+	    high_art.val > U64_MAX / 4 || low_art.val > U64_MAX / 4)
 		return -ENODEV;
 
 	ctrl = tgpio_ctl_without(tgpio_read_ctl(mmio_block), TGPIOCTL_EN);
+
+	/* Stop events, then fold pending toggles into the tracked level flop
+	 * before the registers are cleared; a re-arm that pre-empts a running
+	 * waveform (a PHC step, for example) must not lose the parity.
+	 */
 	tgpio_write_ctl(mmio_block, ctrl);
+	tgpio_hw_flop_fold(mmio_block);
 	tgpio_write_compv(mmio_block, 0);
 	tgpio_write_piv(mmio_block, 0);
 
@@ -2421,18 +2679,16 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 
 	/*
 	 * The output level flop cannot be loaded or read: it holds the level
-	 * of the last generated toggle (it survives disable; EN=1 re-drives
-	 * it; EP writes and single-shot compares do nothing). Polarity is
-	 * therefore handled by slot selection below: if the tracked flop is
-	 * high, the first toggle is a falling edge, so program it on the
-	 * half-period slot before a grid point and the rising edges still
-	 * land on the requested grid.
+	 * of the last generated toggle. Polarity is handled by slot
+	 * selection: if the tracked flop is high, the first toggle is a
+	 * falling edge, programmed one low-time before the requested rising
+	 * edge so the rising edges still land on the requested grid.
 	 */
 	if (mmio_block->output_hw_flop_high) {
-		if (first_art.val > half_period_art.val)
-			first_art.val -= half_period_art.val;
+		if (first_art.val > low_art.val)
+			first_art.val -= low_art.val;
 		else
-			first_art.val += half_period_art.val;
+			first_art.val += high_art.val;
 	}
 
 	/*
@@ -2446,7 +2702,7 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	if (now_art.status >= 0 && margin.status >= 0 &&
 	    now_art.val <= U64_MAX - margin.val) {
 		u64 deadline = now_art.val + margin.val;
-		u64 period_cycles = 2 * half_period_art.val;
+		u64 period_cycles = high_art.val + low_art.val;
 
 		if (first_art.val < deadline) {
 			u64 periods = div64_u64(deadline - first_art.val,
@@ -2461,26 +2717,39 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 		}
 	}
 
+	/* The reload at the pending edge consumes PIV: a pending rise needs
+	 * the high time, a pending fall the low time.
+	 */
+	initial_piv = mmio_block->output_hw_flop_high ? low_art.val :
+							high_art.val;
+
 	ctrl = tgpio_ctl_with(ctrl, TGPIOCTL_EP_TOGGLE | TGPIOCTL_PM);
 	tgpio_write_ctl(mmio_block, ctrl);
 
-	tgpio_write_piv(mmio_block, half_period_art.val);
+	tgpio_write_piv(mmio_block, initial_piv);
 	tgpio_write_compv(mmio_block, first_art.val);
 
-	mmio_block->output_high_time_ns = half_period_ns;
-	mmio_block->output_low_time_ns = half_period_ns;
+	mmio_block->output_high_time_ns = high_time_ns;
+	mmio_block->output_low_time_ns = low_time_ns;
 	mmio_block->output_next_edge = ns_to_ktime(first_edge_ns);
-	mmio_block->output_phase = TGPIO_OUTPUT_HARDWARE_PERIODIC;
+	mmio_block->output_phase = asymmetric ? TGPIO_OUTPUT_HW_DUTY :
+						TGPIO_OUTPUT_HARDWARE_PERIODIC;
 	mmio_block->output_hw_first_art = first_art.val;
-	mmio_block->output_hw_piv = half_period_art.val;
+	mmio_block->output_hw_piv = initial_piv;
 	mmio_block->output_hw_ckpt_compv = first_art.val;
 
 	tgpio_log_output_hw_periodic(dev, mmio_block, first_edge_ns,
-				     half_period_ns, first_art.val,
-				     half_period_art.val);
+				     high_time_ns, first_art.val,
+				     initial_piv);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
-	tgpio_log_output_quantization(dev, mmio_block, first_edge_ns,
-				      half_period_ns);
+	if (!asymmetric)
+		tgpio_log_output_quantization(dev, mmio_block, first_edge_ns,
+					      high_time_ns);
+	else
+		tgpio_output_wake_at(
+			mmio_block,
+			ktime_add_ns(ktime_get_real(),
+				     TGPIO_HW_DUTY_SERVICE_DELAY_NS));
 	return 0;
 }
 
@@ -2969,7 +3238,8 @@ static void tgpio_hw_periodic_drain_low(struct tgpio_mmio_block *mmio_block)
 {
 	unsigned int i;
 
-	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC ||
+	if ((mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC &&
+	     mmio_block->output_phase != TGPIO_OUTPUT_HW_DUTY) ||
 	    !mmio_block->output_hw_piv)
 		return;
 
@@ -2995,6 +3265,21 @@ static void tgpio_hw_periodic_invert(struct tgpio_device *dev,
 
 	mmio_block->output_hw_flop_high = !mmio_block->output_hw_flop_high;
 
+	if (mmio_block->output_phase == TGPIO_OUTPUT_HW_DUTY) {
+		/*
+		 * An asymmetric waveform cannot be re-phased by a half-period
+		 * compare shift; re-arm with the corrected level mirror so
+		 * the slot selection places the rising edges back on the
+		 * grid with the requested duty.
+		 */
+		struct tgpio_output_desired desired =
+			tgpio_output_desired_get(mmio_block);
+
+		if (desired.run == TGPIO_OUTPUT_RUNNING)
+			tgpio_reconcile_arm(dev, mmio_block, &desired);
+		return;
+	}
+
 	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC ||
 	    !mmio_block->output_hw_piv)
 		return;
@@ -3018,6 +3303,65 @@ static void tgpio_hw_periodic_invert(struct tgpio_device *dev,
 	tgpio_hw_periodic_write_compv_paused(mmio_block, compv);
 	pr_info("output polarity inverted block=%u flop_high=%d\n",
 		mmio_block->index, mmio_block->output_hw_flop_high);
+}
+
+/*
+ * output_work-only: asymmetric-duty service. Visits shortly after every
+ * generated edge: folds the edge into the level mirror, programs the
+ * interval the *pending* edge will consume (a pending rise takes the high
+ * time, a pending fall the low time -- recomputed each visit so servo rate
+ * changes are tracked), and schedules the next visit just after the pending
+ * edge. Both halves are at least TGPIO_HW_DUTY_MIN_HALF_NS wide, so the
+ * rewrite always lands well before the edge that consumes it.
+ */
+static void tgpio_hw_duty_service(struct tgpio_device *dev,
+				  struct tgpio_mmio_block *mmio_block)
+{
+	struct tgpio_u64_result piv;
+	struct tgpio_s64_result pending;
+	struct tgpio_s64_result now;
+	struct tgpio_u64_result delay_real;
+	s64 delay_clock;
+	u64 compv;
+
+	tgpio_hw_flop_fold(mmio_block);
+
+	piv = tgpio_clock_delta_to_art_cycles(
+		dev, mmio_block->output_hw_flop_high ?
+			     mmio_block->output_low_time_ns :
+			     mmio_block->output_high_time_ns);
+	if (piv.status >= 0 && piv.val &&
+	    piv.val != mmio_block->output_hw_piv &&
+	    upper_32_bits(piv.val) ==
+		    upper_32_bits(mmio_block->output_hw_piv)) {
+		tgpio_write_piv(mmio_block, piv.val);
+		mmio_block->output_hw_piv = piv.val;
+	}
+
+	compv = tgpio_read_compv(mmio_block);
+	if (compv > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES) {
+		tgpio_disable_output_hw(mmio_block);
+		return;
+	}
+	pending = tgpio_clock_phc_art_to_ns(dev,
+					    compv + TGPIO_ART_HW_DELAY_CYCLES);
+	now = tgpio_clock_now_ns(dev);
+	if (pending.status < 0 || now.status < 0) {
+		tgpio_output_wake_at(mmio_block,
+				     ktime_add_ns(ktime_get_real(),
+						  100 * NSEC_PER_MSEC));
+		return;
+	}
+
+	delay_clock = pending.val - now.val + TGPIO_HW_DUTY_SERVICE_DELAY_NS;
+	if (delay_clock < (s64)TGPIO_HW_DUTY_SERVICE_DELAY_NS)
+		delay_clock = TGPIO_HW_DUTY_SERVICE_DELAY_NS;
+	delay_real = tgpio_clock_delta_to_real_ns(dev, delay_clock);
+	tgpio_output_wake_at(
+		mmio_block,
+		ktime_add_ns(ktime_get_real(),
+			     delay_real.status < 0 ? 100 * NSEC_PER_MSEC :
+						     delay_real.val));
 }
 
 /* Sole writer of output hardware + the per-edge timer. */
@@ -3073,6 +3417,8 @@ static void tgpio_output_work(struct work_struct *work)
 						     &desired);
 			return;
 		}
+		if (mmio_block->output_phase == TGPIO_OUTPUT_HW_DUTY)
+			return; /* the duty service tracks rate per edge */
 		if (mmio_block->output_phase == TGPIO_OUTPUT_ARM_PERIODIC &&
 		    ktime_before(ktime_get_real(), mmio_block->output_wake_at))
 			return;
@@ -3090,9 +3436,15 @@ static void tgpio_output_work(struct work_struct *work)
 		if (tgpio_arm_hardware_periodic(
 			    dev, mmio_block,
 			    ktime_to_ns(mmio_block->output_next_edge),
-			    mmio_block->output_high_time_ns))
+			    mmio_block->output_high_time_ns,
+			    mmio_block->output_low_time_ns))
 			tgpio_disable_output_hw(mmio_block);
 		return; /* hardware free-runs; no further wake needed */
+	}
+
+	if (mmio_block->output_phase == TGPIO_OUTPUT_HW_DUTY) {
+		tgpio_hw_duty_service(dev, mmio_block);
+		return;
 	}
 
 	if (mmio_block->output_phase == TGPIO_OUTPUT_HARDWARE_PERIODIC)
@@ -3188,6 +3540,7 @@ static int tgpio_config_output_values(struct tgpio_device *dev,
 	if (mmio_block->mode != TGPIO_MODE_OUTPUT || !mmio_block->regs)
 		return -EOPNOTSUPP;
 
+	cancel_delayed_work(&mmio_block->oneshot_stop_work);
 	if (!on) {
 		tgpio_disable_output(mmio_block);
 		return 0;
@@ -3447,6 +3800,99 @@ static int tgpio_ptp_enable(struct ptp_clock_info *ptp,
 	}
 
 	return ret;
+}
+
+#define TGPIO_WATCHDOG_PERIOD_S 10
+
+/*
+ * Output stall watchdog: a running hardware periodic block advances COMPV by
+ * PIV on every generated edge, so a COMPV that stops moving for several
+ * periods means the waveform silently died. Checked every 10 seconds; warns
+ * once per stall episode.
+ */
+static void tgpio_watchdog_work_fn(struct work_struct *work)
+{
+	struct tgpio_device *dev = container_of(
+		work, struct tgpio_device, watchdog_work.work);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
+		u64 period_s;
+		u64 compv;
+
+		if (mmio_block->mode != TGPIO_MODE_OUTPUT ||
+		    (mmio_block->output_phase !=
+			     TGPIO_OUTPUT_HARDWARE_PERIODIC &&
+		     mmio_block->output_phase != TGPIO_OUTPUT_HW_DUTY) ||
+		    !READ_ONCE(mmio_block->output_hw_piv) ||
+		    !mmio_block->regs)
+			continue;
+
+		compv = tgpio_read_compv(mmio_block);
+		if (compv != mmio_block->wd_last_compv) {
+			mmio_block->wd_last_compv = compv;
+			mmio_block->wd_stalls = 0;
+			continue;
+		}
+
+		mmio_block->wd_stalls++;
+		period_s = div64_u64(2 * mmio_block->output_high_time_ns,
+				     NSEC_PER_SEC);
+		if ((u64)mmio_block->wd_stalls * TGPIO_WATCHDOG_PERIOD_S >
+			    max_t(u64, 3 * TGPIO_WATCHDOG_PERIOD_S,
+				  3 * period_s) &&
+		    mmio_block->wd_stalls * TGPIO_WATCHDOG_PERIOD_S <=
+			    max_t(u64, 3 * TGPIO_WATCHDOG_PERIOD_S,
+				  3 * period_s) +
+				    TGPIO_WATCHDOG_PERIOD_S)
+			pr_warn("output stalled: block=%u compare stuck at %llu for %us\n",
+				i, compv,
+				mmio_block->wd_stalls *
+					TGPIO_WATCHDOG_PERIOD_S);
+	}
+
+	schedule_delayed_work(&dev->watchdog_work,
+			      TGPIO_WATCHDOG_PERIOD_S * HZ);
+}
+
+/*
+ * Precise cross-timestamp (PTP_SYS_OFFSET_PRECISE): one consistent
+ * (device time, system realtime, system monoraw) triple. The ART value is
+ * obtained by inverting the very realtime instant reported back, so the
+ * device/realtime pairing is exact by construction; tools like phc2sys and
+ * chrony use this automatically when present, removing read-jitter from
+ * clock comparisons.
+ */
+static int tgpio_ptp_getcrosststamp(struct ptp_clock_info *ptp,
+				    struct system_device_crosststamp *cts)
+{
+	struct tgpio_device *dev =
+		container_of(ptp, struct tgpio_device, ptp_info);
+	struct tgpio_s64_result dev_ns;
+	ktime_t real;
+	s64 raw_before;
+	s64 raw_after;
+	u64 art;
+
+	raw_before = ktime_get_raw_ns();
+	real = ktime_get_real();
+	raw_after = ktime_get_raw_ns();
+
+	if (clock_mode == TGPIO_CLOCK_REALTIME) {
+		cts->device = real;
+	} else {
+		if (!ktime_real_to_base_clock(real, CSID_X86_ART, &art))
+			return -EOPNOTSUPP;
+		dev_ns = tgpio_clock_phc_art_to_ns(dev, art);
+		if (dev_ns.status < 0)
+			return -EOPNOTSUPP;
+		cts->device = ns_to_ktime(dev_ns.val);
+	}
+	tgpio_xtstamp_realtime(*cts) = real;
+	cts->sys_monoraw =
+		ns_to_ktime(raw_before + (raw_after - raw_before) / 2);
+	return 0;
 }
 
 /*
@@ -3756,6 +4202,7 @@ static void tgpio_disable_outputs(struct tgpio_device *dev)
 		 * so any later work run won't re-arm; a second round drains the
 		 * timer->work->timer chain to quiescence before unmap/free.
 		 */
+		cancel_delayed_work_sync(&mmio_block->oneshot_stop_work);
 		hrtimer_cancel(&mmio_block->output_timer);
 		cancel_work_sync(&mmio_block->output_work);
 		hrtimer_cancel(&mmio_block->output_timer);
@@ -3843,6 +4290,8 @@ static int tgpio_configure_mmio_blocks(struct tgpio_device *dev)
 		mmio_block->mmio_phys = addrs[i];
 		seqlock_init(&mmio_block->output_seqlock);
 		INIT_WORK(&mmio_block->output_work, tgpio_output_work);
+		INIT_DELAYED_WORK(&mmio_block->oneshot_stop_work,
+				  tgpio_oneshot_stop_work_fn);
 		hrtimer_setup(&mmio_block->output_timer, tgpio_output_timer,
 			      CLOCK_REALTIME, HRTIMER_MODE_ABS);
 
@@ -4078,6 +4527,7 @@ static int tgpio_register_ptp_clock(struct tgpio_device *dev)
 	dev->ptp_info.settime64 = tgpio_ptp_settime64;
 	dev->ptp_info.enable = tgpio_ptp_enable;
 	dev->ptp_info.verify = tgpio_ptp_verify;
+	dev->ptp_info.getcrosststamp = tgpio_ptp_getcrosststamp;
 
 	dev->ptp_clock = ptp_clock_register(&dev->ptp_info, NULL);
 	if (IS_ERR(dev->ptp_clock)) {
@@ -4130,6 +4580,19 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 					   "on" :
 					   "off",
 				   mmio_block->last_event_count);
+			if (tgpio_clock_uses_model() &&
+			    mmio_block->input_have_prev)
+				seq_printf(m, " phase=%lldns",
+					   mmio_block->input_phase_ns);
+			if (mmio_block->interval_count)
+				seq_printf(m,
+					   " interval_last=%lldns min=%lldns max=%lldns mean=%lldns n=%llu",
+					   mmio_block->interval_last_ns,
+					   mmio_block->interval_min_ns,
+					   mmio_block->interval_max_ns,
+					   div64_s64(mmio_block->interval_sum_ns,
+						     (s64)mmio_block->interval_count),
+					   mmio_block->interval_count);
 		} else if (mmio_block->mode == TGPIO_MODE_OUTPUT) {
 			struct tgpio_output_desired desired =
 				tgpio_output_desired_get(mmio_block);
@@ -4256,6 +4719,82 @@ static const struct file_operations tgpio_output_invert_fops = {
 	.write = tgpio_output_invert_write,
 };
 
+static void tgpio_oneshot_stop_work_fn(struct work_struct *work)
+{
+	struct tgpio_mmio_block *mmio_block = container_of(
+		work, struct tgpio_mmio_block, oneshot_stop_work.work);
+
+	tgpio_disable_output(mmio_block);
+}
+
+/*
+ * One-shot timed pulse: write "<start_ns> <width_ns>" (PTP clock domain;
+ * start 0 means 200 ms from now). Implemented as a short-lived periodic
+ * output: the toggle engine produces the rising edge at start and the
+ * falling edge at start+width with hardware timing, and a scheduled stop
+ * lands in the following low half -- which is why the width must be at
+ * least 50 ms: the stop must beat the next unwanted rising edge, and
+ * software scheduling cannot cut it closer.
+ */
+static ssize_t tgpio_oneshot_write(struct file *file, const char __user *ubuf,
+				   size_t count, loff_t *ppos)
+{
+	struct tgpio_mmio_block *mmio_block = file->private_data;
+	struct tgpio_device *dev = mmio_block->owner;
+	struct tgpio_output_desired desired;
+	struct tgpio_u64_result delay_real;
+	struct tgpio_s64_result now;
+	char buf[64];
+	s64 start;
+	u64 width;
+	s64 stop_delta;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	if (sscanf(buf, "%lld %llu", &start, &width) != 2)
+		return -EINVAL;
+
+	if (mmio_block->mode != TGPIO_MODE_OUTPUT)
+		return -EOPNOTSUPP;
+	if (width < TGPIO_HW_DUTY_MIN_HALF_NS || width > (u64)S64_MAX / 4)
+		return -EINVAL;
+	desired = tgpio_output_desired_get(mmio_block);
+	if (desired.run == TGPIO_OUTPUT_RUNNING)
+		return -EBUSY;
+
+	now = tgpio_clock_now_ns(dev);
+	if (now.status < 0 || now.val < 0)
+		return -ENODEV;
+	if (!start)
+		start = now.val + 200 * NSEC_PER_MSEC;
+	if (start < now.val + 50 * NSEC_PER_MSEC)
+		return -EINVAL;
+
+	tgpio_output_publish(mmio_block, TGPIO_OUTPUT_RUNNING,
+			     TGPIO_OUTPUT_HARDWARE, 2 * width, width, width,
+			     start);
+
+	stop_delta = start - now.val + (s64)width +
+		     (s64)min_t(u64, width / 2, 100 * NSEC_PER_MSEC);
+	delay_real = tgpio_clock_delta_to_real_ns(dev, stop_delta);
+	schedule_delayed_work(&mmio_block->oneshot_stop_work,
+			      nsecs_to_jiffies(delay_real.status < 0 ?
+						       (u64)stop_delta :
+						       delay_real.val));
+	pr_info("oneshot armed block=%u start_ns=%lld width_ns=%llu\n",
+		mmio_block->index, start, width);
+	return count;
+}
+
+static const struct file_operations tgpio_oneshot_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = tgpio_oneshot_write,
+};
+
 /* Write 1 to clear the TDC statistics. */
 static ssize_t tgpio_tdc_reset_write(struct file *file,
 				     const char __user *ubuf, size_t count,
@@ -4306,6 +4845,9 @@ static void tgpio_debugfs_init(struct tgpio_device *dev)
 		snprintf(name, sizeof(name), "output%u_invert", i);
 		debugfs_create_file(name, 0200, tgpio_debugfs_dir, mmio_block,
 				    &tgpio_output_invert_fops);
+		snprintf(name, sizeof(name), "oneshot%u", i);
+		debugfs_create_file(name, 0200, tgpio_debugfs_dir, mmio_block,
+				    &tgpio_oneshot_fops);
 	}
 }
 
@@ -4387,6 +4929,9 @@ static int __init tgpio_input_init(void)
 	seqlock_init(&tgpio->phc_seqlock);
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
 	INIT_DELAYED_WORK(&tgpio->art_refine_work, tgpio_art_refine_work_fn);
+	INIT_DELAYED_WORK(&tgpio->watchdog_work, tgpio_watchdog_work_fn);
+	schedule_delayed_work(&tgpio->watchdog_work,
+			      TGPIO_WATCHDOG_PERIOD_S * HZ);
 
 	clock = tgpio_parse_clock_mode(clock_mode_param);
 	if (clock.status < 0) {
@@ -4418,6 +4963,8 @@ static int __init tgpio_input_init(void)
 	ret = tgpio_configure_mmio_blocks(tgpio);
 	if (ret)
 		goto err_cleanup;
+
+	tgpio_pps_register(tgpio);
 
 	ret = tgpio_validate_persistent_operations(tgpio);
 	if (ret)
@@ -4503,6 +5050,8 @@ static void __exit tgpio_input_exit(void)
 		ptp_clock_unregister(tgpio->ptp_clock);
 
 	cancel_delayed_work_sync(&tgpio->art_refine_work);
+	cancel_delayed_work_sync(&tgpio->watchdog_work);
+	tgpio_pps_unregister(tgpio);
 	tgpio_disable_mmio_blocks(tgpio);
 
 	tgpio_unmap_mmio_blocks(tgpio);
