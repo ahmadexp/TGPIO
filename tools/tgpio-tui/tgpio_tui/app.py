@@ -50,6 +50,7 @@ class TgpioApp(App):
     .button-row Button { margin-right: 2; }
     .row-title { padding: 1 2 0 0; text-style: bold; width: 8; }
     .inline-input { width: 34; margin-right: 2; }
+    .button-row Select { width: 18; }
     .filter-button { min-width: 10; }
     #journal { border: round $primary; margin: 0 1 1 1; }
     .mono { padding: 1; }
