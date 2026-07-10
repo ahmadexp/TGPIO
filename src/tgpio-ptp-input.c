@@ -224,6 +224,7 @@ static bool hardware_periodic_output = true;
 static bool activity_log;
 static bool verbose_rounding;
 static bool tdc;
+static unsigned int tdc_start;
 static bool input0_enable;
 static bool input1_enable;
 static unsigned int input0_channel;
@@ -310,7 +311,11 @@ MODULE_PARM_DESC(verbose_rounding,
 
 module_param(tdc, bool, 0644);
 MODULE_PARM_DESC(tdc,
-		 "Time-to-digital converter mode: pair block 0 (start) and block 1 (stop) input captures into hardware-timestamped duration measurements");
+		 "Time-to-digital converter mode: pair start and stop input captures into hardware-timestamped duration measurements");
+
+module_param(tdc_start, uint, 0644);
+MODULE_PARM_DESC(tdc_start,
+		 "Which block is the TDC start input, 0 or 1; the other block is the stop input");
 
 module_param(input0_enable, bool, 0444);
 MODULE_PARM_DESC(input0_enable,
@@ -2009,6 +2014,7 @@ static void tgpio_apply_input(struct tgpio_mmio_block *mmio_block, int desired)
 static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 			      u64 art_cycles, u64 event_delta)
 {
+	unsigned int start_block = READ_ONCE(tdc_start) & 1;
 	struct tgpio_ns_result duration;
 	u64 cycles;
 
@@ -2022,12 +2028,12 @@ static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 	if (event_delta > 1 && event_delta <= 4096)
 		dev->tdc_lost += event_delta - 1;
 
-	if (block == 0) {
+	if (block == start_block) {
 		dev->tdc_start_art = art_cycles;
 		dev->tdc_armed = true;
 		return;
 	}
-	if (block != 1 || !dev->tdc_armed)
+	if (block != (start_block ^ 1) || !dev->tdc_armed)
 		return;
 	if (art_cycles < dev->tdc_start_art)
 		return; /* stop predates the armed start; keep waiting */
@@ -3316,9 +3322,15 @@ static int tgpio_start_persistent_operations(struct tgpio_device *dev)
 	int ret;
 
 	if (READ_ONCE(tdc)) {
+		unsigned int start_block = READ_ONCE(tdc_start);
+
+		if (start_block > 1) {
+			pr_err("tdc_start must be 0 or 1\n");
+			return -EINVAL;
+		}
 		if (dev->mmio_blocks[0].mode != TGPIO_MODE_INPUT ||
 		    dev->mmio_blocks[1].mode != TGPIO_MODE_INPUT) {
-			pr_err("tdc=1 requires tgpio0=input (start) and tgpio1=input (stop)\n");
+			pr_err("tdc=1 requires both tgpio0=input and tgpio1=input\n");
 			return -EINVAL;
 		}
 		/* Arm both captures so measurements start immediately. */
@@ -3328,9 +3340,14 @@ static int tgpio_start_persistent_operations(struct tgpio_device *dev)
 			if (ret)
 				return ret;
 		}
-		pr_info("TDC mode: block 0 %s edge starts, block 1 %s edge stops\n",
-			tgpio_edge_bits_name(dev->mmio_blocks[0].input_edge_bits),
-			tgpio_edge_bits_name(dev->mmio_blocks[1].input_edge_bits));
+		pr_info("TDC mode: block %u %s edge starts, block %u %s edge stops\n",
+			start_block,
+			tgpio_edge_bits_name(
+				dev->mmio_blocks[start_block].input_edge_bits),
+			start_block ^ 1,
+			tgpio_edge_bits_name(
+				dev->mmio_blocks[start_block ^ 1]
+					.input_edge_bits));
 	}
 
 	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
@@ -4178,7 +4195,9 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 	if (READ_ONCE(tdc)) {
 		if (dev->tdc_count)
 			seq_printf(m,
-				   "tdc: count=%llu last=%lldns last_cycles=%llu min=%lldns max=%lldns mean=%lldns lost=%llu armed=%d\n",
+				   "tdc: start=block%u stop=block%u count=%llu last=%lldns last_cycles=%llu min=%lldns max=%lldns mean=%lldns lost=%llu armed=%d\n",
+				   READ_ONCE(tdc_start) & 1,
+				   (READ_ONCE(tdc_start) & 1) ^ 1,
 				   dev->tdc_count, dev->tdc_last_ns,
 				   dev->tdc_last_cycles, dev->tdc_min_ns,
 				   dev->tdc_max_ns,
@@ -4186,7 +4205,10 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 					     (s64)dev->tdc_count),
 				   dev->tdc_lost, dev->tdc_armed);
 		else
-			seq_printf(m, "tdc: count=0 lost=%llu armed=%d\n",
+			seq_printf(m,
+				   "tdc: start=block%u stop=block%u count=0 lost=%llu armed=%d\n",
+				   READ_ONCE(tdc_start) & 1,
+				   (READ_ONCE(tdc_start) & 1) ^ 1,
 				   dev->tdc_lost, dev->tdc_armed);
 	}
 
