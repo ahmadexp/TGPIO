@@ -21,7 +21,7 @@ The default is both blocks as inputs, matching the first working input setup.
 
 | Capability | Summary | Measured on the validated setup |
 |---|---|---|
-| Periodic output | Hardware toggle engine, grid-aligned starts, deterministic polarity | 1 PPS at **+9 ± 64 ns** vs an atomic reference (phc2sys path) |
+| Periodic output | Hardware toggle engine, grid-aligned starts, deterministic polarity | 1 PPS at **+9 ± 64 ns** vs an atomic reference; both outputs simultaneously within ~100 ns on a Calnex Sentinel, tracking each other at **1.4 ± 0.1 ns** |
 | Asymmetric duty | Per-edge interval alternation, halves >= 50 ms, every edge hardware-timed | 25% duty: 249.998 ms / 749.995 ms |
 | One-shot pulse | `oneshotN` debugfs: single hardware-timed pulse at an absolute time | 100 ms request measured 99.9990 ms |
 | Timestamp input | Hardware ART-domain capture, per-edge selection, live statistics | capture-to-grid `phase` readout at ns level |
@@ -363,6 +363,19 @@ asymmetry (about 2.5 us on the validated platform; cancel it with
 `/dev/cpu_dma_latency` at 0 and select the performance cpufreq governor,
 otherwise the asymmetry wanders with power management and the calibration
 goes stale. Measured output alignment after calibration: `+9 +/- 64 ns`.
+
+### Independent validation (Calnex Sentinel)
+
+The phc2sys path was cross-validated on a Calnex Sentinel measuring 1 PPS
+time error on both TGPIO outputs and the atomic reference simultaneously
+(per-second differencing against the reference cancels the instrument's
+internal timebase). Both disciplined outputs measured `-42 +/- 103 ns`
+over 15 minutes and `-66 +/- 83 ns` over a follow-up window, drift below
+0.25 ns/s; repeated windows show the PCIe-path systematic wandering on a
+±60 ns scale over tens of minutes, which bounds how finely
+`output_phase_offset_ns` is worth trimming. The two simultaneously
+disciplined outputs tracked each other at `-1.4 +/- 0.1 ns` — a second
+synchronized hardware output costs nothing in accuracy.
 
 In both cases: PTP device numbering can change across reboots, so resolve
 devices with `cat /sys/class/ptp/ptp*/clock_name` ("Intel TGPIO" is this
