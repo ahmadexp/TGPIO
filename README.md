@@ -259,11 +259,15 @@ so that PHC tools see a consistent clock domain.
 ## TDC Mode (Time-to-Digital Converter)
 
 With both blocks as inputs, `TDC=1` pairs them into a duration counter:
-block 0 is Start, block 1 is Stop, and each completed pair yields the time
-between the two edges.
+one block is Start, the other is Stop, and each completed pair yields the
+time between the two edges. `TDC_START` selects which block starts
+(default 0); it is runtime-writable under
+`/sys/module/tgpio_ptp_input/parameters/tdc_start`, so the roles can be
+swapped on a running measurement.
 
 ```sh
 sudo make reload TDC=1 TGPIO0=input TGPIO1=input EDGE0=rising EDGE1=rising
+sudo make reload TDC=1 TDC_START=1 TGPIO0=input TGPIO1=input   # block 1 starts
 ```
 
 Both timestamps come from the hardware capture registers in the same ART
@@ -288,7 +292,7 @@ Results appear in the status file and, with `ACTIVITY_LOG=1`, per
 measurement in the kernel journal:
 
 ```text
-tdc: count=42 last=1000000013ns last_cycles=38400005 min=999999987ns max=1000000039ns mean=1000000012ns lost=0 armed=0
+tdc: start=block0 stop=block1 count=42 last=1000000013ns last_cycles=38400005 min=999999987ns max=1000000039ns mean=1000000012ns lost=0 armed=0
 activity=tdc_measure start_art=... stop_art=... cycles=... duration_ns=...
 ```
 

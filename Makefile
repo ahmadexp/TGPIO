@@ -21,6 +21,7 @@ HARDWARE_PERIODIC_OUTPUT ?= 1
 ACTIVITY_LOG ?= 0
 VERBOSE_ROUNDING ?= 0
 TDC ?= 0
+TDC_START ?= 0
 INPUT0_ENABLE ?= 0
 INPUT1_ENABLE ?= 0
 INPUT0_CHANNEL ?= 0
@@ -44,7 +45,7 @@ LOAD_ENV += ART_FREQUENCY="$(ART_FREQUENCY)"
 LOAD_ENV += HARDWARE_TIMESTAMPS="$(HARDWARE_TIMESTAMPS)"
 LOAD_ENV += HARDWARE_PERIODIC_OUTPUT="$(HARDWARE_PERIODIC_OUTPUT)"
 LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)" VERBOSE_ROUNDING="$(VERBOSE_ROUNDING)"
-LOAD_ENV += TDC="$(TDC)"
+LOAD_ENV += TDC="$(TDC)" TDC_START="$(TDC_START)"
 LOAD_ENV += INPUT0_ENABLE="$(INPUT0_ENABLE)" INPUT1_ENABLE="$(INPUT1_ENABLE)"
 LOAD_ENV += INPUT0_CHANNEL="$(INPUT0_CHANNEL)" INPUT1_CHANNEL="$(INPUT1_CHANNEL)"
 LOAD_ENV += OUTPUT0_CHANNEL="$(OUTPUT0_CHANNEL)" OUTPUT1_CHANNEL="$(OUTPUT1_CHANNEL)"
@@ -140,6 +141,8 @@ help:
 	@echo "                       Requires TGPIO0=input TGPIO1=input; edges"
 	@echo "                       via EDGE0/EDGE1. Stats in the status file;"
 	@echo "                       clear with /sys/kernel/debug/tgpio/tdc_reset"
+	@echo "  TDC_START=$(TDC_START)          Which block is Start (0 or 1); the other"
+	@echo "                       is Stop. Runtime-writable via /sys/module"
 	@echo
 	@echo "Runtime controls while loaded:"
 	@echo "  sudo cat /sys/kernel/debug/tgpio/status"
@@ -161,6 +164,8 @@ help:
 	@echo "      1 ms period, 250 us on-time (software path)"
 	@echo "  sudo make reload TDC=1 TGPIO0=input TGPIO1=input EDGE0=rising EDGE1=rising"
 	@echo "      Measure start-to-stop durations between the two pins"
+	@echo "  sudo make reload TDC=1 TDC_START=1 TGPIO0=input TGPIO1=input"
+	@echo "      Same, with block 1 as Start and block 0 as Stop"
 	@echo
 	@echo "Full documentation: README.md"
 
