@@ -459,6 +459,16 @@ struct tgpio_mmio_block {
 	atomic_t input_desired; /* published by enable: ON bit | edge bits */
 	int input_applied; /* reconciler-private: last programmed desired */
 	u64 last_event_count;
+	u64 input_prev_art;   /* poll_work-private input statistics */
+	bool input_have_prev;
+	s64 input_phase_ns;   /* last capture vs whole-second grid */
+	u64 interval_count;
+	s64 interval_last_ns;
+	s64 interval_min_ns;
+	s64 interval_max_ns;
+	s64 interval_sum_ns;
+	u64 wd_last_compv;    /* output stall watchdog state */
+	unsigned int wd_stalls;
 	struct system_time_snapshot crosststamp_snapshot;
 	enum tgpio_snapshot_state crosststamp_snapshot_state;
 	struct hrtimer output_timer; /* precise wake -> schedules output_work */
@@ -489,6 +499,7 @@ struct tgpio_device {
 	struct tgpio_stats stats;
 	struct delayed_work poll_work;
 	struct delayed_work art_refine_work;
+	struct delayed_work watchdog_work;
 	bool tdc_armed;	   /* poll_work-private TDC pairing state */
 	u64 tdc_start_art;
 	u64 tdc_count;
@@ -2011,6 +2022,52 @@ static void tgpio_apply_input(struct tgpio_mmio_block *mmio_block, int desired)
  * capture: extra starts mean the latest start wins, extra stops are lost
  * (counted in tdc_lost).
  */
+/*
+ * poll_work-only: per-input capture statistics. The phase is the distance of
+ * the capture from the nearest whole second of the PTP clock (meaningful for
+ * PPS-class references; it makes discipline quality visible in the status
+ * file without any external tool). The interval is the spacing between
+ * consecutive captures: with a single-edge selection it is the period, with
+ * EDGE=both it alternates between the high and low times of the signal.
+ */
+static void tgpio_input_stats_update(struct tgpio_device *dev,
+				     struct tgpio_mmio_block *mmio_block,
+				     u64 art_cycles)
+{
+	struct tgpio_s64_result phc;
+	struct tgpio_ns_result delta;
+	s64 frac;
+
+	if (tgpio_clock_uses_model()) {
+		phc = tgpio_clock_phc_art_to_ns(dev, art_cycles);
+		if (phc.status >= 0 && phc.val >= 0) {
+			frac = phc.val % NSEC_PER_SEC;
+			if (frac >= NSEC_PER_SEC / 2)
+				frac -= NSEC_PER_SEC;
+			mmio_block->input_phase_ns = frac;
+		}
+	}
+
+	if (mmio_block->input_have_prev &&
+	    art_cycles > mmio_block->input_prev_art) {
+		delta = tgpio_clock_art_cycles_to_delta_ns(
+			dev, art_cycles - mmio_block->input_prev_art);
+		if (delta.status >= 0 && delta.ns <= S64_MAX) {
+			mmio_block->interval_count++;
+			mmio_block->interval_last_ns = delta.ns;
+			if (mmio_block->interval_count == 1 ||
+			    (s64)delta.ns < mmio_block->interval_min_ns)
+				mmio_block->interval_min_ns = delta.ns;
+			if (mmio_block->interval_count == 1 ||
+			    (s64)delta.ns > mmio_block->interval_max_ns)
+				mmio_block->interval_max_ns = delta.ns;
+			mmio_block->interval_sum_ns += delta.ns;
+		}
+	}
+	mmio_block->input_prev_art = art_cycles;
+	mmio_block->input_have_prev = true;
+}
+
 static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 			      u64 art_cycles, u64 event_delta)
 {
@@ -2099,6 +2156,8 @@ static void tgpio_poll_work(struct work_struct *work)
 			tgpio_emit_event(dev, mmio_block, channel,
 					 cap.art_cycles, cap.event_count,
 					 event_delta);
+			tgpio_input_stats_update(dev, mmio_block,
+						 cap.art_cycles);
 			tgpio_tdc_capture(dev, i, cap.art_cycles,
 					  event_delta);
 		}
@@ -3449,6 +3508,98 @@ static int tgpio_ptp_enable(struct ptp_clock_info *ptp,
 	return ret;
 }
 
+#define TGPIO_WATCHDOG_PERIOD_S 10
+
+/*
+ * Output stall watchdog: a running hardware periodic block advances COMPV by
+ * PIV on every generated edge, so a COMPV that stops moving for several
+ * periods means the waveform silently died. Checked every 10 seconds; warns
+ * once per stall episode.
+ */
+static void tgpio_watchdog_work_fn(struct work_struct *work)
+{
+	struct tgpio_device *dev = container_of(
+		work, struct tgpio_device, watchdog_work.work);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
+		u64 period_s;
+		u64 compv;
+
+		if (mmio_block->mode != TGPIO_MODE_OUTPUT ||
+		    mmio_block->output_phase !=
+			    TGPIO_OUTPUT_HARDWARE_PERIODIC ||
+		    !READ_ONCE(mmio_block->output_hw_piv) ||
+		    !mmio_block->regs)
+			continue;
+
+		compv = tgpio_read_compv(mmio_block);
+		if (compv != mmio_block->wd_last_compv) {
+			mmio_block->wd_last_compv = compv;
+			mmio_block->wd_stalls = 0;
+			continue;
+		}
+
+		mmio_block->wd_stalls++;
+		period_s = div64_u64(2 * mmio_block->output_high_time_ns,
+				     NSEC_PER_SEC);
+		if ((u64)mmio_block->wd_stalls * TGPIO_WATCHDOG_PERIOD_S >
+			    max_t(u64, 3 * TGPIO_WATCHDOG_PERIOD_S,
+				  3 * period_s) &&
+		    mmio_block->wd_stalls * TGPIO_WATCHDOG_PERIOD_S <=
+			    max_t(u64, 3 * TGPIO_WATCHDOG_PERIOD_S,
+				  3 * period_s) +
+				    TGPIO_WATCHDOG_PERIOD_S)
+			pr_warn("output stalled: block=%u compare stuck at %llu for %us\n",
+				i, compv,
+				mmio_block->wd_stalls *
+					TGPIO_WATCHDOG_PERIOD_S);
+	}
+
+	schedule_delayed_work(&dev->watchdog_work,
+			      TGPIO_WATCHDOG_PERIOD_S * HZ);
+}
+
+/*
+ * Precise cross-timestamp (PTP_SYS_OFFSET_PRECISE): one consistent
+ * (device time, system realtime, system monoraw) triple. The ART value is
+ * obtained by inverting the very realtime instant reported back, so the
+ * device/realtime pairing is exact by construction; tools like phc2sys and
+ * chrony use this automatically when present, removing read-jitter from
+ * clock comparisons.
+ */
+static int tgpio_ptp_getcrosststamp(struct ptp_clock_info *ptp,
+				    struct system_device_crosststamp *cts)
+{
+	struct tgpio_device *dev =
+		container_of(ptp, struct tgpio_device, ptp_info);
+	struct tgpio_s64_result dev_ns;
+	ktime_t real;
+	s64 raw_before;
+	s64 raw_after;
+	u64 art;
+
+	raw_before = ktime_get_raw_ns();
+	real = ktime_get_real();
+	raw_after = ktime_get_raw_ns();
+
+	if (clock_mode == TGPIO_CLOCK_REALTIME) {
+		cts->device = real;
+	} else {
+		if (!ktime_real_to_base_clock(real, CSID_X86_ART, &art))
+			return -EOPNOTSUPP;
+		dev_ns = tgpio_clock_phc_art_to_ns(dev, art);
+		if (dev_ns.status < 0)
+			return -EOPNOTSUPP;
+		cts->device = ns_to_ktime(dev_ns.val);
+	}
+	tgpio_xtstamp_realtime(*cts) = real;
+	cts->sys_monoraw =
+		ns_to_ktime(raw_before + (raw_after - raw_before) / 2);
+	return 0;
+}
+
 /*
  * Realtime clock mode steers CLOCK_REALTIME itself, so hardware-timestamped
  * references (a PPS captured by a TGPIO input and converted through the
@@ -4078,6 +4229,7 @@ static int tgpio_register_ptp_clock(struct tgpio_device *dev)
 	dev->ptp_info.settime64 = tgpio_ptp_settime64;
 	dev->ptp_info.enable = tgpio_ptp_enable;
 	dev->ptp_info.verify = tgpio_ptp_verify;
+	dev->ptp_info.getcrosststamp = tgpio_ptp_getcrosststamp;
 
 	dev->ptp_clock = ptp_clock_register(&dev->ptp_info, NULL);
 	if (IS_ERR(dev->ptp_clock)) {
@@ -4130,6 +4282,19 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 					   "on" :
 					   "off",
 				   mmio_block->last_event_count);
+			if (tgpio_clock_uses_model() &&
+			    mmio_block->input_have_prev)
+				seq_printf(m, " phase=%lldns",
+					   mmio_block->input_phase_ns);
+			if (mmio_block->interval_count)
+				seq_printf(m,
+					   " interval_last=%lldns min=%lldns max=%lldns mean=%lldns n=%llu",
+					   mmio_block->interval_last_ns,
+					   mmio_block->interval_min_ns,
+					   mmio_block->interval_max_ns,
+					   div64_s64(mmio_block->interval_sum_ns,
+						     (s64)mmio_block->interval_count),
+					   mmio_block->interval_count);
 		} else if (mmio_block->mode == TGPIO_MODE_OUTPUT) {
 			struct tgpio_output_desired desired =
 				tgpio_output_desired_get(mmio_block);
@@ -4387,6 +4552,9 @@ static int __init tgpio_input_init(void)
 	seqlock_init(&tgpio->phc_seqlock);
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
 	INIT_DELAYED_WORK(&tgpio->art_refine_work, tgpio_art_refine_work_fn);
+	INIT_DELAYED_WORK(&tgpio->watchdog_work, tgpio_watchdog_work_fn);
+	schedule_delayed_work(&tgpio->watchdog_work,
+			      TGPIO_WATCHDOG_PERIOD_S * HZ);
 
 	clock = tgpio_parse_clock_mode(clock_mode_param);
 	if (clock.status < 0) {
@@ -4503,6 +4671,7 @@ static void __exit tgpio_input_exit(void)
 		ptp_clock_unregister(tgpio->ptp_clock);
 
 	cancel_delayed_work_sync(&tgpio->art_refine_work);
+	cancel_delayed_work_sync(&tgpio->watchdog_work);
 	tgpio_disable_mmio_blocks(tgpio);
 
 	tgpio_unmap_mmio_blocks(tgpio);
