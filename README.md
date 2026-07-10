@@ -70,11 +70,27 @@ PHC mode the driver implements `gettime64`, `settime64`, `adjtime`, and
 events in the adjusted PHC time domain. This is the mode to use with tools that
 discipline a PHC from external timestamps, such as `ts2phc`.
 
-Use `CLOCK_MODE=realtime` to keep the PTP clock tied directly to Linux
-`CLOCK_REALTIME`. In realtime clock mode, `TIMESTAMP_MODE=realtime` reports
-hardware input captures in the same `CLOCK_REALTIME` timebase returned by the
-PTP clock. Use `TIMESTAMP_MODE=art` to report raw ART-cycle-derived nanoseconds
-instead.
+`CLOCK_MODE` selects one of three PTP clock timebases:
+
+- `phc` (default): an adjustable ART-backed PHC. `settime`, `adjtime`, and
+  `adjfine` work, so tools like `ts2phc` and `phc2sys` can discipline it.
+- `art`: the same ART-backed clock model, but anchored to
+  `CLOCK_MONOTONIC_RAW` and deliberately **not adjustable** — `settime`,
+  `adjtime`, and `adjfine` all return `EOPNOTSUPP` and `max_adj` is 0. The
+  cycles-per-second rate is calibrated against the raw clock over 250 ms at
+  load and refined once over a 10 s baseline shortly after (watch for the
+  `ART clock base rate refined` kernel log line). Use this when you want an
+  undisciplined hardware-paced timebase that nothing can steer.
+- `realtime`: the PTP clock returns Linux `CLOCK_REALTIME` directly, and
+  conversions go through the kernel timekeeper per call.
+
+In realtime clock mode, `TIMESTAMP_MODE=realtime` reports hardware input
+captures in the same `CLOCK_REALTIME` timebase returned by the PTP clock. Use
+`TIMESTAMP_MODE=art` to report raw ART-cycle-derived nanoseconds instead.
+
+```sh
+sudo make reload CLOCK_MODE=art TGPIO0=input TGPIO1=output OUTPUT1_PERIOD_NS=1000000000
+```
 
 Mixed-mode examples:
 
