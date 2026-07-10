@@ -536,6 +536,7 @@ tgpio_output_desired_get(struct tgpio_mmio_block *mmio_block);
 static void tgpio_output_wake_at(struct tgpio_mmio_block *mmio_block,
 				 ktime_t when);
 static void tgpio_disable_output(struct tgpio_mmio_block *mmio_block);
+static void tgpio_oneshot_stop_work_fn(struct work_struct *work);
 
 static inline struct tgpio_s64_result tgpio_ok_s64(s64 v)
 {
