@@ -262,6 +262,44 @@ In PHC mode:
 In the default PHC mode, hardware input events are emitted in adjusted PHC time
 so that PHC tools see a consistent clock domain.
 
+## TDC Mode (Time-to-Digital Converter)
+
+With both blocks as inputs, `TDC=1` pairs them into a duration counter:
+block 0 is Start, block 1 is Stop, and each completed pair yields the time
+between the two edges.
+
+```sh
+sudo make reload TDC=1 TGPIO0=input TGPIO1=input EDGE0=rising EDGE1=rising
+```
+
+Both timestamps come from the hardware capture registers in the same ART
+domain, so the measurement is immune to clock discipline, NTP slew, and
+software latency. Resolution is one ART cycle per edge (about 26 ns at
+38.4 MHz, roughly 11 ns RMS on the difference); range is the full 64-bit
+counter, so durations from tens of nanoseconds to years are equally valid.
+Both captures are armed automatically at load; edges are selected with
+`EDGE0`/`EDGE1` as usual, and the normal PTP external timestamp events keep
+flowing alongside.
+
+Semantics: a Start edge arms a measurement, the next Stop edge with a later
+hardware timestamp completes it, and a new Start before a Stop re-arms
+(latest Start wins). Because the poll loop latches one capture per block per
+interval (`POLL_MS`), repeated edges faster than the poll rate keep only the
+most recent; overwritten events are counted as `lost`. A Stop and its Start
+may land in the same poll window — sub-poll (even sub-microsecond) durations
+measure correctly since the pairing uses the hardware timestamps, not
+arrival times.
+
+Results appear in the status file and, with `ACTIVITY_LOG=1`, per
+measurement in the kernel journal:
+
+```text
+tdc: count=42 last=1000000013ns last_cycles=38400005 min=999999987ns max=1000000039ns mean=1000000012ns lost=0 armed=0
+activity=tdc_measure start_art=... stop_art=... cycles=... duration_ns=...
+```
+
+Clear the statistics with `echo 1 > /sys/kernel/debug/tgpio/tdc_reset`.
+
 ## Disciplining The PHC
 
 Two validated ways to steer the TGPIO PHC to an external reference, both

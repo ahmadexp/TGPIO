@@ -21,6 +21,7 @@ HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
 HARDWARE_PERIODIC_OUTPUT="${HARDWARE_PERIODIC_OUTPUT:-1}"
 ACTIVITY_LOG="${ACTIVITY_LOG:-0}"
 VERBOSE_ROUNDING="${VERBOSE_ROUNDING:-0}"
+TDC="${TDC:-0}"
 INPUT0_ENABLE="${INPUT0_ENABLE:-0}"
 INPUT1_ENABLE="${INPUT1_ENABLE:-0}"
 INPUT0_CHANNEL="${INPUT0_CHANNEL:-0}"
@@ -88,6 +89,7 @@ insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	hardware_periodic_output="${HARDWARE_PERIODIC_OUTPUT}" \
 	activity_log="${ACTIVITY_LOG}" \
 	verbose_rounding="${VERBOSE_ROUNDING}" \
+	tdc="${TDC}" \
 	input0_enable="${INPUT0_ENABLE}" input1_enable="${INPUT1_ENABLE}" \
 	input0_channel="${INPUT0_CHANNEL}" input1_channel="${INPUT1_CHANNEL}" \
 	output0_channel="${OUTPUT0_CHANNEL}" output1_channel="${OUTPUT1_CHANNEL}" \

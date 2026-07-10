@@ -20,6 +20,7 @@ HARDWARE_TIMESTAMPS ?= 1
 HARDWARE_PERIODIC_OUTPUT ?= 1
 ACTIVITY_LOG ?= 0
 VERBOSE_ROUNDING ?= 0
+TDC ?= 0
 INPUT0_ENABLE ?= 0
 INPUT1_ENABLE ?= 0
 INPUT0_CHANNEL ?= 0
@@ -43,6 +44,7 @@ LOAD_ENV += ART_FREQUENCY="$(ART_FREQUENCY)"
 LOAD_ENV += HARDWARE_TIMESTAMPS="$(HARDWARE_TIMESTAMPS)"
 LOAD_ENV += HARDWARE_PERIODIC_OUTPUT="$(HARDWARE_PERIODIC_OUTPUT)"
 LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)" VERBOSE_ROUNDING="$(VERBOSE_ROUNDING)"
+LOAD_ENV += TDC="$(TDC)"
 LOAD_ENV += INPUT0_ENABLE="$(INPUT0_ENABLE)" INPUT1_ENABLE="$(INPUT1_ENABLE)"
 LOAD_ENV += INPUT0_CHANNEL="$(INPUT0_CHANNEL)" INPUT1_CHANNEL="$(INPUT1_CHANNEL)"
 LOAD_ENV += OUTPUT0_CHANNEL="$(OUTPUT0_CHANNEL)" OUTPUT1_CHANNEL="$(OUTPUT1_CHANNEL)"
@@ -131,6 +133,14 @@ help:
 	@echo "  VERBOSE_ROUNDING=$(VERBOSE_ROUNDING)   1 = log the ART-cycle rounding of every"
 	@echo "                       output programming action"
 	@echo
+	@echo "TDC (time-to-digital converter):"
+	@echo "  TDC=$(TDC)                1 = pair block 0 (start) and block 1 (stop)"
+	@echo "                       input captures into hardware-timestamped"
+	@echo "                       durations (~26 ns resolution, 64-bit range)."
+	@echo "                       Requires TGPIO0=input TGPIO1=input; edges"
+	@echo "                       via EDGE0/EDGE1. Stats in the status file;"
+	@echo "                       clear with /sys/kernel/debug/tgpio/tdc_reset"
+	@echo
 	@echo "Runtime controls while loaded:"
 	@echo "  sudo cat /sys/kernel/debug/tgpio/status"
 	@echo "  echo 1 > /sys/kernel/debug/tgpio/outputN_invert   (flip polarity)"
@@ -149,6 +159,8 @@ help:
 	@echo "      refclock PHC /dev/ptpX:extpps:pin=0 poll 2 refid TPPS)"
 	@echo "  sudo make reload TGPIO0=output OUTPUT0_PERIOD_NS=1000000 OUTPUT0_DUTY_NS=250000"
 	@echo "      1 ms period, 250 us on-time (software path)"
+	@echo "  sudo make reload TDC=1 TGPIO0=input TGPIO1=input EDGE0=rising EDGE1=rising"
+	@echo "      Measure start-to-stop durations between the two pins"
 	@echo
 	@echo "Full documentation: README.md"
 
