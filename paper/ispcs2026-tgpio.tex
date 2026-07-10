@@ -86,7 +86,7 @@ Table~\ref{tab:params} summarizes the most relevant module parameters. The desig
 Parameter & Default & Purpose\\
 \midrule
 \texttt{addr0}, \texttt{addr1} & static & TGPIO MMIO bases\\
-\texttt{mode0}, \texttt{mode1} & input & per-block function\\
+\texttt{tsync0}, \texttt{tsync1} & input & per-block function\\
 \texttt{edge0}, \texttt{edge1} & rising & default input edge\\
 \texttt{clock\_mode} & phc & realtime or adjustable PHC\\
 \texttt{timestamp\_mode} & realtime & event timestamp domain\\
@@ -108,7 +108,7 @@ Channel mapping follows the PTP pin assignment model. A physical TGPIO block may
 
 The primary control surface is the standard PTP character device, not a private driver-specific ABI. This allows both existing command-line tools and custom measurement software to use the same kernel interface. During bring-up, \texttt{testptp} provided a useful reference for pin assignment, external timestamp enablement, and periodic-output requests. PyPTM provides the same operations as a Python API and command-line tool, making it easier to combine TGPIO configuration, event capture, and CPU-local timing measurements in one experiment script.
 
-One compatibility detail discovered during userspace testing is that some kernel and driver combinations accept the legacy \texttt{PTP\_EXTTS\_REQUEST} ioctl while returning \texttt{EOPNOTSUPP} for \texttt{PTP\_EXTTS\_REQUEST2}. PyPTM therefore attempts the newer ioctl first and falls back to the legacy request when appropriate. This preserves the standard PTP control model while avoiding a dependency on one particular userspace tool implementation.
+One compatibility detail first surfaced during userspace testing: the legacy \texttt{PTP\_EXTTS\_REQUEST} ioctl succeeded while \texttt{PTP\_EXTTS\_REQUEST2} returned \texttt{EOPNOTSUPP}, so PyPTM attempts the newer ioctl and falls back to the legacy request. The root cause was later identified in the driver: recent kernels validate the strict ioctl's flags against the \texttt{supported\_extts\_flags} field of \texttt{ptp\_clock\_info} before the driver sees the request, and a driver that leaves the field zero silently rejects every strict request. Advertising the supported edge and enable flags fixed \texttt{ts2phc} -- which uses only the strict ioctl -- and is worth checking in any PHC driver that predates the field.
 
 \begin{figure}[t]
 \centering
@@ -134,6 +134,8 @@ When the event count changes, the driver emits a PTP external timestamp event th
 For output mode, a PTP periodic-output request supplies a start time and period in the PTP clock's time domain. The driver rejects unsupported perout flags, validates the period, computes a half-period, and requires that Linux timekeeping expose an ART base clock. It then converts the requested start time into an ART compare value and the requested half-period into an ART interval value before programming the hardware.
 
 Steady-state output uses the TGPIO hardware periodic feature: the comparator register holds the first active edge, the periodic interval register holds the half-period in ART cycles, and the periodic-mode bit lets hardware generate subsequent toggle transitions without software reprogramming each edge. Register-level experiments established that single-shot output compares never fire on this hardware and that the output level flop is write-only toggle history: it holds the level of the last generated transition, survives disable, and cannot be preloaded or read back. The driver therefore mirrors the flop in software. It assumes the power-on low state at load, folds every generated toggle into the mirror using the live comparator readback (the comparator advances by exactly one interval per edge), drains the flop low before stops and unloads so the assumption survives module reloads, and selects the first compare slot from the mirror so the rising edges of the waveform always land on the requested period grid. A guard pushes a late first compare forward by whole periods, since enabling with a compare already in the past fires the first toggle immediately and would invert the waveform. If external interference ever falsifies the mirror, a debugfs control flips it and shifts a running waveform by half a period without a glitch. To avoid programming an edge too close to the current time, the driver enforces a lead time before arming the first active transition; the earlier high-resolution timer re-arm path remains available as a fallback for asymmetric duty cycles.
+
+Quantization is reported, not hidden. Converting a request onto integer ART cycles rounds both the half period and the first edge, and every arm therefore writes one unconditional \texttt{output quantization} line to the kernel log: the requested and actual period, the half-period in ART cycles, the period rounding residual, and the first-edge rounding measured by reading the programmed compare value back through the clock conversion. At the 38.4~MHz ART rate one cycle is about 26~ns, so both residuals are bounded by half a cycle; the logged values double as a self-check that the conversion path rounds to nearest. The debugfs status file exposes the same quantities continuously, together with the live phase error of the pending edge and the tracked output level.
 
 \section{Clock-Domain Handling}
 

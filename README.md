@@ -37,8 +37,8 @@ Defaults:
 addr0=0xFE001210
 addr1=0xFE001310
 mmio_size=0x38
-mode0=input
-mode1=input
+tsync0=input
+tsync1=input
 edge0=rising
 edge1=rising
 clock_mode=phc
@@ -85,16 +85,16 @@ instead.
 Mixed-mode examples:
 
 ```sh
-sudo make reload MODE0=output MODE1=input
-sudo make reload MODE0=input MODE1=output
-sudo make reload MODE0=output MODE1=off
-sudo make reload MODE0=output MODE1=input EDGE1=rising
-sudo make reload MODE0=input TIMESTAMP_MODE=art
-sudo make reload MODE0=output OUTPUT_POLARITY=inverted
-sudo make reload MODE0=output OUTPUT0_PERIOD_NS=1000000 OUTPUT0_DUTY_NS=250000
-sudo make reload MODE0=output HARDWARE_PERIODIC_OUTPUT=0
-sudo make reload MODE0=input MODE1=off
-sudo make reload CLOCK_MODE=realtime MODE0=input MODE1=off
+sudo make reload TSYNC0=output TSYNC1=input
+sudo make reload TSYNC0=input TSYNC1=output
+sudo make reload TSYNC0=output TSYNC1=off
+sudo make reload TSYNC0=output TSYNC1=input EDGE1=rising
+sudo make reload TSYNC0=input TIMESTAMP_MODE=art
+sudo make reload TSYNC0=output OUTPUT_POLARITY=inverted
+sudo make reload TSYNC0=output OUTPUT0_PERIOD_NS=1000000 OUTPUT0_DUTY_NS=250000
+sudo make reload TSYNC0=output HARDWARE_PERIODIC_OUTPUT=0
+sudo make reload TSYNC0=input TSYNC1=off
+sudo make reload CLOCK_MODE=realtime TSYNC0=input TSYNC1=off
 ```
 
 `reload` unloads the add-on and reloads it with the selected modes and input
@@ -156,9 +156,9 @@ By default, input timestamps are captured on rising edges. Choose a different
 edge mode at load time with `EDGE0` or `EDGE1`:
 
 ```sh
-sudo make reload MODE0=output MODE1=input EDGE1=rising
-sudo make reload MODE0=output MODE1=input EDGE1=falling
-sudo make reload MODE0=output MODE1=input EDGE1=both
+sudo make reload TSYNC0=output TSYNC1=input EDGE1=rising
+sudo make reload TSYNC0=output TSYNC1=input EDGE1=falling
+sudo make reload TSYNC0=output TSYNC1=input EDGE1=both
 ```
 
 If a userspace program sends explicit PTP rising/falling edge flags, those flags
@@ -175,7 +175,7 @@ capture/compare registers continue to use ART-domain hardware timestamps.
 Example load for a TGPIO external timestamp input:
 
 ```sh
-sudo make reload MODE0=input MODE1=off EDGE0=rising
+sudo make reload TSYNC0=input TSYNC1=off EDGE0=rising
 ```
 
 In PHC mode:
@@ -225,6 +225,50 @@ In PHC mode:
 In the default PHC mode, hardware input events are emitted in adjusted PHC time
 so that PHC tools see a consistent clock domain.
 
+## Disciplining The PHC
+
+Two validated ways to steer the TGPIO PHC to an external reference, both
+measured with a logic analyzer against the atomic-clock PPS of an OCP
+TimeCard.
+
+### Hardware-domain loop (recommended)
+
+Wire the reference PPS into a TGPIO input block and let `ts2phc` discipline
+the PHC from that block's own ART-domain external timestamps while the other
+block generates output:
+
+```sh
+sudo make reload TSYNC0=input EDGE0=rising TSYNC1=output OUTPUT1_PERIOD_NS=1000000000
+sudo ts2phc -m -s generic -c /dev/ptpX --ts2phc.pin_index 0
+```
+
+Capture and generation share the ART timebase, so no PCIe clock comparison
+is in the loop: the uncalibrated systematic offset is only about 50 ns (the
+capture-versus-generate pipeline difference, roughly two ART cycles) and no
+platform tuning is required. Measured output alignment: `-52 +/- 122 ns`
+against a reference distribution whose own wire-to-wire noise floor on the
+instrument was 60-80 ns. This is also the complete GPS PPS use case, with
+any 1 PPS reference standing in for the receiver.
+
+### PHC-to-PHC with phc2sys
+
+```sh
+sudo phc2sys -s /dev/ptp<master> -c /dev/ptpX -O 0 -R 8 -N 10 -m
+```
+
+This path reads both clocks across PCIe, which adds a constant read
+asymmetry (about 2.5 us on the validated platform; cancel it with
+`output_phase_offset_ns`) and requires pinning platform latency: hold
+`/dev/cpu_dma_latency` at 0 and select the performance cpufreq governor,
+otherwise the asymmetry wanders with power management and the calibration
+goes stale. Measured output alignment after calibration: `+9 +/- 64 ns`.
+
+In both cases: PTP device numbering can change across reboots, so resolve
+devices with `cat /sys/class/ptp/ptp*/clock_name` ("Intel TGPIO" is this
+driver). After a cold boot, check output polarity once and flip it with
+`echo 1 > /sys/kernel/debug/tgpio/outputN_invert` if the waveform came up
+half a period off.
+
 ## Output With testptp
 
 For block 0 output:
@@ -266,7 +310,7 @@ path and programs explicit rising and falling edges.
 Use `HARDWARE_PERIODIC_OUTPUT=0` to return to the older software re-arm path:
 
 ```sh
-sudo make reload MODE0=output HARDWARE_PERIODIC_OUTPUT=0
+sudo make reload TSYNC0=output HARDWARE_PERIODIC_OUTPUT=0
 ```
 
 If your board or measurement path inverts the output, reload with
@@ -280,7 +324,7 @@ by default because input events and software output edges can be frequent.
 Enable it at load time:
 
 ```sh
-sudo make reload MODE0=output MODE1=input ACTIVITY_LOG=1
+sudo make reload TSYNC0=output TSYNC1=input ACTIVITY_LOG=1
 ```
 
 Or toggle it on a loaded module:
@@ -316,6 +360,15 @@ The output status shows `art_snapshot`, `high_time`, `low_time`, and the PHC
 `base_art_hz`; for hardware periodic output it also includes
 `art_half_cycles`, `actual_period`, `period_error`, and — while the block is
 armed — `armed_piv` and the live `phase_error` against the requested grid.
+
+Independently of the opt-in activity log, every hardware periodic arm writes
+one `output quantization` line to the kernel log (visible in `dmesg` /
+`journalctl -k`) recording the rounding introduced by converting the request
+onto integer ART cycles: the requested and actual period, the half-period in
+ART cycles, `period_rounding_ns`, and `first_edge_rounding_ns` (the
+programmed compare value read back through the clock conversion). At the
+38.4 MHz ART rate one cycle is about 26 ns, so both figures stay within
+±13 ns of the request.
 When `art_snapshot` is `absent`, PHC mode derives the current ART value from
 the `CLOCK_REALTIME` inversion, which is exact for the current instant even
 while NTP disciplines the realtime clock.
@@ -325,7 +378,7 @@ while NTP disciplines the realtime clock.
 Install for the running kernel:
 
 ```sh
-sudo make install MODE0=output MODE1=input EDGE1=rising
+sudo make install TSYNC0=output TSYNC1=input EDGE1=rising
 ```
 
 `install` persists the module and its load-time options through
@@ -337,7 +390,7 @@ installing. For example, this brings block 0 back as a 1 Hz output and block 1
 back as an enabled rising-edge input whenever the module loads:
 
 ```sh
-sudo make persist MODE0=output MODE1=input EDGE1=rising \
+sudo make persist TSYNC0=output TSYNC1=input EDGE1=rising \
   OUTPUT0_PERIOD_NS=1000000000 INPUT1_ENABLE=1
 ```
 
@@ -375,7 +428,13 @@ ASUS ProArt Z890-CREATOR WIFI with the BIOS version 3202
 
 link: https://www.asus.com/us/motherboards-components/motherboards/proart/proart-z890-creator-wifi/
 
-Using "out of the box" Ubuntu 26.04 LTS (that comes with the default Linux kernel 7.0.0-22-generic)
+Using "out of the box" Ubuntu 26.04 LTS (validated on the default Linux
+kernels 7.0.0-22-generic and 7.0.0-27-generic).
+
+Measured on this setup against an atomic-clock PPS reference (OCP TimeCard,
+Saleae Logic Pro 16 at 50-100 MS/s): disciplined 1 PPS output within
++/-100 ns of the reference by either discipline path, with deterministic
+polarity across module reloads, PHC steps, and phc2sys restarts.
 
 ## Safety
 
