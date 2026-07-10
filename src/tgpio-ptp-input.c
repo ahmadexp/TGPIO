@@ -3603,6 +3603,15 @@ static int tgpio_register_ptp_clock(struct tgpio_device *dev)
 	dev->ptp_info.n_ext_ts = dev->n_ptp_pins;
 	dev->ptp_info.n_per_out = dev->n_ptp_pins;
 	dev->ptp_info.supported_perout_flags = tgpio_supported_perout_flags();
+	/*
+	 * The PTP core validates PTP_EXTTS_REQUEST2 flags against this set
+	 * before the driver sees the request; without it, tools that use the
+	 * strict ioctl (ts2phc) get EOPNOTSUPP while legacy requests work.
+	 */
+	dev->ptp_info.supported_extts_flags = PTP_RISING_EDGE |
+					      PTP_FALLING_EDGE |
+					      PTP_ENABLE_FEATURE |
+					      PTP_STRICT_FLAGS;
 	dev->ptp_info.pin_config = dev->pin_config;
 	dev->ptp_info.adjfine = tgpio_ptp_adjfine;
 	dev->ptp_info.adjtime = tgpio_ptp_adjtime;
