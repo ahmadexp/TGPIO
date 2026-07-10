@@ -37,8 +37,8 @@ Defaults:
 addr0=0xFE001210
 addr1=0xFE001310
 mmio_size=0x38
-tsync0=input
-tsync1=input
+tgpio0=input
+tgpio1=input
 edge0=rising
 edge1=rising
 clock_mode=phc
@@ -85,16 +85,16 @@ instead.
 Mixed-mode examples:
 
 ```sh
-sudo make reload TSYNC0=output TSYNC1=input
-sudo make reload TSYNC0=input TSYNC1=output
-sudo make reload TSYNC0=output TSYNC1=off
-sudo make reload TSYNC0=output TSYNC1=input EDGE1=rising
-sudo make reload TSYNC0=input TIMESTAMP_MODE=art
-sudo make reload TSYNC0=output OUTPUT_POLARITY=inverted
-sudo make reload TSYNC0=output OUTPUT0_PERIOD_NS=1000000 OUTPUT0_DUTY_NS=250000
-sudo make reload TSYNC0=output HARDWARE_PERIODIC_OUTPUT=0
-sudo make reload TSYNC0=input TSYNC1=off
-sudo make reload CLOCK_MODE=realtime TSYNC0=input TSYNC1=off
+sudo make reload TGPIO0=output TGPIO1=input
+sudo make reload TGPIO0=input TGPIO1=output
+sudo make reload TGPIO0=output TGPIO1=off
+sudo make reload TGPIO0=output TGPIO1=input EDGE1=rising
+sudo make reload TGPIO0=input TIMESTAMP_MODE=art
+sudo make reload TGPIO0=output OUTPUT_POLARITY=inverted
+sudo make reload TGPIO0=output OUTPUT0_PERIOD_NS=1000000 OUTPUT0_DUTY_NS=250000
+sudo make reload TGPIO0=output HARDWARE_PERIODIC_OUTPUT=0
+sudo make reload TGPIO0=input TGPIO1=off
+sudo make reload CLOCK_MODE=realtime TGPIO0=input TGPIO1=off
 ```
 
 `reload` unloads the add-on and reloads it with the selected modes and input
@@ -156,9 +156,9 @@ By default, input timestamps are captured on rising edges. Choose a different
 edge mode at load time with `EDGE0` or `EDGE1`:
 
 ```sh
-sudo make reload TSYNC0=output TSYNC1=input EDGE1=rising
-sudo make reload TSYNC0=output TSYNC1=input EDGE1=falling
-sudo make reload TSYNC0=output TSYNC1=input EDGE1=both
+sudo make reload TGPIO0=output TGPIO1=input EDGE1=rising
+sudo make reload TGPIO0=output TGPIO1=input EDGE1=falling
+sudo make reload TGPIO0=output TGPIO1=input EDGE1=both
 ```
 
 If a userspace program sends explicit PTP rising/falling edge flags, those flags
@@ -175,7 +175,7 @@ capture/compare registers continue to use ART-domain hardware timestamps.
 Example load for a TGPIO external timestamp input:
 
 ```sh
-sudo make reload TSYNC0=input TSYNC1=off EDGE0=rising
+sudo make reload TGPIO0=input TGPIO1=off EDGE0=rising
 ```
 
 In PHC mode:
@@ -238,7 +238,7 @@ the PHC from that block's own ART-domain external timestamps while the other
 block generates output:
 
 ```sh
-sudo make reload TSYNC0=input EDGE0=rising TSYNC1=output OUTPUT1_PERIOD_NS=1000000000
+sudo make reload TGPIO0=input EDGE0=rising TGPIO1=output OUTPUT1_PERIOD_NS=1000000000
 sudo ts2phc -m -s generic -c /dev/ptpX --ts2phc.pin_index 0
 ```
 
@@ -310,7 +310,7 @@ path and programs explicit rising and falling edges.
 Use `HARDWARE_PERIODIC_OUTPUT=0` to return to the older software re-arm path:
 
 ```sh
-sudo make reload TSYNC0=output HARDWARE_PERIODIC_OUTPUT=0
+sudo make reload TGPIO0=output HARDWARE_PERIODIC_OUTPUT=0
 ```
 
 If your board or measurement path inverts the output, reload with
@@ -324,7 +324,7 @@ by default because input events and software output edges can be frequent.
 Enable it at load time:
 
 ```sh
-sudo make reload TSYNC0=output TSYNC1=input ACTIVITY_LOG=1
+sudo make reload TGPIO0=output TGPIO1=input ACTIVITY_LOG=1
 ```
 
 Or toggle it on a loaded module:
@@ -378,7 +378,7 @@ while NTP disciplines the realtime clock.
 Install for the running kernel:
 
 ```sh
-sudo make install TSYNC0=output TSYNC1=input EDGE1=rising
+sudo make install TGPIO0=output TGPIO1=input EDGE1=rising
 ```
 
 `install` persists the module and its load-time options through
@@ -390,7 +390,7 @@ installing. For example, this brings block 0 back as a 1 Hz output and block 1
 back as an enabled rising-edge input whenever the module loads:
 
 ```sh
-sudo make persist TSYNC0=output TSYNC1=input EDGE1=rising \
+sudo make persist TGPIO0=output TGPIO1=input EDGE1=rising \
   OUTPUT0_PERIOD_NS=1000000000 INPUT1_ENABLE=1
 ```
 
