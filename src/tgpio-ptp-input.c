@@ -223,6 +223,7 @@ static bool hardware_timestamps = true;
 static bool hardware_periodic_output = true;
 static bool activity_log;
 static bool verbose_rounding;
+static bool tdc;
 static bool input0_enable;
 static bool input1_enable;
 static unsigned int input0_channel;
@@ -306,6 +307,10 @@ MODULE_PARM_DESC(activity_log,
 module_param(verbose_rounding, bool, 0644);
 MODULE_PARM_DESC(verbose_rounding,
 		 "Log the ART-cycle rounding of every output programming action: each interval refresh, phase nudge, and software-programmed edge");
+
+module_param(tdc, bool, 0644);
+MODULE_PARM_DESC(tdc,
+		 "Time-to-digital converter mode: pair block 0 (start) and block 1 (stop) input captures into hardware-timestamped duration measurements");
 
 module_param(input0_enable, bool, 0444);
 MODULE_PARM_DESC(input0_enable,
@@ -479,6 +484,15 @@ struct tgpio_device {
 	struct tgpio_stats stats;
 	struct delayed_work poll_work;
 	struct delayed_work art_refine_work;
+	bool tdc_armed;	   /* poll_work-private TDC pairing state */
+	u64 tdc_start_art;
+	u64 tdc_count;
+	u64 tdc_lost;
+	u64 tdc_last_cycles;
+	s64 tdc_last_ns;
+	s64 tdc_min_ns;
+	s64 tdc_max_ns;
+	s64 tdc_sum_ns;
 	unsigned int n_ptp_pins;
 	struct tgpio_mmio_block mmio_blocks[TGPIO_MAX_BLOCKS];
 };
@@ -1982,6 +1996,59 @@ static void tgpio_apply_input(struct tgpio_mmio_block *mmio_block, int desired)
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
 }
 
+/*
+ * poll_work-only: TDC pairing. A start capture on block 0 arms a
+ * measurement; the next stop capture on block 1 with a later ART value
+ * completes it. Both timestamps come from the hardware capture registers in
+ * the same ART domain, so the duration is immune to clock discipline and
+ * software latency; the resolution is one ART cycle per edge (about 26 ns
+ * at 38.4 MHz). Multiple edges inside one poll window latch only the last
+ * capture: extra starts mean the latest start wins, extra stops are lost
+ * (counted in tdc_lost).
+ */
+static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
+			      u64 art_cycles, u64 event_delta)
+{
+	struct tgpio_ns_result duration;
+	u64 cycles;
+
+	if (!READ_ONCE(tdc))
+		return;
+
+	if (event_delta > 1)
+		dev->tdc_lost += event_delta - 1;
+
+	if (block == 0) {
+		dev->tdc_start_art = art_cycles;
+		dev->tdc_armed = true;
+		return;
+	}
+	if (block != 1 || !dev->tdc_armed)
+		return;
+	if (art_cycles < dev->tdc_start_art)
+		return; /* stop predates the armed start; keep waiting */
+
+	cycles = art_cycles - dev->tdc_start_art;
+	dev->tdc_armed = false;
+	duration = tgpio_clock_art_cycles_to_delta_ns(dev, cycles);
+	if (duration.status < 0 || duration.ns > S64_MAX)
+		return;
+
+	dev->tdc_count++;
+	dev->tdc_last_cycles = cycles;
+	dev->tdc_last_ns = duration.ns;
+	if (dev->tdc_count == 1 || (s64)duration.ns < dev->tdc_min_ns)
+		dev->tdc_min_ns = duration.ns;
+	if (dev->tdc_count == 1 || (s64)duration.ns > dev->tdc_max_ns)
+		dev->tdc_max_ns = duration.ns;
+	dev->tdc_sum_ns += duration.ns;
+
+	if (READ_ONCE(activity_log))
+		pr_info("activity=tdc_measure start_art=%llu stop_art=%llu cycles=%llu duration_ns=%lld\n",
+			dev->tdc_start_art, art_cycles, cycles,
+			(s64)duration.ns);
+}
+
 static void tgpio_poll_work(struct work_struct *work)
 {
 	struct tgpio_device *dev = container_of(to_delayed_work(work),
@@ -2022,6 +2089,8 @@ static void tgpio_poll_work(struct work_struct *work)
 			tgpio_emit_event(dev, mmio_block, channel,
 					 cap.art_cycles, cap.event_count,
 					 event_delta);
+			tgpio_tdc_capture(dev, i, cap.art_cycles,
+					  event_delta);
 		}
 
 		mmio_block->crosststamp_snapshot = snap.snapshot;
@@ -3242,6 +3311,24 @@ static int tgpio_start_persistent_operations(struct tgpio_device *dev)
 	unsigned int i;
 	int ret;
 
+	if (READ_ONCE(tdc)) {
+		if (dev->mmio_blocks[0].mode != TGPIO_MODE_INPUT ||
+		    dev->mmio_blocks[1].mode != TGPIO_MODE_INPUT) {
+			pr_err("tdc=1 requires tgpio0=input (start) and tgpio1=input (stop)\n");
+			return -EINVAL;
+		}
+		/* Arm both captures so measurements start immediately. */
+		for (i = 0; i < 2; i++) {
+			ret = tgpio_config_input(
+				dev, tgpio_persistent_input_channel(i), 0, 1);
+			if (ret)
+				return ret;
+		}
+		pr_info("TDC mode: block 0 %s edge starts, block 1 %s edge stops\n",
+			tgpio_edge_bits_name(dev->mmio_blocks[0].input_edge_bits),
+			tgpio_edge_bits_name(dev->mmio_blocks[1].input_edge_bits));
+	}
+
 	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
 		if (!tgpio_persistent_input_enabled(i))
 			continue;
@@ -4084,6 +4171,21 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 		seq_putc(m, '\n');
 	}
 
+	if (READ_ONCE(tdc)) {
+		if (dev->tdc_count)
+			seq_printf(m,
+				   "tdc: count=%llu last=%lldns last_cycles=%llu min=%lldns max=%lldns mean=%lldns lost=%llu armed=%d\n",
+				   dev->tdc_count, dev->tdc_last_ns,
+				   dev->tdc_last_cycles, dev->tdc_min_ns,
+				   dev->tdc_max_ns,
+				   div64_s64(dev->tdc_sum_ns,
+					     (s64)dev->tdc_count),
+				   dev->tdc_lost, dev->tdc_armed);
+		else
+			seq_printf(m, "tdc: count=0 lost=%llu armed=%d\n",
+				   dev->tdc_lost, dev->tdc_armed);
+	}
+
 	seq_printf(m, "counters: events=%lld fallbacks=%lld\n",
 		   atomic64_read(&dev->stats.events),
 		   atomic64_read(&dev->stats.fallbacks));
@@ -4128,6 +4230,37 @@ static const struct file_operations tgpio_output_invert_fops = {
 	.write = tgpio_output_invert_write,
 };
 
+/* Write 1 to clear the TDC statistics. */
+static ssize_t tgpio_tdc_reset_write(struct file *file,
+				     const char __user *ubuf, size_t count,
+				     loff_t *ppos)
+{
+	struct tgpio_device *dev = file->private_data;
+	bool value;
+	int ret;
+
+	ret = kstrtobool_from_user(ubuf, count, &value);
+	if (ret)
+		return ret;
+	if (!value)
+		return count;
+
+	dev->tdc_count = 0;
+	dev->tdc_lost = 0;
+	dev->tdc_last_cycles = 0;
+	dev->tdc_last_ns = 0;
+	dev->tdc_min_ns = 0;
+	dev->tdc_max_ns = 0;
+	dev->tdc_sum_ns = 0;
+	return count;
+}
+
+static const struct file_operations tgpio_tdc_reset_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = tgpio_tdc_reset_write,
+};
+
 static void tgpio_debugfs_init(struct tgpio_device *dev)
 {
 	unsigned int i;
@@ -4135,6 +4268,8 @@ static void tgpio_debugfs_init(struct tgpio_device *dev)
 	tgpio_debugfs_dir = debugfs_create_dir("tgpio", NULL);
 	debugfs_create_file("status", 0444, tgpio_debugfs_dir, dev,
 			    &tgpio_status_fops);
+	debugfs_create_file("tdc_reset", 0200, tgpio_debugfs_dir, dev,
+			    &tgpio_tdc_reset_fops);
 
 	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
 		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
