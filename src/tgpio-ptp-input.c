@@ -230,6 +230,7 @@ static unsigned long output1_period_ns;
 static unsigned long output0_duty_ns;
 static unsigned long output1_duty_ns;
 static unsigned long output_start_delay_ns;
+static long output_phase_offset_ns;
 
 module_param(addr0, ulong, 0444);
 MODULE_PARM_DESC(addr0, "MMIO base for first TGPIO block");
@@ -341,6 +342,10 @@ MODULE_PARM_DESC(output1_duty_ns,
 module_param(output_start_delay_ns, ulong, 0444);
 MODULE_PARM_DESC(output_start_delay_ns,
 		 "Optional delay from current PTP time to first persisted output edge");
+
+module_param(output_phase_offset_ns, long, 0644);
+MODULE_PARM_DESC(output_phase_offset_ns,
+		 "Calibration offset applied to programmed output edges in ns; positive moves the physical edge later. Writable at runtime; a running output converges within one or two frequency updates");
 
 /* PHC time = anchor_ns + (ART cycles since anchor_art) scaled by scaled_ppm. */
 struct tgpio_phc_params {
@@ -1926,11 +1931,25 @@ static int tgpio_config_input(struct tgpio_device *dev, unsigned int channel,
 	return 0;
 }
 
+/*
+ * Convert a logical output edge time into the hardware compare value. The
+ * calibration offset shifts every programmed edge so a one-shot external
+ * measurement (scope, analyzer, reference timestamper) can cancel constant
+ * pipeline and clock-comparison delays; the phase readback in
+ * tgpio_hw_periodic_phase_get applies the inverse, so the nudge machinery
+ * converges a running output onto the shifted position automatically.
+ */
 static struct tgpio_u64_result
 tgpio_clock_ns_to_compare_art(struct tgpio_device *dev, s64 edge_time_ns)
 {
-	struct tgpio_u64_result art = tgpio_clock_ns_to_art(dev, edge_time_ns);
+	struct tgpio_s64_result shifted =
+		tgpio_add_s64(edge_time_ns, READ_ONCE(output_phase_offset_ns));
+	struct tgpio_u64_result art;
 
+	if (shifted.status < 0)
+		return tgpio_err_u64(shifted.status);
+
+	art = tgpio_clock_ns_to_art(dev, shifted.val);
 	if (art.status < 0)
 		return art;
 
@@ -2212,8 +2231,13 @@ tgpio_hw_periodic_phase_get(struct tgpio_device *dev,
 	pending = tgpio_clock_phc_art_to_ns(dev,
 					    compv + TGPIO_ART_HW_DELAY_CYCLES);
 	now = tgpio_clock_now_ns(dev);
-	if (pending.status < 0 || now.status < 0 || now.val < 0 ||
-	    pending.val < grid_start_ns)
+	if (pending.status < 0 || now.status < 0 || now.val < 0)
+		return (struct tgpio_hw_phase){ .status = TGPIO_E_RANGE };
+
+	/* Back into the logical edge-time domain the grid lives in. */
+	pending = tgpio_add_s64(pending.val,
+				-READ_ONCE(output_phase_offset_ns));
+	if (pending.status < 0 || pending.val < grid_start_ns)
 		return (struct tgpio_hw_phase){ .status = TGPIO_E_RANGE };
 
 	/* A pending edge more than two periods out is not a live edge time. */
