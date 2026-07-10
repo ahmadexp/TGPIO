@@ -3252,8 +3252,15 @@ static void tgpio_disable_outputs(struct tgpio_device *dev)
 		cancel_work_sync(&mmio_block->output_work);
 		hrtimer_cancel(&mmio_block->output_timer);
 		cancel_work_sync(&mmio_block->output_work);
-		if (mmio_block->regs)
+		if (mmio_block->regs) {
+			/*
+			 * The work is quiesced, so its private output state
+			 * is safe to touch. Leave the level flop low so the
+			 * next driver load can trust its power-on assumption.
+			 */
+			tgpio_hw_periodic_drain_low(mmio_block);
 			tgpio_disable_output_hw(mmio_block);
+		}
 	}
 }
 
