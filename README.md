@@ -82,7 +82,28 @@ discipline a PHC from external timestamps, such as `ts2phc`.
   `ART clock base rate refined` kernel log line). Use this when you want an
   undisciplined hardware-paced timebase that nothing can steer.
 - `realtime`: the PTP clock returns Linux `CLOCK_REALTIME` directly, and
-  conversions go through the kernel timekeeper per call.
+  conversions go through the kernel timekeeper per call. This mode is
+  **adjustable, and the adjustments steer the system clock itself**:
+  `settime64` sets `CLOCK_REALTIME`, `adjtime` applies an offset
+  (`ADJ_SETOFFSET`), and `adjfine` slews the kernel NTP frequency
+  (`ADJ_FREQUENCY`, `max_adj` = 500 ppm). Frequency and atomic-offset
+  control need `do_adjtimex`, which is not exported to modules; the driver
+  resolves it via a kprobe and logs a warning (falling back to settime-only
+  plus stepped adjtime) if that fails. Combined with a reference PPS wired
+  into a TGPIO input, this lets the OS clock be disciplined directly from
+  hardware timestamps. Note that linuxptp's `ts2phc -s generic` references
+  CLOCK_TAI and will try to drag a UTC system clock 37 s away — for system
+  clock discipline use chrony's PHC refclock instead:
+
+  ```
+  refclock PHC /dev/ptpX:extpps:pin=0 poll 2 refid TPPS prefer
+  ```
+
+  Validated live: chrony locked to the TGPIO-captured atomic PPS with a
+  -218 ns system-clock offset and 11 ns per-sample standard deviation.
+  (A free-running lab PPS whose pulse is not on the UTC second will
+  eventually conflict with NTP sources; with a GNSS-aligned PPS this
+  configuration holds.)
 
 In realtime clock mode, `TIMESTAMP_MODE=realtime` reports hardware input
 captures in the same `CLOCK_REALTIME` timebase returned by the PTP clock. Use
