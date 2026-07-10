@@ -37,6 +37,12 @@ Full documentation lives in this README and the
 [project wiki](https://github.com/ahmadexp/TGPIO/wiki); run `make help` for
 every load-time option with examples.
 
+## Pre Req
+
+```
+sudo apt install make gcc
+```
+
 ## Build And Load
 
 ```sh
