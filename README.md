@@ -354,6 +354,15 @@ The output status shows `art_snapshot`, `high_time`, `low_time`, and the PHC
 `base_art_hz`; for hardware periodic output it also includes
 `art_half_cycles`, `actual_period`, `period_error`, and — while the block is
 armed — `armed_piv` and the live `phase_error` against the requested grid.
+
+Independently of the opt-in activity log, every hardware periodic arm writes
+one `output quantization` line to the kernel log (visible in `dmesg` /
+`journalctl -k`) recording the rounding introduced by converting the request
+onto integer ART cycles: the requested and actual period, the half-period in
+ART cycles, `period_rounding_ns`, and `first_edge_rounding_ns` (the
+programmed compare value read back through the clock conversion). At the
+38.4 MHz ART rate one cycle is about 26 ns, so both figures stay within
+±13 ns of the request.
 When `art_snapshot` is `absent`, PHC mode derives the current ART value from
 the `CLOCK_REALTIME` inversion, which is exact for the current instant even
 while NTP disciplines the realtime clock.

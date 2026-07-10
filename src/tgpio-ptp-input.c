@@ -2107,6 +2107,10 @@ static void tgpio_log_output_phase_rearm(struct tgpio_device *dev,
 static void tgpio_log_output_late_push(struct tgpio_device *dev,
 				       struct tgpio_mmio_block *mmio_block,
 				       u64 periods);
+static void tgpio_log_output_quantization(struct tgpio_device *dev,
+					  struct tgpio_mmio_block *mmio_block,
+					  s64 first_edge_ns,
+					  u64 half_period_ns);
 
 /* output_work-only: switch the block to autonomous hardware periodic output. */
 static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
@@ -2194,6 +2198,8 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 				     half_period_ns, first_art.val,
 				     half_period_art.val);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
+	tgpio_log_output_quantization(dev, mmio_block, first_edge_ns,
+				      half_period_ns);
 	return 0;
 }
 
@@ -2255,6 +2261,50 @@ tgpio_hw_periodic_phase_get(struct tgpio_device *dev,
 		.nudge_safe = pending.val >=
 			      now.val + (s64)TGPIO_OUTPUT_SAFE_TIME_NS,
 	};
+}
+
+/*
+ * Unconditional (not gated on the activity log): every arm quantizes the
+ * requested period and first edge onto integer ART cycles, and the resulting
+ * rounding deserves a permanent record in the system log. The period
+ * rounding is the residual of the half period against the ART cycle length;
+ * the first-edge rounding is measured from the programmed compare value read
+ * back through the clock conversion. Arms are rare, so this cannot spam.
+ */
+static void tgpio_log_output_quantization(struct tgpio_device *dev,
+					  struct tgpio_mmio_block *mmio_block,
+					  s64 first_edge_ns, u64 half_period_ns)
+{
+	struct tgpio_output_quantization quant;
+	struct tgpio_hw_phase phase;
+	unsigned int channel;
+
+	if (!half_period_ns || half_period_ns > (u64)S64_MAX / 2)
+		return;
+
+	quant = tgpio_output_quantization_get(dev, 2 * half_period_ns,
+					      half_period_ns);
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+
+	if (quant.status < 0) {
+		pr_info("output quantization block=%u channel=%u status=%d\n",
+			mmio_block->index, channel, quant.status);
+		return;
+	}
+
+	phase = tgpio_hw_periodic_phase_get(dev, mmio_block, first_edge_ns,
+					    half_period_ns);
+	if (phase.status < 0)
+		pr_info("output quantization block=%u channel=%u requested_period_ns=%llu art_half_cycles=%llu actual_period_ns=%llu period_rounding_ns=%lld\n",
+			mmio_block->index, channel, 2 * half_period_ns,
+			quant.art_half_period_cycles, quant.actual_period_ns,
+			quant.period_error_ns);
+	else
+		pr_info("output quantization block=%u channel=%u requested_period_ns=%llu art_half_cycles=%llu actual_period_ns=%llu period_rounding_ns=%lld first_edge_rounding_ns=%lld\n",
+			mmio_block->index, channel, 2 * half_period_ns,
+			quant.art_half_period_cycles, quant.actual_period_ns,
+			quant.period_error_ns, phase.error_ns);
 }
 
 /* output_work-only: prime the block and set the initial software-periodic phase. */
