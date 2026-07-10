@@ -219,6 +219,50 @@ In PHC mode:
 In the default PHC mode, hardware input events are emitted in adjusted PHC time
 so that PHC tools see a consistent clock domain.
 
+## Disciplining The PHC
+
+Two validated ways to steer the TGPIO PHC to an external reference, both
+measured with a logic analyzer against the atomic-clock PPS of an OCP
+TimeCard.
+
+### Hardware-domain loop (recommended)
+
+Wire the reference PPS into a TGPIO input block and let `ts2phc` discipline
+the PHC from that block's own ART-domain external timestamps while the other
+block generates output:
+
+```sh
+sudo make reload MODE0=input EDGE0=rising MODE1=output OUTPUT1_PERIOD_NS=1000000000
+sudo ts2phc -m -s generic -c /dev/ptpX --ts2phc.pin_index 0
+```
+
+Capture and generation share the ART timebase, so no PCIe clock comparison
+is in the loop: the uncalibrated systematic offset is only about 50 ns (the
+capture-versus-generate pipeline difference, roughly two ART cycles) and no
+platform tuning is required. Measured output alignment: `-52 +/- 122 ns`
+against a reference distribution whose own wire-to-wire noise floor on the
+instrument was 60-80 ns. This is also the complete GPS PPS use case, with
+any 1 PPS reference standing in for the receiver.
+
+### PHC-to-PHC with phc2sys
+
+```sh
+sudo phc2sys -s /dev/ptp<master> -c /dev/ptpX -O 0 -R 8 -N 10 -m
+```
+
+This path reads both clocks across PCIe, which adds a constant read
+asymmetry (about 2.5 us on the validated platform; cancel it with
+`output_phase_offset_ns`) and requires pinning platform latency: hold
+`/dev/cpu_dma_latency` at 0 and select the performance cpufreq governor,
+otherwise the asymmetry wanders with power management and the calibration
+goes stale. Measured output alignment after calibration: `+9 +/- 64 ns`.
+
+In both cases: PTP device numbering can change across reboots, so resolve
+devices with `cat /sys/class/ptp/ptp*/clock_name` ("Intel TGPIO" is this
+driver). After a cold boot, check output polarity once and flip it with
+`echo 1 > /sys/kernel/debug/tgpio/outputN_invert` if the waveform came up
+half a period off.
+
 ## Output With testptp
 
 For block 0 output:
@@ -369,7 +413,13 @@ ASUS ProArt Z890-CREATOR WIFI with the BIOS version 3202
 
 link: https://www.asus.com/us/motherboards-components/motherboards/proart/proart-z890-creator-wifi/
 
-Using "out of the box" Ubuntu 26.04 LTS (that comes with the default Linux kernel 7.0.0-22-generic)
+Using "out of the box" Ubuntu 26.04 LTS (validated on the default Linux
+kernels 7.0.0-22-generic and 7.0.0-27-generic).
+
+Measured on this setup against an atomic-clock PPS reference (OCP TimeCard,
+Saleae Logic Pro 16 at 50-100 MS/s): disciplined 1 PPS output within
++/-100 ns of the reference by either discipline path, with deterministic
+polarity across module reloads, PHC steps, and phc2sys restarts.
 
 ## Safety
 
