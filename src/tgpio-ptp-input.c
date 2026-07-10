@@ -2063,8 +2063,12 @@ static void tgpio_disable_output_hw(struct tgpio_mmio_block *mmio_block)
 {
 	u32 ctrl = tgpio_read_ctl(mmio_block);
 
-	tgpio_hw_flop_fold(mmio_block);
+	/* Stop event generation first, then fold the final COMPV state into
+	 * the tracked level flop; an edge firing between the fold and the
+	 * disable would otherwise be lost from the parity.
+	 */
 	tgpio_write_ctl(mmio_block, tgpio_ctl_without(ctrl, TGPIOCTL_EN));
+	tgpio_hw_flop_fold(mmio_block);
 	tgpio_write_compv(mmio_block, 0);
 	tgpio_write_piv(mmio_block, 0);
 	tgpio_write_ctl(mmio_block,
@@ -2238,7 +2242,12 @@ static int tgpio_arm_output(struct tgpio_device *dev,
 {
 	u32 ctrl = tgpio_ctl_without(tgpio_read_ctl(mmio_block), TGPIOCTL_EN);
 
+	/* Stop events, then fold pending toggles into the tracked level flop
+	 * before the registers are cleared; a re-arm that pre-empts a running
+	 * waveform (a PHC step, for example) must not lose the parity.
+	 */
 	tgpio_write_ctl(mmio_block, ctrl);
+	tgpio_hw_flop_fold(mmio_block);
 	tgpio_write_compv(mmio_block, 0);
 	tgpio_write_piv(mmio_block, 0);
 
@@ -2248,10 +2257,10 @@ static int tgpio_arm_output(struct tgpio_device *dev,
 
 	/*
 	 * Hardware mode needs no prime edge: single-shot compares never fire
-	 * on this hardware, and programming the falling prime loads the level
-	 * flop high, parking the line high until the periodic arm. Leave the
-	 * block disabled (line low) until tgpio_arm_hardware_periodic sets
-	 * the flop and enables toggle mode.
+	 * on this hardware, and the level flop cannot be preloaded anyway.
+	 * Leave the block disabled (line low) until
+	 * tgpio_arm_hardware_periodic picks the compare slot from the
+	 * tracked flop and enables toggle mode.
 	 */
 	if (mode != TGPIO_OUTPUT_HARDWARE &&
 	    tgpio_program_output_edge(
