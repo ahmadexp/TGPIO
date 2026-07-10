@@ -8,8 +8,8 @@ ADDR0="${ADDR0:-0xFE001210}"
 ADDR1="${ADDR1:-0xFE001310}"
 MMIO_SIZE="${MMIO_SIZE:-0x38}"
 USE_SECOND="${USE_SECOND:-1}"
-TSYNC0="${TSYNC0:-input}"
-TSYNC1="${TSYNC1:-input}"
+TGPIO0="${TGPIO0:-input}"
+TGPIO1="${TGPIO1:-input}"
 EDGE0="${EDGE0:-rising}"
 EDGE1="${EDGE1:-rising}"
 CLOCK_MODE="${CLOCK_MODE:-phc}"
@@ -79,7 +79,7 @@ if tgpio_output_devices_exist; then
 fi
 
 insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
-	use_second="${USE_SECOND}" tsync0="${TSYNC0}" tsync1="${TSYNC1}" \
+	use_second="${USE_SECOND}" tgpio0="${TGPIO0}" tgpio1="${TGPIO1}" \
 	edge0="${EDGE0}" edge1="${EDGE1}" clock_mode="${CLOCK_MODE}" \
 	timestamp_mode="${TIMESTAMP_MODE}" \
 	output_polarity="${OUTPUT_POLARITY}" poll_ms="${POLL_MS}" \
