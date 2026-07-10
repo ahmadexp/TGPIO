@@ -192,6 +192,15 @@ In PHC mode:
   restart happens in steady state; a full grid-aligned re-arm
   (`activity=output_phase_rearm`) is only the backstop for errors beyond a
   quarter period.
+- `output_phase_offset_ns` (runtime writable under
+  `/sys/module/tgpio_ptp_input/parameters/`) shifts every programmed output
+  edge by a constant, so a one-shot external measurement can cancel
+  systematic delays such as the asymmetric PCIe read latency in
+  `phc2sys` PHC-to-PHC comparison. A running output converges onto the new
+  position within a couple of frequency updates via the nudge machinery.
+  With this calibrated (about -2.5 us on the validated platform) and
+  `phc2sys -R 8 -N 5`, the 1 PPS output measures within +/-100 ns of the
+  atomic-clock reference.
 - Output polarity is deterministic through software level tracking. The
   hardware output level flop is write-only state: it holds the level of the
   last generated toggle, survives disable, and cannot be loaded or read (EP
