@@ -119,7 +119,7 @@ tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
 
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (20 * NSEC_PER_MSEC)
-#define TGPIO_OUTPUT_PHASE_NUDGE_NS 100
+#define TGPIO_OUTPUT_PHASE_NUDGE_NS 200
 #define TGPIO_CPUID_ART_LEAF	  0x15
 #define TGPIO_PHC_MAX_ADJ_PPB	  100000000L
 #define TGPIO_MIN_POLL_MS	  1u
