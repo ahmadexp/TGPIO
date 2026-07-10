@@ -706,7 +706,8 @@ are treated as ART-domain cycles.
 Non-commercial use only. The Software is free to use, modify, and
 redistribute for personal, academic, research, teaching, evaluation, and
 hobby purposes. **Any commercial use requires the prior written permission
-of Ahmad Byagowi** (byagowi@turbalance.com). See [LICENSE](LICENSE) for the
+of Ahmad Byagowi** (ahmadexp@gmail.com), who reserves exclusively for
+himself the right to commercialize it. See [LICENSE](LICENSE) for the
 full terms. The kernel module declares `MODULE_LICENSE("Dual BSD/GPL")`
 solely to satisfy the kernel's licensed-symbol requirements when built and
 loaded by end users; versions published before this license change remain
