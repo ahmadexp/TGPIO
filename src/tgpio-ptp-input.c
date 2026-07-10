@@ -24,6 +24,7 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/kobject.h>
+#include <linux/kprobes.h>
 #include <linux/kstrtox.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
@@ -35,6 +36,7 @@
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/timekeeping.h>
+#include <linux/timex.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
@@ -3271,9 +3273,6 @@ static void tgpio_resync_outputs_after_phc_step(struct tgpio_device *dev)
 {
 	unsigned int i;
 
-	if (clock_mode != TGPIO_CLOCK_PHC)
-		return;
-
 	/* Bump the generation of each running output so output_work re-arms
 	 * against the new PHC mapping; the scheduled work runs promptly.
 	 */
@@ -3299,9 +3298,6 @@ static void tgpio_resync_outputs_after_phc_step(struct tgpio_device *dev)
 static void tgpio_update_outputs_after_phc_freq(struct tgpio_device *dev)
 {
 	unsigned int i;
-
-	if (!tgpio_clock_uses_model())
-		return;
 
 	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
 		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
@@ -3345,6 +3341,80 @@ static int tgpio_ptp_enable(struct ptp_clock_info *ptp,
 	return ret;
 }
 
+/*
+ * Realtime clock mode steers CLOCK_REALTIME itself, so hardware-timestamped
+ * references (a PPS captured by a TGPIO input and converted through the
+ * kernel's ART cross-timestamp relation) can discipline the system clock
+ * directly with ts2phc. do_settimeofday64 is exported to modules, but
+ * do_adjtimex is not; resolve it through a kprobe registration, the standard
+ * out-of-tree technique. Without it, frequency adjustment is unavailable and
+ * adjtime falls back to a read-modify-set step.
+ */
+static int (*tgpio_do_adjtimex)(struct __kernel_timex *txc);
+
+/* NTP frequency limit: 500 ppm, as ppb for max_adj and scaled for timex. */
+#define TGPIO_REALTIME_MAX_ADJ_PPB 500000
+#define TGPIO_REALTIME_MAX_SCALED_PPM (500L << 16)
+
+static void tgpio_resolve_do_adjtimex(void)
+{
+	struct kprobe kp = { .symbol_name = "do_adjtimex" };
+
+	if (register_kprobe(&kp)) {
+		pr_warn("do_adjtimex unavailable; realtime mode supports settime and stepped adjtime only\n");
+		return;
+	}
+	tgpio_do_adjtimex = (void *)kp.addr;
+	unregister_kprobe(&kp);
+}
+
+static int tgpio_realtime_adjfine(long scaled_ppm)
+{
+	struct __kernel_timex txc = {
+		.modes = ADJ_FREQUENCY,
+		.freq = scaled_ppm,
+	};
+	int ret;
+
+	if (!tgpio_do_adjtimex)
+		return -EOPNOTSUPP;
+	if (scaled_ppm > TGPIO_REALTIME_MAX_SCALED_PPM ||
+	    scaled_ppm < -TGPIO_REALTIME_MAX_SCALED_PPM)
+		return -ERANGE;
+
+	ret = tgpio_do_adjtimex(&txc);
+	return ret < 0 ? ret : 0;
+}
+
+static int tgpio_realtime_adjtime(s64 delta_ns)
+{
+	struct timespec64 ts;
+	int ret;
+
+	if (tgpio_do_adjtimex) {
+		struct __kernel_timex txc = {
+			.modes = ADJ_SETOFFSET | ADJ_NANO,
+		};
+		s32 rem;
+
+		txc.time.tv_sec = div_s64_rem(delta_ns, NSEC_PER_SEC, &rem);
+		if (rem < 0) {
+			txc.time.tv_sec -= 1;
+			rem += NSEC_PER_SEC;
+		}
+		txc.time.tv_usec = rem;
+		ret = tgpio_do_adjtimex(&txc);
+		return ret < 0 ? ret : 0;
+	}
+
+	/* Fallback: a non-atomic step; the window between read and set adds
+	 * microsecond-scale error, acceptable for coarse correction.
+	 */
+	ktime_get_real_ts64(&ts);
+	ts = timespec64_add(ts, ns_to_timespec64(delta_ns));
+	return do_settimeofday64(&ts);
+}
+
 static int tgpio_ptp_gettime64(struct ptp_clock_info *ptp,
 			       struct timespec64 *ts)
 {
@@ -3376,12 +3446,20 @@ static int tgpio_ptp_settime64(struct ptp_clock_info *ptp,
 	struct tgpio_s64_result old;
 	unsigned long flags;
 	s64 ns;
+	int ret;
 
-	if (clock_mode != TGPIO_CLOCK_PHC)
+	if (clock_mode == TGPIO_CLOCK_ART)
 		return -EOPNOTSUPP;
 
 	if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= NSEC_PER_SEC)
 		return -EINVAL;
+
+	if (clock_mode == TGPIO_CLOCK_REALTIME) {
+		ret = do_settimeofday64(ts);
+		if (!ret)
+			tgpio_resync_outputs_after_phc_step(dev);
+		return ret;
+	}
 	if (ts->tv_sec > div64_s64(S64_MAX, NSEC_PER_SEC))
 		return -ERANGE;
 
@@ -3413,9 +3491,17 @@ static int tgpio_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
 	struct tgpio_s64_result now;
 	struct tgpio_s64_result adjusted;
 	unsigned long flags;
+	int ret;
 
-	if (clock_mode != TGPIO_CLOCK_PHC)
+	if (clock_mode == TGPIO_CLOCK_ART)
 		return -EOPNOTSUPP;
+
+	if (clock_mode == TGPIO_CLOCK_REALTIME) {
+		ret = tgpio_realtime_adjtime(delta);
+		if (!ret)
+			tgpio_resync_outputs_after_phc_step(dev);
+		return ret;
+	}
 
 	art = tgpio_get_current_art();
 	if (art.status < 0)
@@ -3450,9 +3536,17 @@ static int tgpio_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
 	struct tgpio_s64_result now;
 	unsigned long flags;
 	s64 ppb;
+	int ret;
 
-	if (clock_mode != TGPIO_CLOCK_PHC)
+	if (clock_mode == TGPIO_CLOCK_ART)
 		return -EOPNOTSUPP;
+
+	if (clock_mode == TGPIO_CLOCK_REALTIME) {
+		ret = tgpio_realtime_adjfine(scaled_ppm);
+		if (!ret && hardware_periodic_output)
+			tgpio_update_outputs_after_phc_freq(dev);
+		return ret;
+	}
 
 	ppb = tgpio_scaled_ppm_to_ppb(scaled_ppm);
 	if (ppb > TGPIO_PHC_MAX_ADJ_PPB || ppb < -TGPIO_PHC_MAX_ADJ_PPB)
@@ -3850,8 +3944,12 @@ static int tgpio_register_ptp_clock(struct tgpio_device *dev)
 
 	dev->ptp_info.owner = THIS_MODULE;
 	snprintf(dev->ptp_info.name, sizeof(dev->ptp_info.name), "Intel TGPIO");
-	dev->ptp_info.max_adj =
-		clock_mode == TGPIO_CLOCK_PHC ? TGPIO_PHC_MAX_ADJ_PPB : 0;
+	if (clock_mode == TGPIO_CLOCK_PHC)
+		dev->ptp_info.max_adj = TGPIO_PHC_MAX_ADJ_PPB;
+	else if (clock_mode == TGPIO_CLOCK_REALTIME && tgpio_do_adjtimex)
+		dev->ptp_info.max_adj = TGPIO_REALTIME_MAX_ADJ_PPB;
+	else
+		dev->ptp_info.max_adj = 0;
 	dev->ptp_info.n_pins = dev->n_ptp_pins;
 	dev->ptp_info.n_ext_ts = dev->n_ptp_pins;
 	dev->ptp_info.n_per_out = dev->n_ptp_pins;
@@ -4163,6 +4261,9 @@ static int __init tgpio_input_init(void)
 	ret = tgpio_validate_persistent_operations(tgpio);
 	if (ret)
 		goto err_cleanup;
+
+	if (clock_mode == TGPIO_CLOCK_REALTIME)
+		tgpio_resolve_do_adjtimex();
 
 	if (tgpio_clock_uses_model()) {
 		if (!timekeeping_clocksource_has_base(CSID_X86_ART)) {
