@@ -192,11 +192,19 @@ In PHC mode:
   restart happens in steady state; a full grid-aligned re-arm
   (`activity=output_phase_rearm`) is only the backstop for errors beyond a
   quarter period.
-- Output polarity is deterministic: single-shot output compares never fire
-  on this hardware, so instead of a prime edge the driver loads the output
-  level flop low (a brief enable with `EP=rising`, which survives the
-  subsequent disable) before arming toggle mode. The `COMPV` match is
-  therefore always the rising edge, on every arm and re-arm.
+- Output polarity is deterministic through software level tracking. The
+  hardware output level flop is write-only state: it holds the level of the
+  last generated toggle, survives disable, and cannot be loaded or read (EP
+  writes and single-shot output compares do nothing on this hardware). The
+  driver therefore mirrors the flop in software — it assumes the power-on
+  low state at load, counts every generated toggle through the live `COMPV`
+  readback, drains the flop low before stops and unloads so the assumption
+  stays true across reloads, and picks the compare slot at arm time so
+  rising edges always land on the requested grid. If the mirror is ever
+  wrong (for example after external register pokes), writing 1 to
+  `/sys/kernel/debug/tgpio/outputN_invert` flips the tracked level and
+  shifts a running waveform by half a period, glitch-free. The tracked
+  level appears as `tracked_level` in the status output.
 
 `TIMESTAMP_MODE=art` is intended for explicit `CLOCK_MODE=realtime` debugging.
 In the default PHC mode, hardware input events are emitted in adjusted PHC time

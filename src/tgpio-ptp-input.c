@@ -24,6 +24,7 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/kobject.h>
+#include <linux/kstrtox.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -402,6 +403,7 @@ struct tgpio_crosststamp_capture {
  * by tgpio_output_work. Every publisher bumps gen; the work applies the latest.
  */
 struct tgpio_output_desired {
+	unsigned int flip_gen; /* polarity-calibration requests */
 	unsigned int gen;
 	unsigned int freq_gen;
 	enum tgpio_output_run run;
@@ -442,9 +444,12 @@ struct tgpio_mmio_block {
 	struct tgpio_output_desired output_desired;
 	unsigned int output_applied_gen; /* output_work-private from here down */
 	unsigned int output_applied_freq_gen;
+	unsigned int output_applied_flip_gen;
 	enum tgpio_output_phase output_phase;
 	u64 output_hw_first_art; /* armed COMPV; edges at first + k * piv */
 	u64 output_hw_piv;	 /* armed PIV; 0 = not in hardware periodic */
+	u64 output_hw_ckpt_compv; /* COMPV at last flop checkpoint */
+	bool output_hw_flop_high; /* tracked output level flop */
 	u64 output_high_time_ns;
 	u64 output_low_time_ns;
 	enum tgpio_logical_edge output_next_edge_type;
@@ -1221,6 +1226,36 @@ static u64 tgpio_read_compv(struct tgpio_mmio_block *mmio_block)
 	} while (hi != prev_hi);
 
 	return ((u64)hi << 32) | lo;
+}
+
+/*
+ * output_work-only: fold the toggles generated since the last checkpoint
+ * into the tracked level flop. COMPV advances by exactly PIV per generated
+ * edge, and the checkpoint is refreshed at every PIV change and COMPV
+ * rewrite, so the distance is always an exact multiple of the current PIV.
+ * The flop itself is write-only hardware state: it holds the level of the
+ * last toggle, survives disable, and has no reset or readback, so this
+ * software mirror is the only source of polarity truth.
+ */
+static void tgpio_hw_flop_fold(struct tgpio_mmio_block *mmio_block)
+{
+	u64 compv;
+	u64 events;
+
+	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC ||
+	    !mmio_block->output_hw_piv)
+		return;
+
+	compv = tgpio_read_compv(mmio_block);
+	if (compv < mmio_block->output_hw_ckpt_compv)
+		return;
+
+	events = div64_u64(compv - mmio_block->output_hw_ckpt_compv,
+			   mmio_block->output_hw_piv);
+	if (events & 1)
+		mmio_block->output_hw_flop_high =
+			!mmio_block->output_hw_flop_high;
+	mmio_block->output_hw_ckpt_compv = compv;
 }
 
 static struct tgpio_capture
@@ -2028,6 +2063,7 @@ static void tgpio_disable_output_hw(struct tgpio_mmio_block *mmio_block)
 {
 	u32 ctrl = tgpio_read_ctl(mmio_block);
 
+	tgpio_hw_flop_fold(mmio_block);
 	tgpio_write_ctl(mmio_block, tgpio_ctl_without(ctrl, TGPIOCTL_EN));
 	tgpio_write_compv(mmio_block, 0);
 	tgpio_write_piv(mmio_block, 0);
@@ -2071,31 +2107,31 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	tgpio_write_compv(mmio_block, 0);
 	tgpio_write_piv(mmio_block, 0);
 
-	/*
-	 * Load the output level flop deterministically: enabling with
-	 * EP_RISING drives the line low and the flop survives the disable
-	 * (verified on hardware). Toggle mode then starts from low, so the
-	 * COMPV match is always the rising edge. Without this, toggle mode
-	 * resumes from whatever level the previous waveform happened to stop
-	 * at, and the polarity comes up inverted at random. The readback
-	 * posts the enable write and gives the device clock domain time to
-	 * latch the flop before the disable follows.
-	 */
 	ctrl = tgpio_ctl_without(ctrl,
 				 TGPIOCTL_DIR | TGPIOCTL_EP | TGPIOCTL_PM);
-	tgpio_write_ctl(mmio_block, tgpio_ctl_with(ctrl, TGPIOCTL_EN));
-	(void)tgpio_read_ctl(mmio_block);
-	usleep_range(3000, 4000);
 	tgpio_write_ctl(mmio_block, ctrl);
-	(void)tgpio_read_ctl(mmio_block);
-	usleep_range(3000, 4000);
 
 	/*
-	 * Late-arm guard, evaluated after the dance sleeps: if the compare
-	 * were already in the past at enable, hardware would fire the first
-	 * toggle immediately and invert the waveform polarity. Push the
-	 * first edge forward by whole periods (parity-preserving) until it
-	 * sits safely ahead of the counter.
+	 * The output level flop cannot be loaded or read: it holds the level
+	 * of the last generated toggle (it survives disable; EN=1 re-drives
+	 * it; EP writes and single-shot compares do nothing). Polarity is
+	 * therefore handled by slot selection below: if the tracked flop is
+	 * high, the first toggle is a falling edge, so program it on the
+	 * half-period slot before a grid point and the rising edges still
+	 * land on the requested grid.
+	 */
+	if (mmio_block->output_hw_flop_high) {
+		if (first_art.val > half_period_art.val)
+			first_art.val -= half_period_art.val;
+		else
+			first_art.val += half_period_art.val;
+	}
+
+	/*
+	 * Late-arm guard: if the compare were already in the past at enable,
+	 * hardware would fire the first toggle immediately and invert the
+	 * waveform polarity. Push the first edge forward by whole periods
+	 * (parity-preserving) until it sits safely ahead of the counter.
 	 */
 	now_art = tgpio_get_current_art();
 	margin = tgpio_clock_delta_to_art_cycles(dev, 2 * NSEC_PER_MSEC);
@@ -2129,6 +2165,7 @@ static int tgpio_arm_hardware_periodic(struct tgpio_device *dev,
 	mmio_block->output_phase = TGPIO_OUTPUT_HARDWARE_PERIODIC;
 	mmio_block->output_hw_first_art = first_art.val;
 	mmio_block->output_hw_piv = half_period_art.val;
+	mmio_block->output_hw_ckpt_compv = first_art.val;
 
 	tgpio_log_output_hw_periodic(dev, mmio_block, first_edge_ns,
 				     half_period_ns, first_art.val,
@@ -2484,6 +2521,11 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 	struct tgpio_u64_result nudged_art;
 	s64 aligned_ns;
 
+	/* Checkpoint the level flop before changing PIV: the fold math needs
+	 * the PIV that was live while the counted edges fired.
+	 */
+	tgpio_hw_flop_fold(mmio_block);
+
 	/*
 	 * Hot PIV writes are two 32-bit stores; only apply one when the high
 	 * word is unchanged so a concurrent hardware reload cannot see a
@@ -2522,9 +2564,73 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 		return;
 
 	tgpio_write_compv(mmio_block, nudged_art.val);
+	mmio_block->output_hw_ckpt_compv = nudged_art.val;
 	mmio_block->output_next_edge = ns_to_ktime(aligned_ns);
 	tgpio_log_output_phase_nudge(dev, mmio_block, phase.error_ns,
 				     aligned_ns);
+}
+
+/*
+ * output_work-only: before stopping a hardware periodic block, let the
+ * pending falling edge fire when the tracked flop is high, leaving the flop
+ * low. A fresh driver load assumes a low flop (the power-on state); this
+ * keeps that assumption true across stop/start cycles and module reloads.
+ * Bounded wait: gives up after ~3 seconds for very long periods.
+ */
+static void tgpio_hw_periodic_drain_low(struct tgpio_mmio_block *mmio_block)
+{
+	unsigned int i;
+
+	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC ||
+	    !mmio_block->output_hw_piv)
+		return;
+
+	tgpio_hw_flop_fold(mmio_block);
+	for (i = 0; mmio_block->output_hw_flop_high && i < 30; i++) {
+		msleep(100);
+		tgpio_hw_flop_fold(mmio_block);
+	}
+}
+
+/*
+ * output_work-only: external calibration told us the tracked level is
+ * inverted. Fix the belief, and when the block free-runs, shift the pending
+ * compare by half a period (one stretched half-cycle, no glitch) so rising
+ * edges return to the requested grid.
+ */
+static void tgpio_hw_periodic_invert(struct tgpio_device *dev,
+				     struct tgpio_mmio_block *mmio_block)
+{
+	struct tgpio_hw_phase phase;
+	unsigned int i;
+	u64 compv;
+
+	mmio_block->output_hw_flop_high = !mmio_block->output_hw_flop_high;
+
+	if (mmio_block->output_phase != TGPIO_OUTPUT_HARDWARE_PERIODIC ||
+	    !mmio_block->output_hw_piv)
+		return;
+
+	/* Wait out an imminent edge so the COMPV rewrite cannot race it. */
+	for (i = 0; i < 50; i++) {
+		phase = tgpio_hw_periodic_phase_get(
+			dev, mmio_block,
+			tgpio_output_desired_get(mmio_block).first_edge_ns,
+			mmio_block->output_high_time_ns);
+		if (phase.status < 0 || phase.nudge_safe)
+			break;
+		msleep(20);
+	}
+
+	tgpio_hw_flop_fold(mmio_block);
+	compv = tgpio_read_compv(mmio_block);
+	if (compv > U64_MAX - mmio_block->output_hw_piv)
+		return;
+	compv += mmio_block->output_hw_piv;
+	tgpio_write_compv(mmio_block, compv);
+	mmio_block->output_hw_ckpt_compv = compv;
+	pr_info("output polarity inverted block=%u flop_high=%d\n",
+		mmio_block->index, mmio_block->output_hw_flop_high);
 }
 
 /* Sole writer of output hardware + the per-edge timer. */
@@ -2543,10 +2649,18 @@ static void tgpio_output_work(struct work_struct *work)
 
 	if (desired.run == TGPIO_OUTPUT_STOPPED) {
 		hrtimer_cancel(&mmio_block->output_timer);
+		tgpio_hw_periodic_drain_low(mmio_block);
 		tgpio_log_output_stop(dev, mmio_block);
 		tgpio_disable_output_hw(mmio_block);
 		return;
 	}
+
+	/* Calibration flips arrive out of band; apply the belief change
+	 * before any re-arm so the arm picks the corrected slot.
+	 */
+	if ((desired.flip_gen - mmio_block->output_applied_flip_gen) & 1)
+		tgpio_hw_periodic_invert(dev, mmio_block);
+	mmio_block->output_applied_flip_gen = desired.flip_gen;
 
 	/*
 	 * New config: (re)arm to it. prepare and arm each read the PHC mapping
@@ -2633,6 +2747,7 @@ static void tgpio_disable_output(struct tgpio_mmio_block *mmio_block)
 	mmio_block->output_desired = (struct tgpio_output_desired){
 		.gen = mmio_block->output_desired.gen + 1,
 		.freq_gen = mmio_block->output_desired.freq_gen,
+		.flip_gen = mmio_block->output_desired.flip_gen,
 		.run = TGPIO_OUTPUT_STOPPED,
 	};
 	write_sequnlock_irqrestore(&mmio_block->output_seqlock, flags);
@@ -2654,6 +2769,7 @@ static void tgpio_output_publish(struct tgpio_mmio_block *mmio_block,
 	mmio_block->output_desired = (struct tgpio_output_desired){
 		.gen = mmio_block->output_desired.gen + 1,
 		.freq_gen = mmio_block->output_desired.freq_gen,
+		.flip_gen = mmio_block->output_desired.flip_gen,
 		.run = run,
 		.mode = mode,
 		.period_ns = period_ns,
@@ -3121,6 +3237,7 @@ static void tgpio_disable_outputs(struct tgpio_device *dev)
 		mmio_block->output_desired = (struct tgpio_output_desired){
 			.gen = mmio_block->output_desired.gen + 1,
 			.freq_gen = mmio_block->output_desired.freq_gen,
+			.flip_gen = mmio_block->output_desired.flip_gen,
 			.run = TGPIO_OUTPUT_STOPPED,
 		};
 		write_sequnlock_irqrestore(&mmio_block->output_seqlock, flags);
@@ -3537,6 +3654,10 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 							   " armed_piv=%llu phase_error=%lldns",
 							   READ_ONCE(mmio_block->output_hw_piv),
 							   phase.error_ns);
+					seq_printf(m, " tracked_level=%s",
+						   READ_ONCE(mmio_block->output_hw_flop_high) ?
+							   "high" :
+							   "low");
 				}
 			}
 		}
@@ -3552,11 +3673,59 @@ DEFINE_SHOW_ATTRIBUTE(tgpio_status);
 
 static struct dentry *tgpio_debugfs_dir;
 
+/*
+ * Write 1 to flip the tracked output level and shift a running waveform by
+ * half a period. This is the one-shot calibration hook for the write-only
+ * hardware level flop: the driver assumes it is low at load, and an external
+ * observer (scope, logic analyzer, timestamper) corrects it here if the
+ * assumption was wrong.
+ */
+static ssize_t tgpio_output_invert_write(struct file *file,
+					 const char __user *ubuf, size_t count,
+					 loff_t *ppos)
+{
+	struct tgpio_mmio_block *mmio_block = file->private_data;
+	unsigned long flags;
+	bool value;
+	int ret;
+
+	ret = kstrtobool_from_user(ubuf, count, &value);
+	if (ret)
+		return ret;
+	if (!value)
+		return count;
+
+	write_seqlock_irqsave(&mmio_block->output_seqlock, flags);
+	mmio_block->output_desired.flip_gen++;
+	write_sequnlock_irqrestore(&mmio_block->output_seqlock, flags);
+	schedule_work(&mmio_block->output_work);
+	return count;
+}
+
+static const struct file_operations tgpio_output_invert_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = tgpio_output_invert_write,
+};
+
 static void tgpio_debugfs_init(struct tgpio_device *dev)
 {
+	unsigned int i;
+
 	tgpio_debugfs_dir = debugfs_create_dir("tgpio", NULL);
 	debugfs_create_file("status", 0444, tgpio_debugfs_dir, dev,
 			    &tgpio_status_fops);
+
+	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
+		struct tgpio_mmio_block *mmio_block = &dev->mmio_blocks[i];
+		char name[24];
+
+		if (mmio_block->mode != TGPIO_MODE_OUTPUT)
+			continue;
+		snprintf(name, sizeof(name), "output%u_invert", i);
+		debugfs_create_file(name, 0200, tgpio_debugfs_dir, mmio_block,
+				    &tgpio_output_invert_fops);
+	}
 }
 
 static void tgpio_debugfs_exit(void)
