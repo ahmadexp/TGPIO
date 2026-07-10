@@ -220,6 +220,17 @@ This work shows that firmware-undeclared timed I/O hardware can be made useful t
 
 The most important engineering issues are clock-domain correctness and deterministic output behavior. TGPIO capture and compare values are ART-domain cycles, while PTP userspace operates naturally in realtime. The driver addresses this with explicit timestamp modes, Linux timekeeping cross-timestamp conversion, realtime-to-ART output scheduling, and a software mirror of the write-only hardware level state that keeps output polarity deterministic across arms, steps, and reloads. The measured results show that with in-flight interval refresh, live comparator phase nudges, and a one-shot delay calibration, a disciplined TGPIO output holds an external atomic PPS reference within 100~ns -- comparable to a dedicated timing card's own output -- using only hidden platform hardware and standard PTP tooling. The resulting design provides a practical bridge for measurement, synchronization, and control experiments on platforms with hidden timed I/O resources.
 
+\section*{Availability}
+
+The driver source, build tooling, measurement scripts, and documentation are
+available at \texttt{https://github.com/ahmadexp/TGPIO} under the TGPIO
+Non-Commercial License: use, modification, and redistribution are free for
+personal, academic, research, teaching, and evaluation purposes, while any
+commercial use requires the prior written permission of the author. The kernel
+module declares a GPL-compatible \texttt{MODULE\_LICENSE} string solely to
+satisfy the kernel's licensed-symbol requirements when built and loaded by end
+users.
+
 \section*{Acknowledgment}
 
 The author acknowledges the use of OpenAI Codex for assistance with manuscript organization and drafting.
