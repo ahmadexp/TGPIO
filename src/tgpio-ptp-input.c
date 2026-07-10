@@ -140,6 +140,7 @@ enum tgpio_timestamp_mode {
 enum tgpio_clock_mode {
 	TGPIO_CLOCK_REALTIME,
 	TGPIO_CLOCK_PHC,
+	TGPIO_CLOCK_ART,
 };
 
 enum tgpio_output_phase {
@@ -475,6 +476,7 @@ struct tgpio_device {
 	struct tgpio_phc_params phc;
 	struct tgpio_stats stats;
 	struct delayed_work poll_work;
+	struct delayed_work art_refine_work;
 	unsigned int n_ptp_pins;
 	struct tgpio_mmio_block mmio_blocks[TGPIO_MAX_BLOCKS];
 };
@@ -483,6 +485,7 @@ static struct tgpio_device *tgpio;
 
 static struct tgpio_u64_result tgpio_realtime_delta_to_art_cycles(u64 delta_ns);
 static struct tgpio_ns_result tgpio_art_cycles_to_realtime_delta_ns(u64 cycles);
+static void tgpio_update_outputs_after_phc_freq(struct tgpio_device *dev);
 
 static inline struct tgpio_s64_result tgpio_ok_s64(s64 v)
 {
@@ -611,9 +614,23 @@ static const char *tgpio_clock_mode_name(enum tgpio_clock_mode mode)
 		return "realtime";
 	case TGPIO_CLOCK_PHC:
 		return "phc";
+	case TGPIO_CLOCK_ART:
+		return "art";
 	default:
 		return "unknown";
 	}
+}
+
+/*
+ * PHC and ART modes both run on the anchor-plus-rate clock model over the
+ * hardware ART counter; they differ only in what the anchor references
+ * (realtime vs CLOCK_MONOTONIC_RAW) and whether adjustments are accepted
+ * (ART mode rejects them all). Realtime mode bypasses the model and converts
+ * through the kernel timekeeper per call.
+ */
+static inline bool tgpio_clock_uses_model(void)
+{
+	return clock_mode != TGPIO_CLOCK_REALTIME;
 }
 
 struct tgpio_clock_mode_result {
@@ -631,6 +648,10 @@ static struct tgpio_clock_mode_result tgpio_parse_clock_mode(const char *value)
 	    sysfs_streq(value, "adjusted"))
 		return (struct tgpio_clock_mode_result){ TGPIO_OK,
 							 TGPIO_CLOCK_PHC };
+	if (sysfs_streq(value, "art") || sysfs_streq(value, "raw") ||
+	    sysfs_streq(value, "monotonic_raw"))
+		return (struct tgpio_clock_mode_result){ TGPIO_OK,
+							 TGPIO_CLOCK_ART };
 	return (struct tgpio_clock_mode_result){ .status = TGPIO_E_INVAL };
 }
 
@@ -1455,7 +1476,7 @@ static struct tgpio_s64_result tgpio_clock_phc_now_ns(struct tgpio_device *dev)
 
 static struct tgpio_s64_result tgpio_clock_now_ns(struct tgpio_device *dev)
 {
-	if (clock_mode == TGPIO_CLOCK_PHC)
+	if (tgpio_clock_uses_model())
 		return tgpio_clock_phc_now_ns(dev);
 
 	return tgpio_ok_s64(ktime_get_real_ns());
@@ -1466,7 +1487,7 @@ static struct tgpio_u64_result tgpio_clock_ns_to_art(struct tgpio_device *dev,
 {
 	u64 art;
 
-	if (clock_mode == TGPIO_CLOCK_PHC)
+	if (tgpio_clock_uses_model())
 		return tgpio_phc_ns_to_art(tgpio_phc_params_get(dev), ns);
 
 	if (!ktime_real_to_base_clock(ns_to_ktime(ns), CSID_X86_ART, &art))
@@ -1478,7 +1499,7 @@ static struct tgpio_u64_result tgpio_clock_ns_to_art(struct tgpio_device *dev,
 static struct tgpio_u64_result
 tgpio_clock_delta_to_real_ns(struct tgpio_device *dev, s64 clock_delta_ns)
 {
-	if (clock_mode == TGPIO_CLOCK_PHC)
+	if (tgpio_clock_uses_model())
 		return tgpio_phc_delta_to_real_ns(tgpio_phc_params_get(dev),
 						  clock_delta_ns);
 
@@ -1494,7 +1515,7 @@ tgpio_clock_delta_to_art_cycles(struct tgpio_device *dev, s64 clock_delta_ns)
 	struct tgpio_u64_result real;
 	struct tgpio_u64_result cycles;
 
-	if (clock_mode == TGPIO_CLOCK_PHC) {
+	if (tgpio_clock_uses_model()) {
 		cycles = tgpio_phc_delta_to_art_cycles(
 			tgpio_phc_params_get(dev), clock_delta_ns);
 		if (cycles.status < 0)
@@ -1521,7 +1542,7 @@ tgpio_clock_delta_to_art_cycles(struct tgpio_device *dev, s64 clock_delta_ns)
 static struct tgpio_ns_result
 tgpio_clock_art_cycles_to_delta_ns(struct tgpio_device *dev, u64 cycles)
 {
-	if (clock_mode == TGPIO_CLOCK_PHC)
+	if (tgpio_clock_uses_model())
 		return tgpio_phc_art_cycles_to_delta_ns(
 			tgpio_phc_params_get(dev), cycles);
 
@@ -1609,6 +1630,115 @@ static int tgpio_phc_init_clock(struct tgpio_device *dev)
 	dev->phc = tgpio_phc_params_make(art, ktime_to_ns(realtime),
 					 base_art_hz.val, 0);
 	return 0;
+}
+
+/* Calibration anchor for the ART clock mode rate refinement. */
+static u64 tgpio_art_cal_anchor_art;
+static s64 tgpio_art_cal_anchor_raw;
+
+struct tgpio_art_raw_sample {
+	enum tgpio_status status;
+	u64 art;
+	s64 raw;
+};
+
+/*
+ * Sample the ART counter bracketed by CLOCK_MONOTONIC_RAW reads, retrying
+ * until the bracket is tight so the pairing skew stays bounded.
+ */
+static struct tgpio_art_raw_sample tgpio_sample_art_raw(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 8; i++) {
+		s64 raw_before = ktime_get_raw_ns();
+		struct tgpio_u64_result art = tgpio_get_current_art();
+		s64 raw_after = ktime_get_raw_ns();
+
+		if (art.status < 0)
+			return (struct tgpio_art_raw_sample){
+				.status = art.status
+			};
+		if (raw_after - raw_before <= 2000 || i == 7)
+			return (struct tgpio_art_raw_sample){
+				.status = TGPIO_OK,
+				.art = art.val,
+				.raw = raw_before +
+				       (raw_after - raw_before) / 2,
+			};
+	}
+	return (struct tgpio_art_raw_sample){ .status = TGPIO_E_NODEV };
+}
+
+/*
+ * ART clock mode: the same anchor-plus-rate model as PHC mode, but anchored
+ * to CLOCK_MONOTONIC_RAW and never adjusted (settime/adjtime/adjfine return
+ * EOPNOTSUPP). The rate is calibrated against the raw clock over a short
+ * window at load and refined once over a longer baseline shortly after.
+ */
+static int tgpio_art_init_clock(struct tgpio_device *dev)
+{
+	struct tgpio_art_raw_sample first;
+	struct tgpio_art_raw_sample second;
+	u64 base;
+
+	first = tgpio_sample_art_raw();
+	if (first.status < 0)
+		return -ENODEV;
+	msleep(250);
+	second = tgpio_sample_art_raw();
+	if (second.status < 0)
+		return -ENODEV;
+	if (second.raw <= first.raw || second.art <= first.art ||
+	    second.art - first.art > div64_u64(U64_MAX, NSEC_PER_SEC))
+		return -ENODEV;
+
+	base = div64_u64((second.art - first.art) * NSEC_PER_SEC,
+			 (u64)(second.raw - first.raw));
+	if (!base)
+		return -ENODEV;
+
+	tgpio_art_cal_anchor_art = first.art;
+	tgpio_art_cal_anchor_raw = first.raw;
+	dev->phc = tgpio_phc_params_make(second.art, second.raw, base, 0);
+	pr_info("ART clock anchored to CLOCK_MONOTONIC_RAW; base rate %llu cycles/s (refining)\n",
+		base);
+	schedule_delayed_work(&dev->art_refine_work, 10 * HZ);
+	return 0;
+}
+
+/*
+ * One-shot rate refinement: recompute cycles-per-raw-second over the full
+ * baseline since load (much tighter than the 250 ms init window allows) and
+ * re-anchor onto the current raw time. Running outputs pick up the refined
+ * rate through the normal frequency-update path.
+ */
+static void tgpio_art_refine_work_fn(struct work_struct *work)
+{
+	struct tgpio_device *dev = container_of(
+		work, struct tgpio_device, art_refine_work.work);
+	struct tgpio_art_raw_sample now;
+	unsigned long flags;
+	u64 base;
+
+	now = tgpio_sample_art_raw();
+	if (now.status < 0 || now.raw <= tgpio_art_cal_anchor_raw ||
+	    now.art <= tgpio_art_cal_anchor_art ||
+	    now.art - tgpio_art_cal_anchor_art >
+		    div64_u64(U64_MAX, NSEC_PER_SEC))
+		return;
+
+	base = div64_u64((now.art - tgpio_art_cal_anchor_art) * NSEC_PER_SEC,
+			 (u64)(now.raw - tgpio_art_cal_anchor_raw));
+	if (!base)
+		return;
+
+	write_seqlock_irqsave(&dev->phc_seqlock, flags);
+	dev->phc = tgpio_phc_params_make(now.art, now.raw, base, 0);
+	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
+
+	pr_info("ART clock base rate refined to %llu cycles/s\n", base);
+	tgpio_update_outputs_after_phc_freq(dev);
 }
 
 struct tgpio_crosststamp_ctx {
@@ -1761,7 +1891,7 @@ static void tgpio_emit_event(struct tgpio_device *dev,
 		ts = tgpio_clock_now_ns(dev);
 		if (ts.status < 0 || ts.val < 0)
 			ts = tgpio_ok_s64(ktime_get_real_ns());
-	} else if (clock_mode == TGPIO_CLOCK_PHC) {
+	} else if (tgpio_clock_uses_model()) {
 		ts = tgpio_clock_phc_art_to_ns(dev, art_cycles);
 		if (ts.status < 0 || ts.val < 0) {
 			trace_tgpio_timestamp_fallback(mmio_block->index,
@@ -1978,7 +2108,7 @@ static void tgpio_log_rounding_edge(struct tgpio_device *dev,
 	struct tgpio_s64_result back;
 	unsigned int channel;
 
-	if (!READ_ONCE(verbose_rounding) || clock_mode != TGPIO_CLOCK_PHC)
+	if (!READ_ONCE(verbose_rounding) || !tgpio_clock_uses_model())
 		return;
 	if (compare_art > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES)
 		return;
@@ -2296,7 +2426,7 @@ tgpio_hw_periodic_phase_get(struct tgpio_device *dev,
 	u64 rem;
 	s64 err_ns;
 
-	if (clock_mode != TGPIO_CLOCK_PHC || !half_ns ||
+	if (!tgpio_clock_uses_model() || !half_ns ||
 	    half_ns > (u64)S64_MAX / 4 || grid_start_ns < 0)
 		return (struct tgpio_hw_phase){ .status = TGPIO_E_INVAL };
 
@@ -3170,7 +3300,7 @@ static void tgpio_update_outputs_after_phc_freq(struct tgpio_device *dev)
 {
 	unsigned int i;
 
-	if (clock_mode != TGPIO_CLOCK_PHC)
+	if (!tgpio_clock_uses_model())
 		return;
 
 	for (i = 0; i < ARRAY_SIZE(dev->mmio_blocks); i++) {
@@ -3222,7 +3352,7 @@ static int tgpio_ptp_gettime64(struct ptp_clock_info *ptp,
 		container_of(ptp, struct tgpio_device, ptp_info);
 	struct tgpio_s64_result now;
 
-	if (clock_mode != TGPIO_CLOCK_PHC) {
+	if (!tgpio_clock_uses_model()) {
 		ktime_get_real_ts64(ts);
 		return 0;
 	}
@@ -3997,6 +4127,7 @@ static int __init tgpio_input_init(void)
 
 	seqlock_init(&tgpio->phc_seqlock);
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
+	INIT_DELAYED_WORK(&tgpio->art_refine_work, tgpio_art_refine_work_fn);
 
 	clock = tgpio_parse_clock_mode(clock_mode_param);
 	if (clock.status < 0) {
@@ -4033,14 +4164,17 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
-	if (clock_mode == TGPIO_CLOCK_PHC) {
+	if (tgpio_clock_uses_model()) {
 		if (!timekeeping_clocksource_has_base(CSID_X86_ART)) {
-			pr_err("clock_mode=phc requires a timekeeper clocksource based on ART\n");
+			pr_err("clock_mode=%s requires a timekeeper clocksource based on ART\n",
+			       tgpio_clock_mode_name(clock_mode));
 			ret = -ENODEV;
 			goto err_cleanup;
 		}
 
-		ret = tgpio_phc_init_clock(tgpio);
+		ret = clock_mode == TGPIO_CLOCK_ART ?
+			      tgpio_art_init_clock(tgpio) :
+			      tgpio_phc_init_clock(tgpio);
 		if (ret)
 			goto err_cleanup;
 
@@ -4106,6 +4240,7 @@ static void __exit tgpio_input_exit(void)
 	if (tgpio->ptp_clock)
 		ptp_clock_unregister(tgpio->ptp_clock);
 
+	cancel_delayed_work_sync(&tgpio->art_refine_work);
 	tgpio_disable_mmio_blocks(tgpio);
 
 	tgpio_unmap_mmio_blocks(tgpio);
