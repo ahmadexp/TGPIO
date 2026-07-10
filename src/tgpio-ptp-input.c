@@ -1825,8 +1825,13 @@ static struct tgpio_crosststamp_capture tgpio_take_crosststamp(void)
 {
 	struct system_time_snapshot snapshot;
 
-	if (!hardware_timestamps || clock_mode != TGPIO_CLOCK_REALTIME ||
-	    timestamp_mode != TGPIO_TIMESTAMP_REALTIME)
+	/*
+	 * Needed whenever a capture may be converted to realtime: realtime
+	 * timestamp mode and the PPS sources both do, in every clock mode.
+	 * Without the history snapshot the kernel cross-timestamp rejects
+	 * cycles older than the current timekeeping interval.
+	 */
+	if (!hardware_timestamps)
 		return (struct tgpio_crosststamp_capture){
 			.state = TGPIO_SNAPSHOT_NONE
 		};
