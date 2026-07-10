@@ -4705,7 +4705,6 @@ static int __init tgpio_input_init(void)
 	INIT_DELAYED_WORK(&tgpio->watchdog_work, tgpio_watchdog_work_fn);
 	schedule_delayed_work(&tgpio->watchdog_work,
 			      TGPIO_WATCHDOG_PERIOD_S * HZ);
-	tgpio_pps_register(tgpio);
 
 	clock = tgpio_parse_clock_mode(clock_mode_param);
 	if (clock.status < 0) {
@@ -4737,6 +4736,8 @@ static int __init tgpio_input_init(void)
 	ret = tgpio_configure_mmio_blocks(tgpio);
 	if (ret)
 		goto err_cleanup;
+
+	tgpio_pps_register(tgpio);
 
 	ret = tgpio_validate_persistent_operations(tgpio);
 	if (ret)
