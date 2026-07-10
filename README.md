@@ -17,6 +17,26 @@ Each static TGPIO block can be selected independently as:
 
 The default is both blocks as inputs, matching the first working input setup.
 
+## Feature Overview
+
+| Capability | Summary | Measured on the validated setup |
+|---|---|---|
+| Periodic output | Hardware toggle engine, grid-aligned starts, deterministic polarity | 1 PPS at **+9 ± 64 ns** vs an atomic reference (phc2sys path) |
+| Asymmetric duty | Per-edge interval alternation, halves >= 50 ms, every edge hardware-timed | 25% duty: 249.998 ms / 749.995 ms |
+| One-shot pulse | `oneshotN` debugfs: single hardware-timed pulse at an absolute time | 100 ms request measured 99.9990 ms |
+| Timestamp input | Hardware ART-domain capture, per-edge selection, live statistics | capture-to-grid `phase` readout at ns level |
+| TDC mode | Start/stop duration measurement across the two pins, roles selectable | ~26 ns LSB, 64-bit range |
+| PPS sources | RFC 2783 `/dev/ppsX` per input, no PTP awareness needed | 1/s hardware-timestamped asserts |
+| Clock modes | `phc` (adjustable), `art` (raw, unadjustable), `realtime` (steers the system clock) | chrony locked the system clock to a captured PPS at −218 ns |
+| Discipline | ts2phc in the ART domain, or phc2sys PHC-to-PHC | ~50 ns uncalibrated systematic (ART loop) |
+| Precise crosststamps | `PTP_SYS_OFFSET_PRECISE` with exact device/realtime pairing | adopted automatically by phc2sys/chrony |
+| Observability | status file, activity log, quantization + verbose rounding logs, stall watchdog | rounding self-check within ±13 ns |
+| Calibration & persistence | `output_phase_offset_ns`, polarity knobs, auto-polarity (loopback), `make save-config` | one-shot calibration, survives reboots |
+
+Full documentation lives in this README and the
+[project wiki](https://github.com/ahmadexp/TGPIO/wiki); run `make help` for
+every load-time option with examples.
+
 ## Pre Req
 
 ```
@@ -230,7 +250,7 @@ In PHC mode:
 - If `phc2sys` only changes PHC frequency with `adjfine`, the driver
   hot-refreshes `PIV` to the current servo rate (verified safe on this
   hardware: a `PIV` write latches for the following periods) and, when the
-  pending edge has drifted more than 1 us off the requested grid, rewrites
+  pending edge has drifted more than 200 ns off the requested grid, rewrites
   `COMPV` to pull it back (`activity=output_phase_nudge`). No waveform
   restart happens in steady state; a full grid-aligned re-arm
   (`activity=output_phase_rearm`) is only the backstop for errors beyond a
