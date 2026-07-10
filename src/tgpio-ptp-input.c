@@ -317,7 +317,7 @@ MODULE_PARM_DESC(verbose_rounding,
 
 module_param(tdc, bool, 0644);
 MODULE_PARM_DESC(tdc,
-		 "Time-to-digital converter mode: pair start and stop input captures into hardware-timestamped duration measurements");
+		 "Time-to-digital converter mode: pair start and stop input captures into hardware-timestamped bipolar duration measurements (negative when stop precedes start)");
 
 module_param(tdc_start, uint, 0644);
 MODULE_PARM_DESC(tdc_start,
@@ -514,8 +514,9 @@ struct tgpio_device {
 	struct delayed_work watchdog_work;
 	unsigned int autopol_streak;   /* poll_work-private */
 	unsigned int autopol_cooldown;
-	bool tdc_armed;	   /* poll_work-private TDC pairing state */
-	u64 tdc_start_art;
+	bool tdc_pending;  /* poll_work-private TDC pairing state */
+	unsigned int tdc_pending_block;
+	u64 tdc_pending_art;
 	u64 tdc_count;
 	u64 tdc_lost;
 	u64 tdc_last_cycles;
@@ -2062,14 +2063,15 @@ static void tgpio_apply_input(struct tgpio_mmio_block *mmio_block, int desired)
 }
 
 /*
- * poll_work-only: TDC pairing. A start capture on block 0 arms a
- * measurement; the next stop capture on block 1 with a later ART value
- * completes it. Both timestamps come from the hardware capture registers in
- * the same ART domain, so the duration is immune to clock discipline and
- * software latency; the resolution is one ART cycle per edge (about 26 ns
- * at 38.4 MHz). Multiple edges inside one poll window latch only the last
- * capture: extra starts mean the latest start wins, extra stops are lost
- * (counted in tdc_lost).
+ * poll_work-only: bipolar TDC pairing. A capture on either input arms a
+ * measurement; the next capture on the other input completes it. The
+ * result is signed stop-minus-start, so a stop that precedes its start
+ * reads negative. Both timestamps come from the hardware capture registers
+ * in the same ART domain, so the duration is immune to clock discipline
+ * and software latency; the resolution is one ART cycle per edge (about
+ * 26 ns at 38.4 MHz). Multiple edges inside one poll window latch only the
+ * last capture: repeated edges on the armed input re-arm (latest wins),
+ * overwritten captures are counted in tdc_lost.
  */
 /*
  * poll_work-only: automatic output polarity verification. When a reference
@@ -2260,7 +2262,11 @@ static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 {
 	unsigned int start_block = READ_ONCE(tdc_start) & 1;
 	struct tgpio_ns_result duration;
+	u64 start_art;
+	u64 stop_art;
 	u64 cycles;
+	s64 signed_ns;
+	bool negative;
 
 	if (!READ_ONCE(tdc))
 		return;
@@ -2272,35 +2278,42 @@ static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 	if (event_delta > 1 && event_delta <= 4096)
 		dev->tdc_lost += event_delta - 1;
 
-	if (block == start_block) {
-		dev->tdc_start_art = art_cycles;
-		dev->tdc_armed = true;
+	if (!dev->tdc_pending || dev->tdc_pending_block == block) {
+		dev->tdc_pending = true;
+		dev->tdc_pending_block = block;
+		dev->tdc_pending_art = art_cycles;
 		return;
 	}
-	if (block != (start_block ^ 1) || !dev->tdc_armed)
-		return;
-	if (art_cycles < dev->tdc_start_art)
-		return; /* stop predates the armed start; keep waiting */
 
-	cycles = art_cycles - dev->tdc_start_art;
-	dev->tdc_armed = false;
+	if (block == start_block) {
+		start_art = art_cycles;
+		stop_art = dev->tdc_pending_art;
+	} else {
+		start_art = dev->tdc_pending_art;
+		stop_art = art_cycles;
+	}
+	dev->tdc_pending = false;
+
+	negative = stop_art < start_art;
+	cycles = negative ? start_art - stop_art : stop_art - start_art;
 	duration = tgpio_clock_art_cycles_to_delta_ns(dev, cycles);
 	if (duration.status < 0 || duration.ns > S64_MAX)
 		return;
+	signed_ns = negative ? -(s64)duration.ns : (s64)duration.ns;
 
 	dev->tdc_count++;
 	dev->tdc_last_cycles = cycles;
-	dev->tdc_last_ns = duration.ns;
-	if (dev->tdc_count == 1 || (s64)duration.ns < dev->tdc_min_ns)
-		dev->tdc_min_ns = duration.ns;
-	if (dev->tdc_count == 1 || (s64)duration.ns > dev->tdc_max_ns)
-		dev->tdc_max_ns = duration.ns;
-	dev->tdc_sum_ns += duration.ns;
+	dev->tdc_last_ns = signed_ns;
+	if (dev->tdc_count == 1 || signed_ns < dev->tdc_min_ns)
+		dev->tdc_min_ns = signed_ns;
+	if (dev->tdc_count == 1 || signed_ns > dev->tdc_max_ns)
+		dev->tdc_max_ns = signed_ns;
+	dev->tdc_sum_ns += signed_ns;
 
 	if (READ_ONCE(activity_log))
-		pr_info("activity=tdc_measure start_art=%llu stop_art=%llu cycles=%llu duration_ns=%lld\n",
-			dev->tdc_start_art, art_cycles, cycles,
-			(s64)duration.ns);
+		pr_info("activity=tdc_measure start_art=%llu stop_art=%llu cycles=%s%llu duration_ns=%lld\n",
+			start_art, stop_art, negative ? "-" : "", cycles,
+			signed_ns);
 }
 
 static void tgpio_poll_work(struct work_struct *work)
@@ -4659,7 +4672,7 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 	if (READ_ONCE(tdc)) {
 		if (dev->tdc_count)
 			seq_printf(m,
-				   "tdc: start=block%u stop=block%u count=%llu last=%lldns last_cycles=%llu min=%lldns max=%lldns mean=%lldns lost=%llu armed=%d\n",
+				   "tdc: start=block%u stop=block%u count=%llu last=%lldns last_cycles=%llu min=%lldns max=%lldns mean=%lldns lost=%llu pending=%d\n",
 				   READ_ONCE(tdc_start) & 1,
 				   (READ_ONCE(tdc_start) & 1) ^ 1,
 				   dev->tdc_count, dev->tdc_last_ns,
@@ -4667,13 +4680,13 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 				   dev->tdc_max_ns,
 				   div64_s64(dev->tdc_sum_ns,
 					     (s64)dev->tdc_count),
-				   dev->tdc_lost, dev->tdc_armed);
+				   dev->tdc_lost, dev->tdc_pending);
 		else
 			seq_printf(m,
-				   "tdc: start=block%u stop=block%u count=0 lost=%llu armed=%d\n",
+				   "tdc: start=block%u stop=block%u count=0 lost=%llu pending=%d\n",
 				   READ_ONCE(tdc_start) & 1,
 				   (READ_ONCE(tdc_start) & 1) ^ 1,
-				   dev->tdc_lost, dev->tdc_armed);
+				   dev->tdc_lost, dev->tdc_pending);
 	}
 
 	seq_printf(m, "counters: events=%lld fallbacks=%lld\n",
