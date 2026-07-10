@@ -534,6 +534,32 @@ Note that with a tool like `phc2sys -R 8` adjusting frequency eight times per
 second, interval refreshes log at the same rate — this mode is for analysis
 sessions, not steady-state operation.
 
+### Full verbose mode
+
+`VERBOSE=1` (runtime-writable as `parameters/verbose`) is the superset
+switch: it enables the activity log, the rounding log, and detail lines for
+every remaining feature, each tagged `verbose=` for filtering:
+
+```sh
+sudo journalctl -k -f -g 'verbose='
+```
+
+- `verbose=input_stats` — per capture: ART value, phase against the whole
+  second, last/min/max interval and sample count.
+- `verbose=tdc_arm` — each TDC arming or re-arming edge with its role.
+- `verbose=pps_assert` — every RFC 2783 PPS assert with its realtime stamp.
+- `verbose=crosststamp` — precise cross-timestamp triples served to
+  `PTP_SYS_OFFSET_PRECISE` callers (rate-limited).
+- `verbose=clock_settime` / `clock_adjtime` / `clock_adjfine` — every clock
+  adjustment in both `phc` and `realtime` modes with the values applied.
+- `verbose=oneshot_done` — one-shot pulse teardown completion.
+- `verbose=duty_service` — each per-edge PIV alternation of an asymmetric
+  hardware duty cycle.
+- `verbose=auto_polarity` — every auto-polarity sample verdict (on-grid,
+  half-slot with streak count, or ambiguous).
+- `verbose=watchdog` — each 10 s watchdog check per output (advancing or
+  stuck, with the stall age).
+
 For a quick frequency sanity check while an output is running:
 
 ```sh

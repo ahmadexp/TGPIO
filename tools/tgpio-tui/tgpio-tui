@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Launcher for the TGPIO Control Center TUI (run with sudo)."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:
+    from tgpio_tui.app import main
+except ModuleNotFoundError as exc:
+    if exc.name and exc.name.startswith("textual"):
+        sys.exit("tgpio-tui needs the Textual library:\n"
+                 "    sudo pip3 install textual\n"
+                 "(or: sudo apt install pipx && sudo pipx install textual)")
+    raise
+
+main()

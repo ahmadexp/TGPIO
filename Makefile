@@ -59,7 +59,7 @@ LOAD_ENV += OUTPUT1_DUTY_NS="$(OUTPUT1_DUTY_NS)"
 LOAD_ENV += OUTPUT_START_DELAY_NS="$(OUTPUT_START_DELAY_NS)"
 LOAD_ENV += OUTPUT_PHASE_OFFSET_NS="$(OUTPUT_PHASE_OFFSET_NS)"
 
-.PHONY: all clean help load reload unload status install persist uninstall save-config
+.PHONY: all clean help load reload unload status install persist uninstall save-config tui
 
 help:
 	@echo "TGPIO PTP driver -- build, load, and configuration"
@@ -74,6 +74,7 @@ help:
 	@echo "  make persist         Alias for install, including persisted operations"
 	@echo "  make uninstall       Remove the persistent install"
 	@echo "  make save-config     Persist the current runtime configuration"
+	@echo "  make tui             Launch the TGPIO Control Center TUI (sudo)"
 	@echo "  make clean           Clean the build"
 	@echo "  make help            This text"
 	@echo
@@ -217,3 +218,6 @@ uninstall:
 
 save-config:
 	$(SUDO) ./scripts/save-config.sh
+
+tui:
+	$(SUDO) ./tools/tgpio-tui/tgpio-tui
