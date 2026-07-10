@@ -219,6 +219,7 @@ static enum tgpio_output_polarity output_polarity;
 static bool hardware_timestamps = true;
 static bool hardware_periodic_output = true;
 static bool activity_log;
+static bool verbose_rounding;
 static bool input0_enable;
 static bool input1_enable;
 static unsigned int input0_channel;
@@ -298,6 +299,10 @@ MODULE_PARM_DESC(hardware_periodic_output,
 module_param(activity_log, bool, 0644);
 MODULE_PARM_DESC(activity_log,
 		 "Log input captures and output activity to the kernel journal");
+
+module_param(verbose_rounding, bool, 0644);
+MODULE_PARM_DESC(verbose_rounding,
+		 "Log the ART-cycle rounding of every output programming action: each interval refresh, phase nudge, and software-programmed edge");
 
 module_param(input0_enable, bool, 0444);
 MODULE_PARM_DESC(input0_enable,
@@ -1932,6 +1937,69 @@ static int tgpio_config_input(struct tgpio_device *dev, unsigned int channel,
 }
 
 /*
+ * verbose_rounding-only: report the rounding of one periodic-interval
+ * refresh. The interval register takes integer ART cycles, so the actual
+ * half period differs from the request by up to half a cycle each time the
+ * servo rate changes it.
+ */
+static void tgpio_log_rounding_interval(struct tgpio_device *dev,
+					struct tgpio_mmio_block *mmio_block,
+					u64 piv_cycles)
+{
+	struct tgpio_ns_result actual;
+	unsigned int channel;
+
+	if (!READ_ONCE(verbose_rounding))
+		return;
+
+	actual = tgpio_clock_art_cycles_to_delta_ns(dev, piv_cycles);
+	if (actual.status < 0 || actual.ns > S64_MAX)
+		return;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("output rounding block=%u channel=%u event=interval_refresh piv_cycles=%llu requested_half_ns=%llu actual_half_ns=%llu half_rounding_ns=%lld\n",
+		mmio_block->index, channel, piv_cycles,
+		mmio_block->output_high_time_ns, actual.ns,
+		(s64)actual.ns - (s64)mmio_block->output_high_time_ns);
+}
+
+/*
+ * verbose_rounding-only: report the rounding of one absolute edge, measured
+ * by converting the programmed compare value back through the PHC mapping
+ * (including the hardware delay and calibration offset the forward path
+ * applied).
+ */
+static void tgpio_log_rounding_edge(struct tgpio_device *dev,
+				    struct tgpio_mmio_block *mmio_block,
+				    const char *event, s64 requested_ns,
+				    u64 compare_art)
+{
+	struct tgpio_s64_result back;
+	unsigned int channel;
+
+	if (!READ_ONCE(verbose_rounding) || clock_mode != TGPIO_CLOCK_PHC)
+		return;
+	if (compare_art > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES)
+		return;
+
+	back = tgpio_clock_phc_art_to_ns(dev,
+					 compare_art +
+						 TGPIO_ART_HW_DELAY_CYCLES);
+	if (back.status < 0)
+		return;
+	back = tgpio_add_s64(back.val, -READ_ONCE(output_phase_offset_ns));
+	if (back.status < 0)
+		return;
+
+	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
+					       PTP_PF_PEROUT);
+	pr_info("output rounding block=%u channel=%u event=%s requested_edge_ns=%lld programmed_edge_ns=%lld edge_rounding_ns=%lld\n",
+		mmio_block->index, channel, event, requested_ns, back.val,
+		back.val - requested_ns);
+}
+
+/*
  * Convert a logical output edge time into the hardware compare value. The
  * calibration offset shifts every programmed edge so a one-shot external
  * measurement (scope, analyzer, reference timestamper) can cancel constant
@@ -1977,6 +2045,8 @@ tgpio_program_output_edge(struct tgpio_device *dev,
 	tgpio_write_ctl(mmio_block, ctrl);
 
 	tgpio_write_compv(mmio_block, art.val);
+	tgpio_log_rounding_edge(dev, mmio_block, "software_edge",
+				ktime_to_ns(edge_time), art.val);
 	return TGPIO_OK;
 }
 
@@ -2642,6 +2712,7 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 		    upper_32_bits(mmio_block->output_hw_piv)) {
 		tgpio_write_piv(mmio_block, piv.val);
 		mmio_block->output_hw_piv = piv.val;
+		tgpio_log_rounding_interval(dev, mmio_block, piv.val);
 	}
 
 	phase = tgpio_hw_periodic_phase_get(dev, mmio_block,
@@ -2672,6 +2743,8 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 	mmio_block->output_next_edge = ns_to_ktime(aligned_ns);
 	tgpio_log_output_phase_nudge(dev, mmio_block, phase.error_ns,
 				     aligned_ns);
+	tgpio_log_rounding_edge(dev, mmio_block, "phase_nudge", aligned_ns,
+				nudged_art.val);
 }
 
 /*

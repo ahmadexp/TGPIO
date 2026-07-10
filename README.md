@@ -340,15 +340,63 @@ sudo journalctl -k -f -g 'tgpio_ptp_input: activity='
 ```
 
 Input lines include the block, PTP channel, edge selection, event counter,
-event-counter delta, raw ART capture value, and emitted timestamp. Output lines
-include perout arming, requested period, high/on time, low/off time, ART-cycle
-quantization for hardware periodic output, calculated full period, and
-rounding/split error fields. In hardware periodic mode the hardware free-runs
-after arming, so the journal records the programmed periodic setup rather than
-every physical edge. If PHC frequency is adjusted while hardware periodic
-output is running, the stream includes `activity=output_freq_update` with the
-refreshed interval. In software mode, the journal can record each programmed
-transition.
+event-counter delta, raw ART capture value, and emitted timestamp.
+
+What the output path reports, and where to see it with journalctl:
+
+- `output quantization ...` — unconditional (needs no option): one line per
+  arm in the kernel log with the requested and actual period, half-period in
+  ART cycles, `period_rounding_ns`, and `first_edge_rounding_ns`. See it with
+  `sudo journalctl -k -g 'output quantization'`.
+- `activity=output_arm` / `activity=output_hw_periodic` — arming details:
+  requested period, high/on and low/off time, ART-cycle quantization,
+  calculated full period, rounding/split error fields, and the armed first
+  edge. In hardware periodic mode the hardware free-runs after arming, so the
+  journal records the programmed setup rather than every physical edge; in
+  software mode each programmed transition can be logged.
+- `activity=output_phase_nudge` — a running output's pending compare was
+  pulled back onto the period grid after PHC frequency updates, with the
+  phase error that was corrected.
+- `activity=output_phase_rearm` — the phase error exceeded a quarter period
+  and the output was restarted on the grid (backstop path).
+- `activity=output_late_push` — an arm ran late and the first edge was pushed
+  forward by whole periods to protect polarity.
+- `activity=output_stop` — the output was stopped.
+
+### Verbose rounding mode
+
+For the rounding of every individual output programming action — not just
+arms — enable `verbose_rounding`:
+
+```sh
+sudo make reload TGPIO0=input TGPIO1=output OUTPUT1_PERIOD_NS=1000000000 VERBOSE_ROUNDING=1
+```
+
+Or toggle it on a loaded module:
+
+```sh
+echo 1 | sudo tee /sys/module/tgpio_ptp_input/parameters/verbose_rounding
+```
+
+Every periodic-interval refresh, phase nudge, and software-programmed edge
+then writes one `output rounding` line with the requested value, the value
+actually programmed (read back through the clock conversion), and the
+difference:
+
+```text
+output rounding block=1 channel=1 event=interval_refresh piv_cycles=19199251 requested_half_ns=500000000 actual_half_ns=500000013 half_rounding_ns=13
+output rounding block=1 channel=1 event=phase_nudge requested_edge_ns=... programmed_edge_ns=... edge_rounding_ns=-9
+```
+
+Follow it live with:
+
+```sh
+sudo journalctl -k -f -g 'output rounding'
+```
+
+Note that with a tool like `phc2sys -R 8` adjusting frequency eight times per
+second, interval refreshes log at the same rate — this mode is for analysis
+sessions, not steady-state operation.
 
 For a quick frequency sanity check while an output is running:
 
