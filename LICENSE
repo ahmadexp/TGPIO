@@ -1,31 +1,52 @@
-BSD 2-Clause License
+TGPIO Non-Commercial License
 
-Copyright (c) 2026, Ahmad Byagowi
+Copyright (c) 2026, Ahmad Byagowi. All rights reserved.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
+1. Definitions
 
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
+   "Software" means this project: source code, scripts, documentation,
+   and any binaries built from them.
 
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
+   "Non-Commercial Use" means use for personal projects, academic study,
+   scientific research, teaching, evaluation, or hobby purposes, where the
+   Software is not used, directly or indirectly, to generate revenue,
+   provide paid services, or operate within a commercial product,
+   commercial service, or commercial environment.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+2. Grant
 
-Additional kernel module licensing note:
+   Permission is hereby granted, free of charge, to use, copy, modify, and
+   redistribute the Software for Non-Commercial Use only, provided that:
 
-Files that carry the SPDX expression "BSD-2-Clause OR GPL-2.0-only" may also
-be used under GPL-2.0-only. This is provided for Linux kernel module
-compatibility. The default project license remains BSD 2-Clause unless a file
-states otherwise.
+   a. this copyright notice and this license are retained in all copies
+      and substantial portions of the Software; and
+   b. redistributed modified versions are clearly marked as modified.
+
+3. Commercial Use
+
+   Any use of the Software other than Non-Commercial Use — including but
+   not limited to incorporation into commercial products or services,
+   deployment in production commercial environments, or paid consulting
+   built on the Software — requires the PRIOR WRITTEN PERMISSION of
+   Ahmad Byagowi. Contact: byagowi@turbalance.com.
+
+4. Linux Kernel Interface
+
+   The kernel module component declares MODULE_LICENSE("Dual BSD/GPL")
+   solely so the Linux kernel grants it access to licensed symbols when
+   built and loaded by an end user for Non-Commercial Use under this
+   license. This declaration does not extend the rights granted by this
+   license. Versions of this project published before this license took
+   effect remain available under the terms they carried at the time.
+
+5. No Warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+   FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE. THIS SOFTWARE POKES PLATFORM MMIO REGISTERS;
+   USE ONLY ON HARDWARE WHERE THE ADDRESSES ARE CONFIRMED, AT YOUR OWN
+   RISK.

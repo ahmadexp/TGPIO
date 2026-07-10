@@ -1,4 +1,5 @@
-/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* Licensed under the TGPIO Non-Commercial License (see LICENSE).
+ * Commercial use requires the prior written permission of Ahmad Byagowi. */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM tgpio
 
