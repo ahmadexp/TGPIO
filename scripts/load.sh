@@ -21,6 +21,7 @@ HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
 HARDWARE_PERIODIC_OUTPUT="${HARDWARE_PERIODIC_OUTPUT:-1}"
 ACTIVITY_LOG="${ACTIVITY_LOG:-0}"
 VERBOSE_ROUNDING="${VERBOSE_ROUNDING:-0}"
+VERBOSE="${VERBOSE:-0}"
 TDC="${TDC:-0}"
 TDC_START="${TDC_START:-0}"
 AUTO_POLARITY="${AUTO_POLARITY:-0}"
@@ -91,6 +92,7 @@ insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	hardware_periodic_output="${HARDWARE_PERIODIC_OUTPUT}" \
 	activity_log="${ACTIVITY_LOG}" \
 	verbose_rounding="${VERBOSE_ROUNDING}" \
+	verbose="${VERBOSE}" \
 	tdc="${TDC}" \
 	tdc_start="${TDC_START}" \
 	auto_polarity="${AUTO_POLARITY}" \

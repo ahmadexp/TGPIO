@@ -228,6 +228,7 @@ static bool hardware_timestamps = true;
 static bool hardware_periodic_output = true;
 static bool activity_log;
 static bool verbose_rounding;
+static bool verbose;
 static bool tdc;
 static unsigned int tdc_start;
 static bool auto_polarity;
@@ -315,6 +316,10 @@ module_param(verbose_rounding, bool, 0644);
 MODULE_PARM_DESC(verbose_rounding,
 		 "Log the ART-cycle rounding of every output programming action: each interval refresh, phase nudge, and software-programmed edge");
 
+module_param(verbose, bool, 0644);
+MODULE_PARM_DESC(verbose,
+		 "Log detail lines for every feature: input events and statistics, TDC pairing, PPS asserts, cross-timestamps, clock adjustments, output programming and rounding, one-shot, duty service, auto-polarity, and the watchdog (superset of activity_log and verbose_rounding)");
+
 module_param(tdc, bool, 0644);
 MODULE_PARM_DESC(tdc,
 		 "Time-to-digital converter mode: pair start and stop input captures into hardware-timestamped bipolar duration measurements (negative when stop precedes start)");
@@ -374,6 +379,25 @@ MODULE_PARM_DESC(output_start_delay_ns,
 module_param(output_phase_offset_ns, long, 0644);
 MODULE_PARM_DESC(output_phase_offset_ns,
 		 "Calibration offset applied to programmed output edges in ns; positive moves the physical edge later. Writable at runtime; a running output converges within one or two frequency updates");
+
+/*
+ * verbose is a superset switch: it enables the activity log, the rounding
+ * log, and additional per-feature detail lines gated on tgpio_log_verbose().
+ */
+static bool tgpio_log_activity_on(void)
+{
+	return READ_ONCE(activity_log) || READ_ONCE(verbose);
+}
+
+static bool tgpio_log_rounding_on(void)
+{
+	return READ_ONCE(verbose_rounding) || READ_ONCE(verbose);
+}
+
+static bool tgpio_log_verbose(void)
+{
+	return READ_ONCE(verbose);
+}
 
 /* PHC time = anchor_ns + (ART cycles since anchor_art) scaled by scaled_ppm. */
 struct tgpio_phc_params {
@@ -1941,7 +1965,7 @@ static void tgpio_log_input_event(struct tgpio_mmio_block *mmio_block,
 				  u64 event_delta, u64 art_cycles,
 				  s64 timestamp_ns, bool fallback)
 {
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	pr_info("activity=input_event block=%u channel=%u edge=%s event_count=%llu event_delta=%llu art=%llu timestamp_ns=%lld clock_mode=%s timestamp_mode=%s hardware_timestamps=%c fallback=%c\n",
@@ -2118,14 +2142,24 @@ static void tgpio_auto_polarity_check(struct tgpio_device *dev,
 	dist_half = r > period / 2 ? r - period / 2 : period / 2 - r;
 
 	if (dist_grid < period / 8) {
+		if (tgpio_log_verbose())
+			pr_info("verbose=auto_polarity block=%u verdict=on_grid dist_grid_ns=%llu dist_half_ns=%llu\n",
+				out->index, dist_grid, dist_half);
 		dev->autopol_streak = 0;
 		return;
 	}
 	if (dist_half >= period / 8) {
+		if (tgpio_log_verbose())
+			pr_info("verbose=auto_polarity block=%u verdict=ambiguous dist_grid_ns=%llu dist_half_ns=%llu\n",
+				out->index, dist_grid, dist_half);
 		dev->autopol_streak = 0; /* ambiguous sample */
 		return;
 	}
 
+	if (tgpio_log_verbose())
+		pr_info("verbose=auto_polarity block=%u verdict=half_slot dist_grid_ns=%llu dist_half_ns=%llu streak=%u\n",
+			out->index, dist_grid, dist_half,
+			dev->autopol_streak + 1);
 	if (++dev->autopol_streak < 3)
 		return;
 	dev->autopol_streak = 0;
@@ -2159,6 +2193,10 @@ static void tgpio_pps_emit(struct tgpio_mmio_block *mmio_block,
 	ktime_get_raw_ts64(&pet.ts_raw);
 #endif
 	pps_event(mmio_block->pps, &pet, PPS_CAPTUREASSERT, NULL);
+
+	if (tgpio_log_verbose())
+		pr_info("verbose=pps_assert block=%u art=%llu realtime_ns=%llu\n",
+			mmio_block->index, art_cycles, real.val);
 }
 
 static void tgpio_pps_register(struct tgpio_device *dev)
@@ -2255,6 +2293,15 @@ static void tgpio_input_stats_update(struct tgpio_device *dev,
 	}
 	mmio_block->input_prev_art = art_cycles;
 	mmio_block->input_have_prev = true;
+
+	if (tgpio_log_verbose())
+		pr_info("verbose=input_stats block=%u art=%llu phase_ns=%lld interval_last_ns=%lld interval_min_ns=%lld interval_max_ns=%lld interval_n=%llu\n",
+			mmio_block->index, art_cycles,
+			mmio_block->input_phase_ns,
+			mmio_block->interval_last_ns,
+			mmio_block->interval_min_ns,
+			mmio_block->interval_max_ns,
+			mmio_block->interval_count);
 }
 
 static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
@@ -2279,6 +2326,12 @@ static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 		dev->tdc_lost += event_delta - 1;
 
 	if (!dev->tdc_pending || dev->tdc_pending_block == block) {
+		if (tgpio_log_verbose())
+			pr_info("verbose=tdc_arm block=%u role=%s art=%llu rearm=%d\n",
+				block, block == start_block ? "start" : "stop",
+				art_cycles,
+				dev->tdc_pending &&
+					dev->tdc_pending_block == block);
 		dev->tdc_pending = true;
 		dev->tdc_pending_block = block;
 		dev->tdc_pending_art = art_cycles;
@@ -2310,7 +2363,7 @@ static void tgpio_tdc_capture(struct tgpio_device *dev, unsigned int block,
 		dev->tdc_max_ns = signed_ns;
 	dev->tdc_sum_ns += signed_ns;
 
-	if (READ_ONCE(activity_log))
+	if (tgpio_log_activity_on())
 		pr_info("activity=tdc_measure start_art=%llu stop_art=%llu cycles=%s%llu duration_ns=%lld\n",
 			start_art, stop_art, negative ? "-" : "", cycles,
 			signed_ns);
@@ -2394,7 +2447,7 @@ static int tgpio_config_input(struct tgpio_device *dev, unsigned int channel,
 	atomic_set(&mmio_block->input_desired,
 		   on ? tgpio_input_desired(TGPIO_CAPTURE_ON, edge_bits) :
 			tgpio_input_desired(TGPIO_CAPTURE_OFF, 0));
-	if (READ_ONCE(activity_log))
+	if (tgpio_log_activity_on())
 		pr_info("activity=input_config block=%u channel=%u state=%s edge=%s flags=%#x\n",
 			mmio_block->index, channel, on ? "on" : "off",
 			on ? tgpio_edge_bits_name(edge_bits) : "none", flags);
@@ -2420,7 +2473,7 @@ static void tgpio_log_rounding_interval(struct tgpio_device *dev,
 	struct tgpio_ns_result actual;
 	unsigned int channel;
 
-	if (!READ_ONCE(verbose_rounding))
+	if (!tgpio_log_rounding_on())
 		return;
 
 	actual = tgpio_clock_art_cycles_to_delta_ns(dev, piv_cycles);
@@ -2449,7 +2502,7 @@ static void tgpio_log_rounding_edge(struct tgpio_device *dev,
 	struct tgpio_s64_result back;
 	unsigned int channel;
 
-	if (!READ_ONCE(verbose_rounding) || !tgpio_clock_uses_model())
+	if (!tgpio_log_rounding_on() || !tgpio_clock_uses_model())
 		return;
 	if (compare_art > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES)
 		return;
@@ -2948,7 +3001,7 @@ static void tgpio_log_output_arm(struct tgpio_device *dev,
 	unsigned int channel;
 	s64 start_adjust_ns;
 
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
@@ -3004,7 +3057,7 @@ static void tgpio_log_output_hw_periodic(struct tgpio_device *dev,
 	s64 period_error_ns = 0;
 	u64 actual_period_ns = 0;
 
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	actual_half = tgpio_clock_art_cycles_to_delta_ns(dev, half_period_art);
@@ -3031,7 +3084,7 @@ static void tgpio_log_output_phase_rearm(struct tgpio_device *dev,
 {
 	unsigned int channel;
 
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
@@ -3046,7 +3099,7 @@ static void tgpio_log_output_phase_nudge(struct tgpio_device *dev,
 {
 	unsigned int channel;
 
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
@@ -3061,7 +3114,7 @@ static void tgpio_log_output_late_push(struct tgpio_device *dev,
 {
 	unsigned int channel;
 
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
@@ -3077,7 +3130,7 @@ static void tgpio_log_output_edge(struct tgpio_device *dev,
 {
 	unsigned int channel;
 
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
@@ -3092,7 +3145,7 @@ static void tgpio_log_output_stop(struct tgpio_device *dev,
 {
 	unsigned int channel;
 
-	if (!READ_ONCE(activity_log))
+	if (!tgpio_log_activity_on())
 		return;
 
 	channel = tgpio_channel_for_mmio_block(dev, mmio_block->index,
@@ -3350,6 +3403,15 @@ static void tgpio_hw_duty_service(struct tgpio_device *dev,
 		    upper_32_bits(mmio_block->output_hw_piv)) {
 		tgpio_write_piv(mmio_block, piv.val);
 		mmio_block->output_hw_piv = piv.val;
+		if (tgpio_log_verbose())
+			pr_info("verbose=duty_service block=%u level=%s next_half_ns=%llu piv_cycles=%llu\n",
+				mmio_block->index,
+				mmio_block->output_hw_flop_high ? "high" :
+								  "low",
+				mmio_block->output_hw_flop_high ?
+					mmio_block->output_low_time_ns :
+					mmio_block->output_high_time_ns,
+				piv.val);
 	}
 
 	compv = tgpio_read_compv(mmio_block);
@@ -3845,12 +3907,19 @@ static void tgpio_watchdog_work_fn(struct work_struct *work)
 
 		compv = tgpio_read_compv(mmio_block);
 		if (compv != mmio_block->wd_last_compv) {
+			if (tgpio_log_verbose())
+				pr_info("verbose=watchdog block=%u state=advancing compv=%llu\n",
+					i, compv);
 			mmio_block->wd_last_compv = compv;
 			mmio_block->wd_stalls = 0;
 			continue;
 		}
 
 		mmio_block->wd_stalls++;
+		if (tgpio_log_verbose())
+			pr_info("verbose=watchdog block=%u state=stuck compv=%llu stalled_s=%u\n",
+				i, compv,
+				mmio_block->wd_stalls * TGPIO_WATCHDOG_PERIOD_S);
 		period_s = div64_u64(2 * mmio_block->output_high_time_ns,
 				     NSEC_PER_SEC);
 		if ((u64)mmio_block->wd_stalls * TGPIO_WATCHDOG_PERIOD_S >
@@ -3906,6 +3975,12 @@ static int tgpio_ptp_getcrosststamp(struct ptp_clock_info *ptp,
 	tgpio_xtstamp_realtime(*cts) = real;
 	cts->sys_monoraw =
 		ns_to_ktime(raw_before + (raw_after - raw_before) / 2);
+
+	if (tgpio_log_verbose())
+		pr_info_ratelimited("verbose=crosststamp device_ns=%lld realtime_ns=%lld monoraw_ns=%lld\n",
+				    ktime_to_ns(cts->device),
+				    ktime_to_ns(real),
+				    ktime_to_ns(cts->sys_monoraw));
 	return 0;
 }
 
@@ -4047,6 +4122,9 @@ static int tgpio_ptp_settime64(struct ptp_clock_info *ptp,
 	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
 
 	trace_tgpio_phc_step(old.status < 0 ? 0 : old.val, ns);
+	if (tgpio_log_verbose())
+		pr_info("verbose=clock_settime old_ns=%lld new_ns=%lld anchor_art=%llu\n",
+			old.status < 0 ? 0 : old.val, ns, art.val);
 	tgpio_resync_outputs_after_phc_step(dev);
 	return 0;
 }
@@ -4066,6 +4144,9 @@ static int tgpio_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
 
 	if (clock_mode == TGPIO_CLOCK_REALTIME) {
 		ret = tgpio_realtime_adjtime(delta);
+		if (tgpio_log_verbose())
+			pr_info("verbose=clock_adjtime mode=realtime delta_ns=%lld ret=%d\n",
+				delta, ret);
 		if (!ret)
 			tgpio_resync_outputs_after_phc_step(dev);
 		return ret;
@@ -4092,6 +4173,9 @@ static int tgpio_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
 	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
 
 	trace_tgpio_phc_step(now.val, adjusted.val);
+	if (tgpio_log_verbose())
+		pr_info("verbose=clock_adjtime mode=phc delta_ns=%lld old_ns=%lld new_ns=%lld\n",
+			delta, now.val, adjusted.val);
 	tgpio_resync_outputs_after_phc_step(dev);
 	return 0;
 }
@@ -4111,6 +4195,9 @@ static int tgpio_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
 
 	if (clock_mode == TGPIO_CLOCK_REALTIME) {
 		ret = tgpio_realtime_adjfine(scaled_ppm);
+		if (tgpio_log_verbose())
+			pr_info("verbose=clock_adjfine mode=realtime scaled_ppm=%ld ret=%d\n",
+				scaled_ppm, ret);
 		if (!ret && hardware_periodic_output)
 			tgpio_update_outputs_after_phc_freq(dev);
 		return ret;
@@ -4134,6 +4221,9 @@ static int tgpio_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
 					 dev->phc.base_art_hz, scaled_ppm);
 	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
 
+	if (tgpio_log_verbose())
+		pr_info("verbose=clock_adjfine mode=phc scaled_ppm=%ld ppb=%lld base_art_hz=%llu\n",
+			scaled_ppm, ppb, dev->phc.base_art_hz);
 	if (hardware_periodic_output)
 		tgpio_update_outputs_after_phc_freq(dev);
 	return 0;
@@ -4568,7 +4658,9 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 	seq_printf(m, "clock_mode: %s\n", tgpio_clock_mode_name(clock_mode));
 	seq_printf(m, "art_frequency: %lu Hz\n", art_frequency);
 	seq_printf(m, "activity_log: %s\n",
-		   READ_ONCE(activity_log) ? "on" : "off");
+		   tgpio_log_activity_on() ? "on" : "off");
+	seq_printf(m, "verbose: %s\n",
+		   tgpio_log_verbose() ? "on" : "off");
 	seq_printf(m, "art_base_clock: %s\n",
 		   timekeeping_clocksource_has_base(CSID_X86_ART) ? "present" :
 								    "absent");
@@ -4739,6 +4831,8 @@ static void tgpio_oneshot_stop_work_fn(struct work_struct *work)
 		work, struct tgpio_mmio_block, oneshot_stop_work.work);
 
 	tgpio_disable_output(mmio_block);
+	if (tgpio_log_verbose())
+		pr_info("verbose=oneshot_done block=%u\n", mmio_block->index);
 }
 
 /*
