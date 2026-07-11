@@ -396,7 +396,7 @@ MODULE_PARM_DESC(art_calibration,
 
 module_param(rate_trim_ppb, long, 0644);
 MODULE_PARM_DESC(rate_trim_ppb,
-		 "Operator rate calibration for the art clock mode in parts per billion, applied on top of the calibrated base rate (runtime-writable; measure the output drift on an instrument and write the negated slope)");
+		 "Operator rate calibration for the art clock mode in parts per billion, applied on top of the calibrated base rate (runtime-writable): measure the output TIE slope on an instrument and write it in ns/s with its sign");
 
 /*
  * verbose is a superset switch: it enables the activity log, the rounding
@@ -1788,6 +1788,14 @@ static s64 tgpio_art_cal_anchor_real;
 static u64 tgpio_art_cal_base;
 static s64 tgpio_art_cal_ema_mppb;
 
+/* Ring of recent (ART, CLOCK_REALTIME) pairs: rate windows span several
+ * refine periods, dividing the sampling noise by the window length.
+ */
+#define TGPIO_ART_CAL_RING 8
+static struct { u64 art; s64 real; } tgpio_art_cal_ring[TGPIO_ART_CAL_RING];
+static unsigned int tgpio_art_cal_ring_head;
+static unsigned int tgpio_art_cal_ring_count;
+
 struct tgpio_art_raw_sample {
 	enum tgpio_status status;
 	u64 art;
@@ -1822,12 +1830,17 @@ static struct tgpio_art_raw_sample tgpio_sample_art_raw(void)
 	return (struct tgpio_art_raw_sample){ .status = TGPIO_E_NODEV };
 }
 
-/* Same bracketing pattern against CLOCK_REALTIME. */
+/* Same bracketing pattern against CLOCK_REALTIME, keeping the tightest
+ * pairing seen: rate estimation divides the bracket skew by the window
+ * length, so every nanosecond here matters.
+ */
 static struct tgpio_art_raw_sample tgpio_sample_art_real(void)
 {
+	struct tgpio_art_raw_sample best = { .status = TGPIO_E_NODEV };
+	s64 best_bracket = S64_MAX;
 	unsigned int i;
 
-	for (i = 0; i < 8; i++) {
+	for (i = 0; i < 16; i++) {
 		s64 before = ktime_get_real_ns();
 		struct tgpio_u64_result art = tgpio_get_current_art();
 		s64 after = ktime_get_real_ns();
@@ -1836,14 +1849,18 @@ static struct tgpio_art_raw_sample tgpio_sample_art_real(void)
 			return (struct tgpio_art_raw_sample){
 				.status = art.status
 			};
-		if (after - before <= 2000 || i == 7)
-			return (struct tgpio_art_raw_sample){
+		if (after - before < best_bracket) {
+			best_bracket = after - before;
+			best = (struct tgpio_art_raw_sample){
 				.status = TGPIO_OK,
 				.art = art.val,
 				.raw = before + (after - before) / 2,
 			};
+		}
+		if (best_bracket <= 300)
+			break;
 	}
-	return (struct tgpio_art_raw_sample){ .status = TGPIO_E_NODEV };
+	return best;
 }
 
 
@@ -1852,12 +1869,19 @@ static bool tgpio_art_cal_realtime(void)
 	return !strcmp(art_calibration_param, "realtime");
 }
 
-/* Operator rate trim, expressed in the model's scaled-ppm units. */
+/*
+ * Operator rate trim in the model's scaled-ppm units. The stored
+ * scaled_ppm field lowers the effective cycles-per-second when positive
+ * (adjfine semantics: positive input speeds the clock and is stored
+ * negated), so a positive trim — which must raise the effective rate —
+ * enters negated. Sign convention for the operator: write the observed
+ * output TIE slope in ns/s (equal to ppb), with its sign.
+ */
 static long tgpio_rate_trim_scaled_ppm(void)
 {
 	long ppb = clamp_t(long, READ_ONCE(rate_trim_ppb), -500000L, 500000L);
 
-	return (long)div_s64((s64)ppb * 65536, 1000);
+	return (long)div_s64((s64)-ppb * 65536, 1000);
 }
 
 /*
@@ -1966,16 +1990,34 @@ static void tgpio_art_refine_work_fn(struct work_struct *work)
 		struct tgpio_art_raw_sample real = tgpio_sample_art_real();
 		u64 delta_art, expect;
 		s64 delta_real, err_cycles, err_mppb;
+		unsigned int oldest;
 
-		if (real.status < 0 ||
-		    real.raw <= tgpio_art_cal_anchor_real ||
-		    real.art <= tgpio_art_cal_anchor_art)
+		if (real.status < 0)
 			goto resched;
-		delta_art = real.art - tgpio_art_cal_anchor_art;
-		delta_real = real.raw - tgpio_art_cal_anchor_real;
-		tgpio_art_cal_anchor_art = real.art;
-		tgpio_art_cal_anchor_real = real.raw;
-		if (delta_real < 5 * (s64)NSEC_PER_SEC)
+		if (!tgpio_art_cal_ring_count) {
+			tgpio_art_cal_ring[0].art = real.art;
+			tgpio_art_cal_ring[0].real = real.raw;
+			tgpio_art_cal_ring_head = 1 % TGPIO_ART_CAL_RING;
+			tgpio_art_cal_ring_count = 1;
+			goto resched;
+		}
+		oldest = tgpio_art_cal_ring_count < TGPIO_ART_CAL_RING ?
+				 0 :
+				 tgpio_art_cal_ring_head;
+		if (real.raw <= tgpio_art_cal_ring[oldest].real ||
+		    real.art <= tgpio_art_cal_ring[oldest].art) {
+			tgpio_art_cal_ring_count = 0;
+			goto resched;
+		}
+		delta_art = real.art - tgpio_art_cal_ring[oldest].art;
+		delta_real = real.raw - tgpio_art_cal_ring[oldest].real;
+		tgpio_art_cal_ring[tgpio_art_cal_ring_head].art = real.art;
+		tgpio_art_cal_ring[tgpio_art_cal_ring_head].real = real.raw;
+		tgpio_art_cal_ring_head =
+			(tgpio_art_cal_ring_head + 1) % TGPIO_ART_CAL_RING;
+		if (tgpio_art_cal_ring_count < TGPIO_ART_CAL_RING)
+			tgpio_art_cal_ring_count++;
+		if (delta_real < 25 * (s64)NSEC_PER_SEC)
 			goto resched;
 		base = tgpio_art_cal_base;
 		expect = mul_u64_u64_div_u64((u64)delta_real, base,
@@ -1987,12 +2029,15 @@ static void tgpio_art_refine_work_fn(struct work_struct *work)
 			NSEC_PER_SEC * 1000ULL, delta_art);
 		if (err_cycles < 0)
 			err_mppb = -err_mppb;
-		if (err_mppb > 100000000LL || err_mppb < -100000000LL)
+		if (err_mppb > 100000000LL || err_mppb < -100000000LL) {
+			tgpio_art_cal_ring_count = 0;
 			goto resched;
+		}
 		/* EMA, alpha = 0.3 */
 		tgpio_art_cal_ema_mppb +=
 			div_s64((err_mppb - tgpio_art_cal_ema_mppb) * 3, 10);
-		scaled = (long)div_s64(tgpio_art_cal_ema_mppb * 65536,
+		/* positive rate error -> raise the rate -> negative scaled */
+		scaled = (long)div_s64(-tgpio_art_cal_ema_mppb * 65536,
 				       1000000) +
 			 tgpio_rate_trim_scaled_ppm();
 		goto apply;
@@ -3062,6 +3107,37 @@ tgpio_hw_periodic_phase_get(struct tgpio_device *dev,
 
 	div64_u64_rem((u64)(pending.val - grid_start_ns), half_ns, &rem);
 	err_ns = rem >= half_ns - rem ? (s64)rem - (s64)half_ns : (s64)rem;
+
+	if (!tgpio_clock_uses_model()) {
+		/*
+		 * Realtime mode: the pending time above went through a
+		 * bracketed ART/realtime pairing, whose sampling noise would
+		 * enter every nudge. The noisy value is only used to pick
+		 * the nearest grid edge; the error is then recomputed
+		 * exactly in the ART domain through the timekeeper's
+		 * realtime-to-ART conversion of that edge.
+		 */
+		struct tgpio_u64_result target = tgpio_clock_ns_to_compare_art(
+			dev, pending.val - err_ns);
+		struct tgpio_ns_result exact;
+		u64 pending_art = compv + TGPIO_ART_HW_DELAY_CYCLES;
+		bool late;
+
+		if (target.status == TGPIO_OK) {
+			late = pending_art >= target.val;
+			exact = tgpio_clock_art_cycles_to_delta_ns(
+				dev, late ? pending_art - target.val :
+					    target.val - pending_art);
+			if (exact.status == TGPIO_OK && exact.ns <= S64_MAX) {
+				s64 e = late ? (s64)exact.ns : -(s64)exact.ns;
+
+				pending = tgpio_ok_s64(pending.val - err_ns +
+						       e);
+				if (pending.status == TGPIO_OK)
+					err_ns = e;
+			}
+		}
+	}
 
 	return (struct tgpio_hw_phase){
 		.status = TGPIO_OK,
