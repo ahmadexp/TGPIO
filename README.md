@@ -397,6 +397,20 @@ reference channel itself on the same instrument (69 ns) — with residual
 drift `+0.002 ns/s`; the differenced spread (87 ns) is then dominated by
 the reference channel's own trigger noise.
 
+### PCIe PTM on the master PHC
+
+With a PTM-capable master (validated against an OCP TimeCard running the
+LitePCIe-with-PTM gateware, whose driver then serves
+`PTP_SYS_OFFSET_PRECISE` via hardware PTM dialogs), phc2sys gets
+hardware-paired readings on **both** legs — TGPIO via ART cross-timestamps,
+the master via PCIe PTM — and the software-bracketed read asymmetry that
+required the microsecond-scale `output_phase_offset_ns` calibration is
+structurally removed. Measured over a 22-minute common-view window with
+zero calibration applied: smoothed output phase wander of ~10 ns RMS
+against the shared atomic reference and drift below 0.01 ns/s. Run phc2sys
+under a supervisor: PTM dialog timeouts occasionally surface as a fatal
+clock-read error.
+
 Calibration recipe (verified sign convention): measure the mean output
 time error against your reference, then **add it** to the current offset —
 
