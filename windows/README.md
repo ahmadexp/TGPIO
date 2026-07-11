@@ -24,6 +24,13 @@ selection, capture/event-count readout, ART/TSC crosststamps.
 Not yet ported: asymmetric duty (needs the per-edge PIV service loop),
 one-shot pulses, phase nudging/servo, auto-polarity, PPS, discipline.
 
+## Host-side tests
+
+`tests/host/run.sh` compiles `hw.c`/`art.c` against stub kernel headers and
+unit-tests the programming sequences (arm ordering, flop parity, late-arm
+guard, PM-paused rewrites) on any machine with a C compiler -- no WDK
+needed. Run it after touching `hw.c`.
+
 ## Build
 
 On the Windows test machine, install Visual Studio (Community is fine) with
