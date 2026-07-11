@@ -247,6 +247,8 @@ static unsigned long output1_duty_ns;
 static unsigned long output_start_delay_ns;
 static long output_phase_offset_ns;
 static unsigned long output_phase_tolerance_ns = TGPIO_OUTPUT_PHASE_NUDGE_NS;
+static char art_calibration_param[12] = "raw";
+static long rate_trim_ppb;
 
 module_param(addr0, ulong, 0444);
 MODULE_PARM_DESC(addr0, "MMIO base for first TGPIO block");
@@ -386,6 +388,15 @@ MODULE_PARM_DESC(output_phase_offset_ns,
 module_param(output_phase_tolerance_ns, ulong, 0644);
 MODULE_PARM_DESC(output_phase_tolerance_ns,
 		 "Output phase dead-band in ns: nudge the pending edge back onto the grid once the tracked phase error exceeds this (default 200; floor one ART cycle)");
+
+module_param_string(art_calibration, art_calibration_param,
+		    sizeof(art_calibration_param), 0444);
+MODULE_PARM_DESC(art_calibration,
+		 "ART clock mode rate source: raw (default; same-crystal, keeps the crystal's ppm error) or realtime (kernel timekeeper rate, as accurate as the system clock discipline; refined periodically)");
+
+module_param(rate_trim_ppb, long, 0644);
+MODULE_PARM_DESC(rate_trim_ppb,
+		 "Operator rate calibration for the art clock mode in parts per billion, applied on top of the calibrated base rate (runtime-writable; measure the output drift on an instrument and write the negated slope)");
 
 /*
  * verbose is a superset switch: it enables the activity log, the rounding
@@ -1657,6 +1668,36 @@ tgpio_clock_art_cycles_to_delta_ns(struct tgpio_device *dev, u64 cycles)
 	return tgpio_art_cycles_to_realtime_delta_ns(cycles);
 }
 
+/*
+ * Absolute ART value to clock nanoseconds in every clock mode. Realtime
+ * mode has no clock model, so a nearby ART value converts through the
+ * current instant: the delta to now via the timekeeper rate, added to
+ * CLOCK_REALTIME.
+ */
+static struct tgpio_s64_result tgpio_clock_art_to_ns(struct tgpio_device *dev,
+						     u64 art)
+{
+	struct tgpio_u64_result art_now;
+	struct tgpio_ns_result delta;
+	s64 real_now;
+
+	if (tgpio_clock_uses_model())
+		return tgpio_clock_phc_art_to_ns(dev, art);
+
+	art_now = tgpio_get_current_art();
+	real_now = ktime_get_real_ns();
+	if (art_now.status < 0)
+		return tgpio_err_s64(art_now.status);
+
+	delta = tgpio_clock_art_cycles_to_delta_ns(
+		dev, art >= art_now.val ? art - art_now.val :
+					  art_now.val - art);
+	if (delta.status < 0 || delta.ns > S64_MAX)
+		return tgpio_err_s64(TGPIO_E_RANGE);
+	return tgpio_add_s64(real_now, art >= art_now.val ? (s64)delta.ns :
+							    -(s64)delta.ns);
+}
+
 static struct tgpio_output_quantization
 tgpio_output_quantization_err(enum tgpio_status status)
 {
@@ -1778,75 +1819,148 @@ static struct tgpio_art_raw_sample tgpio_sample_art_raw(void)
 	return (struct tgpio_art_raw_sample){ .status = TGPIO_E_NODEV };
 }
 
+static bool tgpio_art_cal_realtime(void)
+{
+	return !strcmp(art_calibration_param, "realtime");
+}
+
+/* Operator rate trim, expressed in the model's scaled-ppm units. */
+static long tgpio_rate_trim_scaled_ppm(void)
+{
+	long ppb = clamp_t(long, READ_ONCE(rate_trim_ppb), -500000L, 500000L);
+
+	return (long)div_s64((s64)ppb * 65536, 1000);
+}
+
 /*
  * ART clock mode: the same anchor-plus-rate model as PHC mode, but anchored
- * to CLOCK_MONOTONIC_RAW and never adjusted (settime/adjtime/adjfine return
- * EOPNOTSUPP). The rate is calibrated against the raw clock over a short
- * window at load and refined once over a longer baseline shortly after.
+ * to CLOCK_MONOTONIC_RAW and never adjusted through the PTP interface
+ * (settime/adjtime/adjfine return EOPNOTSUPP). The base rate comes from one
+ * of two calibration sources: "raw" measures ART against
+ * CLOCK_MONOTONIC_RAW — but both derive from the same crystal, so this only
+ * recovers the nominal ratio and the output keeps the crystal's ppm-scale
+ * error against true seconds; "realtime" takes the kernel timekeeper's
+ * realtime rate, which is as accurate as the system clock discipline
+ * (sub-ppb with a hardware-disciplined system clock). On top of either, the
+ * runtime rate_trim_ppb parameter applies an operator calibration measured
+ * on an external instrument. Rate updates are phase-continuous.
  */
 static int tgpio_art_init_clock(struct tgpio_device *dev)
 {
 	struct tgpio_art_raw_sample first;
 	struct tgpio_art_raw_sample second;
+	struct tgpio_u64_result rt;
 	u64 base;
 
 	first = tgpio_sample_art_raw();
 	if (first.status < 0)
 		return -ENODEV;
-	msleep(250);
-	second = tgpio_sample_art_raw();
-	if (second.status < 0)
-		return -ENODEV;
-	if (second.raw <= first.raw || second.art <= first.art ||
-	    second.art - first.art > div64_u64(U64_MAX, NSEC_PER_SEC))
-		return -ENODEV;
 
-	base = div64_u64((second.art - first.art) * NSEC_PER_SEC,
-			 (u64)(second.raw - first.raw));
-	if (!base)
-		return -ENODEV;
+	if (tgpio_art_cal_realtime()) {
+		rt = tgpio_realtime_delta_to_art_cycles(NSEC_PER_SEC);
+		if (rt.status < 0 || !rt.val)
+			return -ENODEV;
+		base = rt.val;
+	} else {
+		msleep(250);
+		second = tgpio_sample_art_raw();
+		if (second.status < 0)
+			return -ENODEV;
+		if (second.raw <= first.raw || second.art <= first.art ||
+		    second.art - first.art > div64_u64(U64_MAX, NSEC_PER_SEC))
+			return -ENODEV;
+		base = div64_u64((second.art - first.art) * NSEC_PER_SEC,
+				 (u64)(second.raw - first.raw));
+		if (!base)
+			return -ENODEV;
+		first = second;
+	}
 
 	tgpio_art_cal_anchor_art = first.art;
 	tgpio_art_cal_anchor_raw = first.raw;
-	dev->phc = tgpio_phc_params_make(second.art, second.raw, base, 0);
-	pr_info("ART clock anchored to CLOCK_MONOTONIC_RAW; base rate %llu cycles/s (refining)\n",
-		base);
+	dev->phc = tgpio_phc_params_make(first.art, first.raw, base,
+					 tgpio_rate_trim_scaled_ppm());
+	pr_info("ART clock anchored to CLOCK_MONOTONIC_RAW; base rate %llu cycles/s (%s calibration, refining)\n",
+		base, art_calibration_param);
 	schedule_delayed_work(&dev->art_refine_work, 10 * HZ);
 	return 0;
 }
 
+#define TGPIO_ART_REFINE_PERIOD_S 30
+#define TGPIO_REALTIME_RESYNC_S 1
+
 /*
- * One-shot rate refinement: recompute cycles-per-raw-second over the full
- * baseline since load (much tighter than the 250 ms init window allows) and
- * re-anchor onto the current raw time. Running outputs pick up the refined
- * rate through the normal frequency-update path.
+ * Periodic clock-model maintenance. In ART mode, re-derive the base rate
+ * from the selected calibration source (raw: full baseline since load;
+ * realtime: current timekeeper rate), fold in the operator rate trim, apply
+ * the new rate phase-continuously, and refresh running outputs. In realtime
+ * mode there is no model, but the system clock is steered behind the
+ * driver's back (chrony, adjtimex), so running hardware outputs are
+ * refreshed against the current timekeeper conversion every second.
  */
 static void tgpio_art_refine_work_fn(struct work_struct *work)
 {
 	struct tgpio_device *dev = container_of(
 		work, struct tgpio_device, art_refine_work.work);
 	struct tgpio_art_raw_sample now;
+	struct tgpio_s64_result cur_ns;
+	struct tgpio_u64_result rt;
 	unsigned long flags;
+	long scaled;
 	u64 base;
 
-	now = tgpio_sample_art_raw();
-	if (now.status < 0 || now.raw <= tgpio_art_cal_anchor_raw ||
-	    now.art <= tgpio_art_cal_anchor_art ||
-	    now.art - tgpio_art_cal_anchor_art >
-		    div64_u64(U64_MAX, NSEC_PER_SEC))
+	if (!tgpio_clock_uses_model()) {
+		tgpio_update_outputs_after_phc_freq(dev);
+		schedule_delayed_work(&dev->art_refine_work,
+				      TGPIO_REALTIME_RESYNC_S * HZ);
 		return;
+	}
 
-	base = div64_u64((now.art - tgpio_art_cal_anchor_art) * NSEC_PER_SEC,
-			 (u64)(now.raw - tgpio_art_cal_anchor_raw));
-	if (!base)
-		return;
+	now = tgpio_sample_art_raw();
+	if (now.status < 0)
+		goto resched;
+
+	if (tgpio_art_cal_realtime()) {
+		rt = tgpio_realtime_delta_to_art_cycles(NSEC_PER_SEC);
+		if (rt.status < 0 || !rt.val)
+			goto resched;
+		base = rt.val;
+	} else {
+		if (now.raw <= tgpio_art_cal_anchor_raw ||
+		    now.art <= tgpio_art_cal_anchor_art ||
+		    now.art - tgpio_art_cal_anchor_art >
+			    div64_u64(U64_MAX, NSEC_PER_SEC))
+			goto resched;
+		base = div64_u64((now.art - tgpio_art_cal_anchor_art) *
+					 NSEC_PER_SEC,
+				 (u64)(now.raw - tgpio_art_cal_anchor_raw));
+		if (!base)
+			goto resched;
+	}
+	scaled = tgpio_rate_trim_scaled_ppm();
 
 	write_seqlock_irqsave(&dev->phc_seqlock, flags);
-	dev->phc = tgpio_phc_params_make(now.art, now.raw, base, 0);
-	write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
+	if (dev->phc.base_art_hz != base ||
+	    dev->phc.scaled_ppm != scaled) {
+		cur_ns = tgpio_phc_art_to_ns(dev->phc, now.art);
+		if (cur_ns.status < 0) {
+			write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
+			goto resched;
+		}
+		dev->phc = tgpio_phc_params_make(now.art, cur_ns.val, base,
+						 scaled);
+		write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
+		if (tgpio_log_verbose())
+			pr_info("verbose=art_refine base_art_hz=%llu trim_scaled_ppm=%ld\n",
+				base, scaled);
+		tgpio_update_outputs_after_phc_freq(dev);
+	} else {
+		write_sequnlock_irqrestore(&dev->phc_seqlock, flags);
+	}
 
-	pr_info("ART clock base rate refined to %llu cycles/s\n", base);
-	tgpio_update_outputs_after_phc_freq(dev);
+resched:
+	schedule_delayed_work(&dev->art_refine_work,
+			      TGPIO_ART_REFINE_PERIOD_S * HZ);
 }
 
 struct tgpio_crosststamp_ctx {
@@ -2850,16 +2964,15 @@ tgpio_hw_periodic_phase_get(struct tgpio_device *dev,
 	u64 rem;
 	s64 err_ns;
 
-	if (!tgpio_clock_uses_model() || !half_ns ||
-	    half_ns > (u64)S64_MAX / 4 || grid_start_ns < 0)
+	if (!half_ns || half_ns > (u64)S64_MAX / 4 || grid_start_ns < 0)
 		return (struct tgpio_hw_phase){ .status = TGPIO_E_INVAL };
 
 	compv = tgpio_read_compv(mmio_block);
 	if (!compv || compv > U64_MAX - TGPIO_ART_HW_DELAY_CYCLES)
 		return (struct tgpio_hw_phase){ .status = TGPIO_E_RANGE };
 
-	pending = tgpio_clock_phc_art_to_ns(dev,
-					    compv + TGPIO_ART_HW_DELAY_CYCLES);
+	pending = tgpio_clock_art_to_ns(dev,
+					compv + TGPIO_ART_HW_DELAY_CYCLES);
 	now = tgpio_clock_now_ns(dev);
 	if (pending.status < 0 || now.status < 0 || now.val < 0)
 		return (struct tgpio_hw_phase){ .status = TGPIO_E_RANGE };
@@ -3758,6 +3871,12 @@ static int tgpio_start_persistent_operations(struct tgpio_device *dev)
 {
 	unsigned int i;
 	int ret;
+
+	if (strcmp(art_calibration_param, "raw") &&
+	    strcmp(art_calibration_param, "realtime")) {
+		pr_err("art_calibration must be raw or realtime\n");
+		return -EINVAL;
+	}
 
 	if (READ_ONCE(tdc)) {
 		unsigned int start_block = READ_ONCE(tdc_start);
@@ -5131,6 +5250,13 @@ static int __init tgpio_input_init(void)
 	ret = tgpio_start_persistent_operations(tgpio);
 	if (ret)
 		goto err_cleanup;
+
+	/* Realtime mode: the system clock is steered behind the driver's
+	 * back, so running outputs need periodic re-sync to its grid.
+	 */
+	if (clock_mode == TGPIO_CLOCK_REALTIME)
+		schedule_delayed_work(&tgpio->art_refine_work,
+				      TGPIO_REALTIME_RESYNC_S * HZ);
 
 	pr_info("loaded with tgpio0=%s tgpio1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s hardware_periodic_output=%c activity_log=%c\n",
 		tgpio_mode_name(tgpio->mmio_blocks[0].mode),

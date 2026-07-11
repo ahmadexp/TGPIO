@@ -37,6 +37,8 @@ OUTPUT1_DUTY_NS ?= 0
 OUTPUT_START_DELAY_NS ?= 0
 OUTPUT_PHASE_OFFSET_NS ?= 0
 OUTPUT_PHASE_TOLERANCE_NS ?= 200
+ART_CALIBRATION ?= raw
+RATE_TRIM_PPB ?= 0
 
 LOAD_ENV := ADDR0="$(ADDR0)" ADDR1="$(ADDR1)" MMIO_SIZE="$(MMIO_SIZE)"
 LOAD_ENV += USE_SECOND="$(USE_SECOND)" TGPIO0="$(TGPIO0)" TGPIO1="$(TGPIO1)"
@@ -60,6 +62,7 @@ LOAD_ENV += OUTPUT1_DUTY_NS="$(OUTPUT1_DUTY_NS)"
 LOAD_ENV += OUTPUT_START_DELAY_NS="$(OUTPUT_START_DELAY_NS)"
 LOAD_ENV += OUTPUT_PHASE_OFFSET_NS="$(OUTPUT_PHASE_OFFSET_NS)"
 LOAD_ENV += OUTPUT_PHASE_TOLERANCE_NS="$(OUTPUT_PHASE_TOLERANCE_NS)"
+LOAD_ENV += ART_CALIBRATION="$(ART_CALIBRATION)" RATE_TRIM_PPB="$(RATE_TRIM_PPB)"
 
 .PHONY: all clean help load reload unload status install persist uninstall save-config tui
 
@@ -101,6 +104,13 @@ help:
 	@echo "                       realtime | art (raw ART nanoseconds, debug)"
 	@echo "  ART_FREQUENCY=$(ART_FREQUENCY)"
 	@echo "                       0 = auto/calibrated; set Hz only to override"
+	@echo "  ART_CALIBRATION=$(ART_CALIBRATION)  art mode rate source: raw = same-crystal"
+	@echo "                       (keeps the crystal ppm error) | realtime ="
+	@echo "                       kernel timekeeper rate (as accurate as the"
+	@echo "                       system clock discipline; refined every 30 s)"
+	@echo "  RATE_TRIM_PPB=$(RATE_TRIM_PPB)        Operator rate calibration for art mode in"
+	@echo "                       parts per billion (runtime-writable):"
+	@echo "                       measure output drift, write the negated slope"
 	@echo
 	@echo "Output generation:"
 	@echo "  OUTPUT0_PERIOD_NS=$(OUTPUT0_PERIOD_NS) OUTPUT1_PERIOD_NS=$(OUTPUT1_PERIOD_NS)"

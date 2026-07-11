@@ -37,6 +37,7 @@ RUNTIME_VALUE_PARAMS = [
     ("output_phase_tolerance_ns", "Phase nudge dead-band (ns)"),
     ("tdc_start", "TDC start block (0 or 1)"),
     ("poll_ms", "Input poll interval (ms)"),
+    ("rate_trim_ppb", "ART-mode rate trim (ppb)"),
 ]
 
 # Load-time options fed to scripts/load.sh through the environment.

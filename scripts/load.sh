@@ -38,6 +38,8 @@ OUTPUT1_DUTY_NS="${OUTPUT1_DUTY_NS:-0}"
 OUTPUT_START_DELAY_NS="${OUTPUT_START_DELAY_NS:-0}"
 OUTPUT_PHASE_OFFSET_NS="${OUTPUT_PHASE_OFFSET_NS:-0}"
 OUTPUT_PHASE_TOLERANCE_NS="${OUTPUT_PHASE_TOLERANCE_NS:-200}"
+ART_CALIBRATION="${ART_CALIBRATION:-raw}"
+RATE_TRIM_PPB="${RATE_TRIM_PPB:-0}"
 
 tgpio_input_loaded()
 {
@@ -106,6 +108,8 @@ insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	output1_duty_ns="${OUTPUT1_DUTY_NS}" \
 	output_start_delay_ns="${OUTPUT_START_DELAY_NS}" \
 	output_phase_offset_ns="${OUTPUT_PHASE_OFFSET_NS}" \
-	output_phase_tolerance_ns="${OUTPUT_PHASE_TOLERANCE_NS}"
+	output_phase_tolerance_ns="${OUTPUT_PHASE_TOLERANCE_NS}" \
+	art_calibration="${ART_CALIBRATION}" \
+	rate_trim_ppb="${RATE_TRIM_PPB}"
 
 "${SCRIPT_DIR}/status.sh"
