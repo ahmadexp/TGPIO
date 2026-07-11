@@ -1781,9 +1781,12 @@ static int tgpio_phc_init_clock(struct tgpio_device *dev)
 	return 0;
 }
 
-/* Calibration anchor for the ART clock mode rate refinement. */
+/* Calibration anchors for the ART clock mode rate refinement. */
 static u64 tgpio_art_cal_anchor_art;
 static s64 tgpio_art_cal_anchor_raw;
+static s64 tgpio_art_cal_anchor_real;
+static u64 tgpio_art_cal_base;
+static s64 tgpio_art_cal_ema_mppb;
 
 struct tgpio_art_raw_sample {
 	enum tgpio_status status;
@@ -1818,6 +1821,31 @@ static struct tgpio_art_raw_sample tgpio_sample_art_raw(void)
 	}
 	return (struct tgpio_art_raw_sample){ .status = TGPIO_E_NODEV };
 }
+
+/* Same bracketing pattern against CLOCK_REALTIME. */
+static struct tgpio_art_raw_sample tgpio_sample_art_real(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 8; i++) {
+		s64 before = ktime_get_real_ns();
+		struct tgpio_u64_result art = tgpio_get_current_art();
+		s64 after = ktime_get_real_ns();
+
+		if (art.status < 0)
+			return (struct tgpio_art_raw_sample){
+				.status = art.status
+			};
+		if (after - before <= 2000 || i == 7)
+			return (struct tgpio_art_raw_sample){
+				.status = TGPIO_OK,
+				.art = art.val,
+				.raw = before + (after - before) / 2,
+			};
+	}
+	return (struct tgpio_art_raw_sample){ .status = TGPIO_E_NODEV };
+}
+
 
 static bool tgpio_art_cal_realtime(void)
 {
@@ -1857,10 +1885,14 @@ static int tgpio_art_init_clock(struct tgpio_device *dev)
 		return -ENODEV;
 
 	if (tgpio_art_cal_realtime()) {
+		struct tgpio_art_raw_sample real = tgpio_sample_art_real();
+
 		rt = tgpio_realtime_delta_to_art_cycles(NSEC_PER_SEC);
-		if (rt.status < 0 || !rt.val)
+		if (rt.status < 0 || !rt.val || real.status < 0)
 			return -ENODEV;
 		base = rt.val;
+		tgpio_art_cal_anchor_real = real.raw;
+		first.art = real.art;
 	} else {
 		msleep(250);
 		second = tgpio_sample_art_raw();
@@ -1878,6 +1910,7 @@ static int tgpio_art_init_clock(struct tgpio_device *dev)
 
 	tgpio_art_cal_anchor_art = first.art;
 	tgpio_art_cal_anchor_raw = first.raw;
+	tgpio_art_cal_base = base;
 	dev->phc = tgpio_phc_params_make(first.art, first.raw, base,
 					 tgpio_rate_trim_scaled_ppm());
 	pr_info("ART clock anchored to CLOCK_MONOTONIC_RAW; base rate %llu cycles/s (%s calibration, refining)\n",
@@ -1904,7 +1937,6 @@ static void tgpio_art_refine_work_fn(struct work_struct *work)
 		work, struct tgpio_device, art_refine_work.work);
 	struct tgpio_art_raw_sample now;
 	struct tgpio_s64_result cur_ns;
-	struct tgpio_u64_result rt;
 	unsigned long flags;
 	long scaled;
 	u64 base;
@@ -1921,10 +1953,49 @@ static void tgpio_art_refine_work_fn(struct work_struct *work)
 		goto resched;
 
 	if (tgpio_art_cal_realtime()) {
-		rt = tgpio_realtime_delta_to_art_cycles(NSEC_PER_SEC);
-		if (rt.status < 0 || !rt.val)
+		/*
+		 * Sliding-window rate tracking against CLOCK_REALTIME: each
+		 * cycle measures the rate error over the last interval only
+		 * (a whole-baseline average would lag the crystal's thermal
+		 * drift by half the baseline age forever) and folds it into
+		 * an exponential moving average that filters the reference
+		 * servo's wiggle and the one-cycle quantization. A large
+		 * apparent error means the system clock stepped: drop the
+		 * sample and restart the window.
+		 */
+		struct tgpio_art_raw_sample real = tgpio_sample_art_real();
+		u64 delta_art, expect;
+		s64 delta_real, err_cycles, err_mppb;
+
+		if (real.status < 0 ||
+		    real.raw <= tgpio_art_cal_anchor_real ||
+		    real.art <= tgpio_art_cal_anchor_art)
 			goto resched;
-		base = rt.val;
+		delta_art = real.art - tgpio_art_cal_anchor_art;
+		delta_real = real.raw - tgpio_art_cal_anchor_real;
+		tgpio_art_cal_anchor_art = real.art;
+		tgpio_art_cal_anchor_real = real.raw;
+		if (delta_real < 5 * (s64)NSEC_PER_SEC)
+			goto resched;
+		base = tgpio_art_cal_base;
+		expect = mul_u64_u64_div_u64((u64)delta_real, base,
+					     NSEC_PER_SEC);
+		err_cycles = (s64)(delta_art - expect);
+		/* window rate error in milli-ppb */
+		err_mppb = (s64)mul_u64_u64_div_u64(
+			(u64)(err_cycles < 0 ? -err_cycles : err_cycles),
+			NSEC_PER_SEC * 1000ULL, delta_art);
+		if (err_cycles < 0)
+			err_mppb = -err_mppb;
+		if (err_mppb > 100000000LL || err_mppb < -100000000LL)
+			goto resched;
+		/* EMA, alpha = 0.3 */
+		tgpio_art_cal_ema_mppb +=
+			div_s64((err_mppb - tgpio_art_cal_ema_mppb) * 3, 10);
+		scaled = (long)div_s64(tgpio_art_cal_ema_mppb * 65536,
+				       1000000) +
+			 tgpio_rate_trim_scaled_ppm();
+		goto apply;
 	} else {
 		if (now.raw <= tgpio_art_cal_anchor_raw ||
 		    now.art <= tgpio_art_cal_anchor_art ||
@@ -1939,6 +2010,7 @@ static void tgpio_art_refine_work_fn(struct work_struct *work)
 	}
 	scaled = tgpio_rate_trim_scaled_ppm();
 
+apply:
 	write_seqlock_irqsave(&dev->phc_seqlock, flags);
 	if (dev->phc.base_art_hz != base ||
 	    dev->phc.scaled_ppm != scaled) {
