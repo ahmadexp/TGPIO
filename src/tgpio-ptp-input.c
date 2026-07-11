@@ -124,6 +124,8 @@ tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (20 * NSEC_PER_MSEC)
 #define TGPIO_OUTPUT_PHASE_NUDGE_NS 200
+/* Nudging below one ART cycle (~26 ns) just chases quantization. */
+#define TGPIO_OUTPUT_PHASE_NUDGE_MIN_NS 26
 #define TGPIO_HW_DUTY_MIN_HALF_NS (50 * NSEC_PER_MSEC)
 #define TGPIO_HW_DUTY_SERVICE_DELAY_NS (10 * NSEC_PER_MSEC)
 #define TGPIO_CPUID_ART_LEAF	  0x15
@@ -244,6 +246,7 @@ static unsigned long output0_duty_ns;
 static unsigned long output1_duty_ns;
 static unsigned long output_start_delay_ns;
 static long output_phase_offset_ns;
+static unsigned long output_phase_tolerance_ns = TGPIO_OUTPUT_PHASE_NUDGE_NS;
 
 module_param(addr0, ulong, 0444);
 MODULE_PARM_DESC(addr0, "MMIO base for first TGPIO block");
@@ -379,6 +382,10 @@ MODULE_PARM_DESC(output_start_delay_ns,
 module_param(output_phase_offset_ns, long, 0644);
 MODULE_PARM_DESC(output_phase_offset_ns,
 		 "Calibration offset applied to programmed output edges in ns; positive moves the physical edge later. Writable at runtime; a running output converges within one or two frequency updates");
+
+module_param(output_phase_tolerance_ns, ulong, 0644);
+MODULE_PARM_DESC(output_phase_tolerance_ns,
+		 "Output phase dead-band in ns: nudge the pending edge back onto the grid once the tracked phase error exceeds this (default 200; floor one ART cycle)");
 
 /*
  * verbose is a superset switch: it enables the activity log, the rounding
@@ -3242,6 +3249,7 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 	struct tgpio_hw_phase phase;
 	struct tgpio_u64_result nudged_art;
 	s64 aligned_ns;
+	s64 tolerance;
 
 	/* Checkpoint the level flop before changing PIV: the fold math needs
 	 * the PIV that was live while the counted edges fired.
@@ -3275,8 +3283,9 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 		return;
 	}
 
-	if (phase.error_ns >= -TGPIO_OUTPUT_PHASE_NUDGE_NS &&
-	    phase.error_ns <= TGPIO_OUTPUT_PHASE_NUDGE_NS)
+	tolerance = max_t(s64, READ_ONCE(output_phase_tolerance_ns),
+			  TGPIO_OUTPUT_PHASE_NUDGE_MIN_NS);
+	if (phase.error_ns >= -tolerance && phase.error_ns <= tolerance)
 		return;
 	if (!phase.nudge_safe)
 		return; /* edge imminent; retry on the next frequency update */
