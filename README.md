@@ -372,10 +372,41 @@ time error on both TGPIO outputs and the atomic reference simultaneously
 internal timebase). Both disciplined outputs measured `-42 +/- 103 ns`
 over 15 minutes and `-66 +/- 83 ns` over a follow-up window, drift below
 0.25 ns/s; repeated windows show the PCIe-path systematic wandering on a
-±60 ns scale over tens of minutes, which bounds how finely
-`output_phase_offset_ns` is worth trimming. The two simultaneously
-disciplined outputs tracked each other at `-1.4 +/- 0.1 ns` — a second
-synchronized hardware output costs nothing in accuracy.
+±60 ns scale over tens of minutes (and it re-randomizes on every module
+reload), which bounds how finely `output_phase_offset_ns` is worth
+trimming. The two simultaneously disciplined outputs tracked each other at
+`-1.4 +/- 0.1 ns` — a second synchronized hardware output costs nothing in
+accuracy.
+
+### Tightening precision
+
+Two knobs measurably narrow the phase envelope:
+
+- `OUTPUT_PHASE_TOLERANCE_NS` (runtime-writable as
+  `output_phase_tolerance_ns`, default 200, floor 26 = one ART cycle) —
+  the dead-band before the driver nudges the pending edge back onto the
+  grid. The default lets the output wander ±200 ns against its own PHC;
+  `30` holds the driver-reported grid error within ±30 ns at the cost of
+  more (verified glitch-free) in-flight compare rewrites.
+- `phc2sys -N 15` — deeper per-sample read filtering rejects PCIe latency
+  outliers better than the `-N 10` baseline.
+
+Measured effect on the Sentinel (tolerance 30 + `-N 15`): each output's
+absolute spread dropped from 78 ns to **47 ns** — quieter than the atomic
+reference channel itself on the same instrument (69 ns) — with residual
+drift `+0.002 ns/s`; the differenced spread (87 ns) is then dominated by
+the reference channel's own trigger noise.
+
+Calibration recipe (verified sign convention): measure the mean output
+time error against your reference, then **add it** to the current offset —
+
+```sh
+# measured mean TE of -267 ns, current offset -2309:
+echo -2576 | sudo tee /sys/module/tgpio_ptp_input/parameters/output_phase_offset_ns
+```
+
+One step converges; re-measure to confirm. Remember the PCIe-path
+systematic re-randomizes on module reload, so recalibrate after one.
 
 In both cases: PTP device numbering can change across reboots, so resolve
 devices with `cat /sys/class/ptp/ptp*/clock_name` ("Intel TGPIO" is this

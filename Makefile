@@ -36,6 +36,7 @@ OUTPUT0_DUTY_NS ?= 0
 OUTPUT1_DUTY_NS ?= 0
 OUTPUT_START_DELAY_NS ?= 0
 OUTPUT_PHASE_OFFSET_NS ?= 0
+OUTPUT_PHASE_TOLERANCE_NS ?= 200
 
 LOAD_ENV := ADDR0="$(ADDR0)" ADDR1="$(ADDR1)" MMIO_SIZE="$(MMIO_SIZE)"
 LOAD_ENV += USE_SECOND="$(USE_SECOND)" TGPIO0="$(TGPIO0)" TGPIO1="$(TGPIO1)"
@@ -58,6 +59,7 @@ LOAD_ENV += OUTPUT0_DUTY_NS="$(OUTPUT0_DUTY_NS)"
 LOAD_ENV += OUTPUT1_DUTY_NS="$(OUTPUT1_DUTY_NS)"
 LOAD_ENV += OUTPUT_START_DELAY_NS="$(OUTPUT_START_DELAY_NS)"
 LOAD_ENV += OUTPUT_PHASE_OFFSET_NS="$(OUTPUT_PHASE_OFFSET_NS)"
+LOAD_ENV += OUTPUT_PHASE_TOLERANCE_NS="$(OUTPUT_PHASE_TOLERANCE_NS)"
 
 .PHONY: all clean help load reload unload status install persist uninstall save-config tui
 
@@ -112,6 +114,10 @@ help:
 	@echo "  OUTPUT_PHASE_OFFSET_NS=$(OUTPUT_PHASE_OFFSET_NS)"
 	@echo "                       Calibration shift of every output edge in ns"
 	@echo "                       (runtime-writable via /sys/module parameters)"
+	@echo "  OUTPUT_PHASE_TOLERANCE_NS=$(OUTPUT_PHASE_TOLERANCE_NS)"
+	@echo "                       Phase dead-band: nudge the pending edge"
+	@echo "                       once drift exceeds this (ns; floor 26 ="
+	@echo "                       one ART cycle; runtime-writable)"
 	@echo "  OUTPUT_START_DELAY_NS=$(OUTPUT_START_DELAY_NS)"
 	@echo "                       Delay from load to the first persisted edge"
 	@echo "  OUTPUT_POLARITY=$(OUTPUT_POLARITY)      normal | inverted"

@@ -34,6 +34,7 @@ RUNTIME_BOOL_PARAMS = [
 ]
 RUNTIME_VALUE_PARAMS = [
     ("output_phase_offset_ns", "Output phase offset (ns)"),
+    ("output_phase_tolerance_ns", "Phase nudge dead-band (ns)"),
     ("tdc_start", "TDC start block (0 or 1)"),
     ("poll_ms", "Input poll interval (ms)"),
 ]
