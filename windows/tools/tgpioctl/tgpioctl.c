@@ -27,7 +27,7 @@
 #include <string.h>
 #include <intrin.h>
 
-#include "..\..\include\tgpio_ioctl.h"
+#include "../../include/tgpio_ioctl.h"
 
 #define HNS_PER_SEC 10000000ull /* 100 ns units per second */
 

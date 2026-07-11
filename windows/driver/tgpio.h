@@ -17,7 +17,7 @@
 #include <wdf.h>
 #include <intrin.h>
 
-#include "..\include\tgpio_ioctl.h"
+#include "../include/tgpio_ioctl.h"
 
 #ifndef MAXULONG64
 #define MAXULONG64 0xffffffffffffffffull
