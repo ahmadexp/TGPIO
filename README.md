@@ -38,6 +38,33 @@ Full documentation lives in this README and the
 [project wiki](https://github.com/ahmadexp/TGPIO/wiki); run `make help` for
 every load-time option with examples.
 
+## Measured Results
+
+Both disciplined 1 PPS outputs on a Calnex Sentinel, differenced per second
+against the atomic reference channel (calibrated phc2sys path):
+
+<p align="center">
+  <img src="assets/results-commonview-te.png" alt="Disciplined outputs vs atomic PPS" width="760">
+</p>
+
+The two outputs, driven from the same disciplined clock model, are
+electrically indistinguishable — a constant 1.4 ns cable-length skew with
+0.07 ns standard deviation:
+
+<p align="center">
+  <img src="assets/results-dual-output-skew.png" alt="Output-to-output skew" width="520">
+</p>
+
+With PCIe PTM enabled on the master card (hardware-paired readings on both
+legs of the phc2sys comparison), a 22-minute run with **zero calibration**
+holds ~10 ns RMS smoothed phase wander and drift below 0.01 ns/s — the
+instrument display below shows the master's PPS (flat trace) and the TGPIO
+output over 1.4 ks:
+
+<p align="center">
+  <img src="assets/results-sentinel-ptm-run.png" alt="PTM-era run on the Sentinel" width="760">
+</p>
+
 ## Pre Req
 
 ```
