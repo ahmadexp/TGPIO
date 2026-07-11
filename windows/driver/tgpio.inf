@@ -1,0 +1,82 @@
+; Licensed under the TGPIO Non-Commercial License (see LICENSE).
+; Intel Time-Aware GPIO -- Windows KMDF driver.
+; Copyright (c) 2026 Ahmad Byagowi
+;
+; Root-enumerated install (no ACPI dependency, matching the Linux driver):
+;   pnputil /add-driver tgpio.inf /install
+;   devcon install tgpio.inf ROOT\TGPIO
+;
+; MMIO bases are configurable under the service Parameters key; defaults
+; below match the Linux module parameters (0xFE001210 / 0xFE001310).
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 07/11/2026,1.0.0.0
+CatalogFile = tgpio.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+tgpio.sys = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceName% = TGPIO_Device, ROOT\TGPIO
+
+[TGPIO_Device.NT]
+CopyFiles = TGPIO_CopyFiles
+
+[TGPIO_CopyFiles]
+tgpio.sys
+
+[TGPIO_Device.NT.HW]
+AddReg = TGPIO_Device.NT.AddReg
+
+[TGPIO_Device.NT.AddReg]
+HKR, , DeviceCharacteristics, 0x10001, 0x0100 ; FILE_DEVICE_SECURE_OPEN
+; Administrators and SYSTEM only: this device maps raw MMIO.
+HKR, , Security, , "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[TGPIO_Device.NT.Services]
+AddService = tgpio, %SPSVCINST_ASSOCSERVICE%, TGPIO_Service_Inst
+
+[TGPIO_Service_Inst]
+DisplayName   = %ServiceName%
+ServiceType   = 1 ; SERVICE_KERNEL_DRIVER
+StartType     = 3 ; SERVICE_DEMAND_START
+ErrorControl  = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\tgpio.sys
+AddReg        = TGPIO_Params.AddReg
+
+[TGPIO_Params.AddReg]
+HKR, Parameters, Addr0Low,  0x10001, 0xFE001210
+HKR, Parameters, Addr0High, 0x10001, 0x00000000
+HKR, Parameters, Addr1Low,  0x10001, 0xFE001310
+HKR, Parameters, Addr1High, 0x10001, 0x00000000
+HKR, Parameters, MmioSize,  0x10001, 0x00000038
+HKR, Parameters, UseSecond, 0x10001, 0x00000001
+; Crystal Hz when CPUID leaf 15h ECX is zero (0 = use CPUID).
+HKR, Parameters, ArtFrequencyHz, 0x10001, 0x00000000
+
+[TGPIO_Device.NT.Wdf]
+KmdfService = tgpio, TGPIO_wdfsect
+
+[TGPIO_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderName = "Ahmad Byagowi"
+DeviceName   = "Intel Time-Aware GPIO (TGPIO)"
+ServiceName  = "TGPIO Driver"
+DiskName     = "TGPIO Installation Disk"

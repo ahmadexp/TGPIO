@@ -129,12 +129,24 @@ discipline a PHC from external timestamps, such as `ts2phc`.
 - `phc` (default): an adjustable ART-backed PHC. `settime`, `adjtime`, and
   `adjfine` work, so tools like `ts2phc` and `phc2sys` can discipline it.
 - `art`: the same ART-backed clock model, but anchored to
-  `CLOCK_MONOTONIC_RAW` and deliberately **not adjustable** — `settime`,
-  `adjtime`, and `adjfine` all return `EOPNOTSUPP` and `max_adj` is 0. The
-  cycles-per-second rate is calibrated against the raw clock over 250 ms at
-  load and refined once over a 10 s baseline shortly after (watch for the
-  `ART clock base rate refined` kernel log line). Use this when you want an
-  undisciplined hardware-paced timebase that nothing can steer.
+  `CLOCK_MONOTONIC_RAW` and deliberately **not adjustable** through the PTP
+  interface — `settime`, `adjtime`, and `adjfine` all return `EOPNOTSUPP`
+  and `max_adj` is 0. Use this when you want a hardware-paced timebase that
+  no PTP client can steer. Its rate accuracy depends on the calibration
+  source, `ART_CALIBRATION`:
+  - `raw` (default): measured against `CLOCK_MONOTONIC_RAW` — but that
+    clock derives from the same crystal as ART, so this only recovers the
+    nominal ratio and the output keeps the crystal's ppm error against
+    true seconds (measured: −41 µs/s on the validated platform).
+  - `realtime`: tracks the kernel timekeeper's rate with a sliding-window
+    estimator refined every 30 s — as accurate as the system clock
+    discipline (measured: tens of ppb, i.e. tens of ns/s, with a
+    PTM-disciplined system clock). The phase still free-runs; only the
+    rate is calibrated, and updates are phase-continuous.
+
+  On top of either source, the runtime-writable `rate_trim_ppb` applies an
+  operator calibration: measure the output TIE slope on an instrument and
+  write it in ns/s with its sign.
 - `realtime`: the PTP clock returns Linux `CLOCK_REALTIME` directly, and
   conversions go through the kernel timekeeper per call. This mode is
   **adjustable, and the adjustments steer the system clock itself**:
@@ -158,6 +170,19 @@ discipline a PHC from external timestamps, such as `ts2phc`.
   (A free-running lab PPS whose pulse is not on the UTC second will
   eventually conflict with NTP sources; with a GNSS-aligned PPS this
   configuration holds.)
+
+  Realtime-mode **outputs** are re-synced to the realtime grid once per
+  second (the system clock is steered behind the driver's back by
+  chrony/adjtimex, so the driver corrects the free-running hardware
+  waveform with the same glitch-free nudge machinery as PHC mode; the
+  phase readback converts exactly through the timekeeper, with no
+  sampling noise). Measured with `phc2sys -s <PTM master> -c
+  CLOCK_REALTIME` disciplining the system clock: the outputs track the
+  atomic-aligned realtime grid within roughly ±100–150 ns. The residual
+  band is the system clock's own discipline wander — pair realtime mode
+  with a *smooth* servo (1 Hz PI phc2sys or chrony's PHC refclock); an
+  aggressive `-R 8` linreg servo dithers the clock frequency and widens
+  the band to ±250 ns.
 
 In realtime clock mode, `TIMESTAMP_MODE=realtime` reports hardware input
 captures in the same `CLOCK_REALTIME` timebase returned by the PTP clock. Use
