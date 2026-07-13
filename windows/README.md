@@ -95,6 +95,11 @@ tgpioctl invert 0             :: fix polarity if the waveform is inverted
 tgpioctl stop 0
 ```
 
+Successful Windows bring-up with both TGPIO MMIO blocks detected and block 0
+armed for a UTC-aligned 1 Hz periodic output:
+
+![TGPIO running on Windows](../assets/windows-tgpioctl-success.png)
+
 ## Bring-up test plan
 
 1. `tgpioctl info` -- sanity: ART frequency matches the Linux DUT
