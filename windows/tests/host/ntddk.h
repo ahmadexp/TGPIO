@@ -6,9 +6,14 @@
 #include <stdio.h>
 #include <stddef.h>
 
-typedef unsigned long ULONG;
+/* Match the LLP64 widths used by the Windows compiler when testing on LP64. */
+#ifndef _MSC_VER
+#define __int32 int
+#define __int64 long long
+#endif
+typedef uint32_t ULONG;
 typedef unsigned char UCHAR, BOOLEAN, KIRQL;
-typedef long NTSTATUS;
+typedef int32_t NTSTATUS;
 typedef void VOID;
 typedef void *PVOID;
 typedef const wchar_t *PCWSTR;

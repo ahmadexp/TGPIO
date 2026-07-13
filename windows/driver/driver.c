@@ -66,6 +66,7 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 	unsigned __int64 addr1 = TGPIO_DEFAULT_ADDR1;
 	ULONG mmio_size = TGPIO_DEFAULT_MMIO_SIZE;
 	ULONG use_second = 1;
+	ULONG art_frequency_override = 0;
 	NTSTATUS status;
 
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes,
@@ -98,9 +99,10 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 		use_second = tgpio_reg_read_ulong(params_key, L"UseSecond",
 						  use_second);
 		/* Crystal frequency when CPUID 15h leaves ECX zero. */
-		dev->art_frequency_hz = tgpio_reg_read_ulong(
-			params_key, L"ArtFrequencyHz",
-			(ULONG)dev->art_frequency_hz);
+		art_frequency_override = tgpio_reg_read_ulong(
+			params_key, L"ArtFrequencyHz", 0);
+		if (art_frequency_override)
+			dev->art_frequency_hz = art_frequency_override;
 		WdfRegistryClose(params_key);
 	}
 	if (!dev->art_frequency_hz) {

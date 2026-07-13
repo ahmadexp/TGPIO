@@ -72,6 +72,10 @@
   <ItemGroup>
     <Inf Include="tgpio.inf" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Stage the linked driver beside the INF so Inf2Cat can validate it. -->
+    <FilesToPackage Include="$(TargetPath)" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
