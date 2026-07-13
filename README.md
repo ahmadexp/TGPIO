@@ -213,6 +213,23 @@ edge defaults.
 Before proceeding with Input and Output, make sure testptp is installed. If not, here is a repo:
 https://github.com/Time-Appliances-Project/Incubation-Projects/tree/master/Software/testptp
 
+## Companion Tool: ppstool
+
+[ppstool](https://github.com/ahmadexp/ppstool) is the companion tool for
+TGPIO. Use its command-line or terminal interface to inspect TGPIO PTP device
+status and capabilities, view and configure pin assignments, and read external
+timestamp events from TGPIO input pins. It can also configure and test periodic
+outputs.
+
+Typical status and input tests are:
+
+```sh
+sudo ppstool -d /dev/ptpX -c
+sudo ppstool -d /dev/ptpX -l
+sudo ppstool -d /dev/ptpX -i 0 -L 0,1
+sudo ppstool -d /dev/ptpX -i 0 -e -1
+```
+
 ## Python Control With PyPTM
 
 PyPTM is a companion Python library and CLI for TSC/PTP/TGPIO experiments:
