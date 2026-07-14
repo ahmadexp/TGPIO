@@ -65,9 +65,9 @@ Windows will warn that the driver is test-signed; accept. If `devcon` is
 not on PATH it lives in the WDK under `Tools\x64\devcon.exe`.
 
 After installation, Device Manager lists **Intel Time-Aware GPIO (TGPIO)**
-under **System devices**:
+under **System devices** and loads the custom icon bundled with the driver package:
 
-![TGPIO in Windows Device Manager](../assets/windows-device-manager-tgpio.png)
+![TGPIO custom icon in Windows Device Manager](../assets/windows-device-manager-tgpio.png)
 
 To change MMIO addresses, edit
 `HKLM\SYSTEM\CurrentControlSet\Services\tgpio\Parameters`

@@ -70,11 +70,18 @@
     <ClInclude Include="..\include\tgpio_ioctl.h" />
   </ItemGroup>
   <ItemGroup>
-    <Inf Include="tgpio.inf" />
+    <Inf Include="tgpio.inf">
+      <!-- Keep upgrades monotonic across midnight; automatic StampInf time
+           versions can otherwise sort below the package already installed. -->
+      <DateStamp>07/14/2026</DateStamp>
+      <TimeStamp>18.0.0.1</TimeStamp>
+    </Inf>
+    <None Include="tgpio.ico" />
   </ItemGroup>
   <ItemGroup>
     <!-- Stage the linked driver beside the INF so Inf2Cat can validate it. -->
     <FilesToPackage Include="$(TargetPath)" />
+    <FilesToPackage Include="tgpio.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
