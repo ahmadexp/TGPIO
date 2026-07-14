@@ -14,7 +14,7 @@ Signature   = "$WINDOWS NT$"
 Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 07/11/2026,1.0.0.0
+DriverVer   = 07/14/2026,18.0.0.1
 CatalogFile = tgpio.cat
 PnpLockdown = 1
 
@@ -26,6 +26,7 @@ DefaultDestDir = 13
 
 [SourceDisksFiles]
 tgpio.sys = 1
+tgpio.ico = 1
 
 [Manufacturer]
 %ProviderName% = Standard,NT$ARCH$.10.0...16299
@@ -35,9 +36,16 @@ tgpio.sys = 1
 
 [TGPIO_Device.NT]
 CopyFiles = TGPIO_CopyFiles
+AddProperty = TGPIO_Device_Properties
 
 [TGPIO_CopyFiles]
 tgpio.sys
+tgpio.ico
+
+; Device Manager icon. Keep the standalone icon in the Driver Store so the
+; property remains valid without installing files outside the driver package.
+[TGPIO_Device_Properties]
+DeviceIcon,,,,"%13%\tgpio.ico"
 
 [TGPIO_Device.NT.HW]
 AddReg = TGPIO_Device.NT.AddReg
@@ -66,7 +74,8 @@ HKR, Parameters, Addr1High, 0x10001, 0x00000000
 HKR, Parameters, MmioSize,  0x10001, 0x00000038
 HKR, Parameters, UseSecond, 0x10001, 0x00000001
 ; Crystal Hz when CPUID leaf 15h ECX is zero (0 = use CPUID).
-HKR, Parameters, ArtFrequencyHz, 0x10001, 0x00000000
+; Preserve a machine-specific calibrated value when the package is updated.
+HKR, Parameters, ArtFrequencyHz, 0x10003, 0x00000000
 
 [TGPIO_Device.NT.Wdf]
 KmdfService = tgpio, TGPIO_wdfsect
