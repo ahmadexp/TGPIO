@@ -1,0 +1,91 @@
+% Architecture diagram for the TGPIO PTP driver (Figure 1).
+% Requires in the main preamble:
+%   \usepackage{tikz}
+%   \usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  band/.style={rounded corners=2pt, inner sep=5pt},
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=7mm,
+              inner xsep=3pt, inner ysep=2pt, fill=white},
+  kbox/.style={box, inner xsep=2pt},
+  pin/.style={draw, circle, minimum size=7mm, inner sep=0pt, font=\scriptsize, fill=white},
+  up/.style={-{Latex[length=2mm]}, thick},                 % input path (device -> user)
+  dn/.style={-{Latex[length=2mm]}, thick, densely dashed}, % output path (user -> device)
+  ck/.style={-{Latex[length=2mm]}, thick, densely dotted}, % ART timebase
+  lbl/.style={font=\scriptsize\itshape, inner sep=1pt},
+]
+
+% ---- Userspace and PTP interface ----
+\node[box, text width=30mm] (tools) at (0,0)
+  {\texttt{ts2phc} / \texttt{phc2sys} /\\ \texttt{testptp} / PyPTM};
+\node[kbox, text width=29mm] (ptpcore) at (4.0,-1.45)
+  {Linux PTP core\\ \scriptsize \texttt{/dev/ptpN} + callbacks};
+
+% ---- Kernel / driver layer ----
+\node[kbox, text width=27mm] (poll)   at (0,-2.65)
+  {Poll worker\\ \scriptsize event count + capture};
+\node[kbox, text width=29mm] (conv)   at (4.0,-2.65)
+  {Clock conversion\\ \scriptsize ART $\leftrightarrow$ active PTP clock};
+\node[kbox, text width=23mm] (phc)    at (7.7,-2.65)
+  {Clock modes\\ \scriptsize PHC / realtime / ART};
+\node[kbox, text width=29mm] (output) at (4.0,-3.95)
+  {Output control\\ \scriptsize scheduling + level mirror};
+
+% ---- Hardware layer ----
+\node[box, text width=27mm] (cap) at (0,-5.40)
+  {Capture regs\\ \scriptsize ART timestamp};
+\node[box, text width=27mm] (cmp) at (4.0,-5.40)
+  {Compare + interval\\ \scriptsize toggle engine};
+\node[box, text width=14mm] (art) at (7.7,-5.40)
+  {ART\\timebase};
+
+% ---- Physical pins ----
+\node[pin] (pinin)  at (0,-6.70)   {IN};
+\node[pin] (pinout) at (4.0,-6.70) {OUT};
+\node[lbl, left=1.5mm of pinin, align=right] {GPS PPS /\\ ext.\ edge};
+\node[lbl, right=1.5mm of pinout, align=left] {periodic\\ output};
+
+% ---- Background bands ----
+\coordinate (ubandleft) at (-1.75,0);
+\coordinate (kbandleft) at (-1.75,-2.65);
+\coordinate (kbandright) at (9.10,-2.65);
+\coordinate (hbandleft) at (-1.75,-5.40);
+\coordinate (hbandright) at (9.10,-5.40);
+\begin{scope}[on background layer]
+  \node[band, fill=black!5,  fit=(ubandleft)(tools)] (uband) {};
+  \node[band, fill=black!8,
+    fit=(kbandleft)(kbandright)(ptpcore)(poll)(conv)(phc)(output)] (kband) {};
+  \node[band, fill=black!12,
+    fit=(hbandleft)(hbandright)(cap)(cmp)(art)] (hband) {};
+\end{scope}
+\node[lbl, anchor=south west] at (uband.north west) {Userspace};
+\node[lbl, anchor=south east] at (kband.north east) {Linux PTP core + TGPIO driver};
+\node[lbl, anchor=south west] at (hband.north west) {TGPIO hardware};
+
+% ---- Input path (solid, upward): pin -> cap -> poll -> conversion -> PTP event -> tools
+\draw[up] (pinin) -- (cap);
+\draw[up] (cap) -- (poll);
+\draw[up] (poll) -- (conv);
+\draw[up] ([xshift=-3mm]conv.north) -- ([xshift=-3mm]ptpcore.south);
+\draw[up] ([yshift=2pt]ptpcore.west) -| ([xshift=3mm]tools.south);
+
+% ---- Output path (dashed, downward): request -> conversion/control -> compare -> pin
+\draw[dn] ([xshift=-3mm]tools.south) |- ([yshift=-2pt]ptpcore.west);
+\draw[dn] ([xshift=3mm]ptpcore.south) -- ([xshift=3mm]conv.north);
+\draw[dn] (conv.south) -- (output.north);
+\draw[dn] (output.south) -- (cmp.north);
+\draw[dn] (cmp) -- (pinout);
+
+% ---- Clock-model and ART support edges
+\draw[ck] (phc.west) -- (conv.east);
+\draw[ck] (art.north) -- (phc.south);
+\draw[ck] (art.west) -- (cmp.east);
+\draw[ck, preaction={draw=white, line width=3pt}]
+  ([xshift=-2mm]art.north) -- ++(0,0.45) -| ([xshift=4mm]cap.north);
+
+\end{tikzpicture}
+\caption{Architecture of the TGPIO PTP driver. Solid arrows trace external timestamp events; dashed arrows trace periodic-output requests and programming. Dotted links show clock-domain support: ART clocks capture and compare, while the selected PHC, realtime, or raw ART mode supplies timestamp conversion. Output control tracks the write-only hardware level and re-arms or nudges compare state when clock discipline changes.}
+\label{fig:architecture}
+\end{figure*}
