@@ -10,7 +10,8 @@
 \usepackage{siunitx}
 \newcommand{\ns}[1]{\qty{#1}{\nano\second}}
 
-\title{A Comprehensive Linux PTP Driver for Time-Aware GPIO}
+\title{A Customizable Linux PTP Driver\\
+for Time-Aware GPIO}
 
 \author{
 \IEEEauthorblockN{Ahmad Byagowi}
@@ -36,7 +37,7 @@ christopher.s.hall@intel.com}
 
 
 \pdfinfo{
-/Title (A Comprehensive Linux PTP Driver for Time-Aware GPIO)
+/Title (A Customizable Linux PTP Driver for Time-Aware GPIO)
 /Subject (IEEE ISPCS 2026)
 }
 
@@ -45,28 +46,36 @@ christopher.s.hall@intel.com}
 \maketitle
 
 \begin{abstract}
-Clock synchronization makes time comparable across systems, but measurement and control applications also need to bind that time to physical signals. Time-Aware GPIO (TGPIO) provides this timed-I/O boundary, timestamping external edges and generating scheduled outputs in the platform time domain. This paper presents a Linux driver that exposes Intel TGPIO blocks the firmware does not enumerate through the standard PTP hardware clock interface, so unmodified tools such as \texttt{ts2phc} and \texttt{phc2sys} can drive otherwise unreachable hardware. Its core contribution is a set of output semantics found through register-level experiments (inert single-shot compares, an unreadable write-only level flop, and glitch-free in-flight register rewrites) and a discipline built on them that steers a free-running output without waveform restarts while tracking polarity in software. Measured against the atomic-clock-referenced PPS of an OCP TimeCard, the disciplined 1~PPS output holds a \ns{+9} mean offset (\ns{64} standard deviation), comparable to the TimeCard's own PPS.
+Clock synchronization makes time comparable across systems, but measurement and control applications often need to bridge that time to physical signals. Time-Aware GPIO (TGPIO) provides this timed-I/O boundary, timestamping external edges and generating scheduled outputs in the platform time domain. This paper presents a Linux driver that exposes TGPIO blocks the firmware does not enumerate through the standard PTP hardware clock interface, so unmodified tools such as \texttt{ts2phc} and \texttt{phc2sys} can drive otherwise unreachable hardware. Its core contribution is a set of output semantics found through register-level experiments (inert single-shot compares, an unreadable write-only level flop, and glitch-free in-flight register rewrites) and a discipline built on them that steers a free-running output without waveform restarts while tracking polarity in software. Measured against the atomic-clock-referenced PPS of an OCP TimeCard, the disciplined 1~PPS output holds a \ns{+9} mean offset (\ns{64} standard deviation), comparable to the TimeCard's own PPS.
 \end{abstract}
 
 \begin{IEEEkeywords}
 ART, Device driver, PPS, Precision Time Protocol, PTP hardware clock, Time-Aware GPIO, timed I/O
 \end{IEEEkeywords}
 
-\section{Introduction}
+\section{Introduction}\label{sec:introduction}
 
-Precision timing systems often need more than a synchronized network clock. They also often need physical I/O that binds external events to a shared timebase such as timestamping a pulse-per-second (PPS) signal, measuring an instrument trigger, or generating a scheduled output transition for a device under test. Linux already provides a mature PTP hardware clock (PHC) abstraction for these ancillary functions, including external timestamp input and periodic output generation \cite{linux-ptp-docs}.
+Real time systems often need more than a synchronized network clock. They also often need physical I/O that binds external events to a shared timebase such as timestamping a pulse-per-second (PPS) signal, measuring an instrument trigger, or generating a scheduled output transition for a device under test. Linux already handles this class of ancillary work through its PTP hardware clock (PHC) abstraction, which covers both external timestamp input and periodic output generation \cite{linux-ptp-docs}.
 
-A concrete example is a small system that needs accurate time from a GPS receiver but has no network interface card PHC, FPGA, or dedicated timing card. If the receiver's PPS edge can be timestamped directly by TGPIO and exposed as a PHC external timestamp event, linuxptp tooling can discipline the TGPIO PHC and transfer that time to the system clock. This minimal-hardware path from an external time reference into Linux timekeeping also lets the operating system participate in the timing domain of a Time-Sensitive Networking (TSN) system \cite{ieee8021as}.
+Consider a system that must derive time from a GPS receiver without a network interface card PHC, FPGA, or dedicated timing card. TGPIO can timestamp the receiver's PPS edge directly and expose the capture as a PHC external timestamp event. Standard linuxptp tools can then discipline the TGPIO PHC and transfer the resulting time to the system clock. This provides a minimal-hardware path from an external reference into Linux timekeeping and allows the operating system to participate in the timing domain of a Time-Sensitive Networking (TSN) system \cite{ieee8021as}.
 
-Some commodity platforms contain timed I/O resources that firmware never enumerates, so standard platform-driver discovery fails even though the underlying MMIO register block is present and functional. The result is an awkward gap: hardware useful for synchronization and measurement that applications have no standard way to reach.
+There is a catch on some commodity platforms. The timed I/O resources are physically present and functional, but firmware never enumerates them, so the normal platform-driver discovery path finds nothing. The result is an awkward gap in that applications do not have a standarized way to reach hardware useful for synchronization and measurement.
 
-This paper describes an out-of-tree Linux driver that bridges that gap for Intel Time-Aware GPIO (TGPIO) blocks on a tested desktop platform. The driver maps known static MMIO resources, exposes each block as a PTP pin, and allows the block to be configured as an external timestamp input, a periodic output generator, or unused. It is designed around the Linux PHC interface rather than a custom userspace ABI, so existing tools such as \texttt{testptp} work unmodified; a companion Python library, PyPTM, wraps the same public PTP character-device interface for scripted experiments \cite{pyptm-repo}.
+This paper describes an out-of-tree Linux driver that closes that gap for Intel Time-Aware GPIO (TGPIO). It maps the known static MMIO resources, presents each block as a PTP pin, and lets that block act as an external timestamp input, a periodic output generator, or nothing at all. The design leans on the Linux PHC interface instead of a bespoke userspace ABI, so existing tools like \texttt{testptp} run against it unmodified. A companion Python library, PyPTM, wraps the same public PTP character-device interface for scripted experiments \cite{pyptm-repo}.
 
-The central design problem is not only register access: TGPIO capture and compare values live in the platform ART domain, while the PTP clock interface presents timestamps in a PTP clock domain. The driver therefore defaults to an ART-backed adjustable PHC, provides explicit realtime and raw ART modes for compatibility and diagnostics, and handles bring-up issues that are easy to miss in a purely architectural description, such as input edge defaults, deterministic output startup, and output polarity.
+Register access turns out to be the easy part. The harder problem is that TGPIO capture and compare values live in the platform ART domain, while the PTP clock interface speaks in a PTP clock domain. So the driver defaults to an ART-backed adjustable PHC, adds explicit realtime and raw ART modes for compatibility and diagnostics, and deals with the bring-up details that an architecture-level description tends to gloss over including input edge defaults, deterministic output startup, and output polarity.
 
-This work contributes a PTP-clock abstraction for static TGPIO MMIO blocks that firmware does not enumerate, with per-block selection of external timestamp input, periodic output, or disabled operation; a timestamp path supporting realtime-converted captures, raw ART-derived timestamps, and a default ART-backed adjustable PHC mode for tools such as \texttt{ts2phc}; experimentally established TGPIO output semantics (toggle-only level state, inert single-shot compares, safe hot register rewrites) and a discipline design built on them, combining grid-aligned re-arms, in-flight interval refresh, sub-\ns{100} phase nudges, and software-tracked polarity; a one-shot external calibration that cancels constant clock-comparison and pipeline delays, bringing a disciplined 1~PPS output within \ns{100} of an atomic reference; and a Windows KMDF port of the same blocks reusing those hardware findings unchanged, which separates what is portable about timed I/O from what each operating system's clock model forces.
+This work makes the following contributions:
+\begin{enumerate}
+\item A PTP-clock abstraction for static TGPIO MMIO blocks that firmware does not enumerate, with per-block selection of external timestamp input, periodic output, or disabled operation.
+\item A timestamp path that supports realtime-converted captures, raw ART-derived timestamps, and a default ART-backed adjustable PHC mode for tools such as \texttt{ts2phc}.
+\item A set of experimentally established TGPIO output semantics %(toggle-only level state, inert single-shot compares, safe hot register rewrites) 
+together with a discipline design built on them, combining grid-aligned re-arms, in-flight interval refresh, sub-\ns{100} phase nudges, and software-tracked polarity.
+\item A one-shot external calibration that cancels constant clock-comparison and pipeline delays, holding a disciplined 1~PPS output within \ns{100} of an atomic reference.
+\item A Windows KMDF port of the same blocks that reuses those hardware findings unchanged, which separates what is portable about timed I/O from what each operating system's clock model forces.
+\end{enumerate}
 
-\section{Background}
+\section{Background}\label{sec:background}
 
 \subsection{Linux PTP Hardware Clocks}
 
@@ -74,15 +83,15 @@ Linux exposes hardware-assisted precision timing through the PHC subsystem: a dr
 
 \subsection{ART, TSC, and Cross Timestamps}
 
-Modern Intel platforms relate the Time Stamp Counter (TSC), the ART, and system time: CPUID leaf \texttt{0x15} reports a crystal clock frequency and TSC-to-crystal ratio on supported processors \cite{intel-sdm}, and Linux timekeeping exposes cross-timestamp support for relating device counter values to system time \cite{linux-timekeeping-docs,linux-crosststamp-rfc}. PCIe Precision Time Measurement extends this timebase across the platform to distributed applications \cite{last-centimeters}; TGPIO instead carries it to a physical pin, and the two mechanisms share the ART domain used here.
+Modern Intel platforms relate the Time Stamp Counter (TSC), the ART, and system time: CPUID leaf \texttt{0x15} reports a crystal clock frequency and TSC-to-crystal ratio on supported processors \cite{intel-sdm}, and Linux timekeeping exposes cross-timestamp support for relating device counter values to system time \cite{linux-timekeeping-docs,linux-crosststamp-rfc}. PCIe Precision Time Measurement extends this timebase to distributed applications \cite{last-centimeters} and TGPIO carries it to a physical pin.
 
-The TGPIO hardware used by this driver captures and compares ART-domain counter values; the driver converts between ART and the active PTP clock domain in both directions, as detailed in Section~IV.
+The TGPIO hardware used by this driver captures and compares ART-domain counter values.  The driver converts between ART and the active PTP clock domain in both directions, as detailed in Section~\ref{sec:clock-domain-handling}.
 
 \subsection{Firmware Enumeration Gap}
 
 Upstream and public discussion around Intel timed I/O shows that TGPIO-like facilities have existed in Linux development contexts \cite{linux-pps-gen-tio,lkml-tgpio-pmc,lkml-tgpio-io}, but the platform studied here does not enumerate the relevant ACPI device. The driver therefore takes the MMIO base addresses as platform-specific module parameters, which is less general than firmware discovery but useful when the hardware exists and the address map has been confirmed.
 
-\section{Driver Design}
+\section{Driver Design}\label{sec:driver-design}
 
 Figure~\ref{fig:architecture} shows the overall architecture.  The driver maps the static TGPIO blocks, presents each as a PTP pin, and converts between the hardware ART domain and the PTP clock domain on both the input and output paths.
 
@@ -138,7 +147,7 @@ Steady-state output uses the TGPIO hardware periodic feature: the comparator hol
 
 Quantization is reported, not hidden: converting a request onto integer ART cycles rounds both the half-period and the first edge (each bounded by half a 26~ns cycle at the 38.4~MHz ART rate), and every arm logs both residuals, the first-edge one measured by reading the programmed compare value back through the clock conversion. The debugfs status file exposes the same quantities continuously, with the live phase error of the pending edge and the tracked output level.
 
-\section{Clock-Domain Handling}
+\section{Clock-Domain Handling}\label{sec:clock-domain-handling}
 
 The driver supports three PTP clock modes; internally, the TGPIO registers always use ART-domain counter values for both capture and compare. The default mode exposes an ART-backed adjustable PHC with \texttt{settime64()}, \texttt{adjtime()}, and \texttt{adjfine()} support, so a GPS PPS signal connected directly to a TGPIO input can become the external reference for tools such as \texttt{ts2phc}, after which other Linux time tools can make the disciplined time available to the system. An \texttt{art} mode reuses the same anchor-plus-rate clock model but rejects every adjustment, providing an undisciplined hardware-paced timebase; calibrating its rate against \texttt{CLOCK\_MONOTONIC\_RAW} can only recover the nominal ratio (that clock shares ART's crystal, so the crystal's ppm-scale error remains), while an alternative realtime calibration tracks the kernel timekeeper's rate with a sliding-window estimator and a runtime trim accepts an operator calibration from an external instrument.
 
@@ -150,7 +159,7 @@ For output events, the userspace request is expressed in the PTP clock domain wh
 
 A running hardware output must also follow PHC discipline. The PHC base rate is calibrated from the kernel timekeeper at load, since the nominal CPUID crystal frequency differs from the effective rate by tens of ppm on the tested platform. A PHC step re-arms the output with the first edge advanced along the originally requested period grid, so a step never shifts the waveform phase. A frequency adjustment rewrites the periodic interval register in flight (such writes latch cleanly for subsequent periods), and residual phase errors above 50~ns, measured against the pending edge read live from the comparator, are corrected by rewriting the comparator, which moves only the pending edge and produces no glitch. Finally, a runtime-writable calibration offset shifts every programmed edge by a constant, letting a one-shot external measurement cancel systematic delays such as the asymmetric PCIe read latency in PHC-to-PHC comparison.
 
-\section{Bring-Up Lessons}
+\section{Bring-Up Lessons}\label{sec:bring-up-lessons}
 
 Several implementation details emerged only during bring-up. First, the input default was changed to rising edge: both-edge capture doubles the apparent event rate and rarely matches PPS or trigger workflows.
 
@@ -158,7 +167,7 @@ Second, the modes need different dependency checks: raw ART conversion and hardw
 
 Third, the output semantics above differed substantially from the initial mental model and were settled only by direct register experiments observed with a logic analyzer.  An initially implemented ``preconditioning edge'' relied on single-shot comparison and was a silent no-op, the edge-polarity field has no effect on outputs, and no register round-trip reveals the output level. The belief that in-flight register rewrites corrupt the waveform originated from an older driver revision and dissolved under controlled experiments. The one caveat is that a comparator rewrite can register a phantom event that flips the level-mirror parity, so the driver pauses the periodic-mode bit around such rewrites while output enable holds the line level. Because the analyzer captures were scripted, each wrong hypothesis was falsifiable within minutes; this loop of poke, capture, and decode was the single most productive bring-up tool.
 
-\section{Evaluation}
+\section{Evaluation}\label{sec:evaluation}
 
 The tested platform is an ASUS ProArt Z890-CREATOR WIFI motherboard (BIOS 3202) running Ubuntu 26.04 LTS with Linux \texttt{7.0.0-27-generic}, using the default addresses and two-block setup. The reference is an OCP TimeCard whose PHC (\texttt{ptp\_ocp}) is fed by its onboard atomic clock. A Saleae Logic Pro 16 samples four channels at 100~MS/s (10~ns resolution), observing the atomic 1~PPS, the TimeCard PPS, and both TGPIO outputs; the analyzer's crystal error cancels because all results are channel-to-channel differences against the atomic PPS. \texttt{phc2sys} disciplines the TGPIO PHC from the TimeCard PHC at eight updates per second.
 
@@ -226,17 +235,17 @@ The alternate clock modes were characterized in the same setup (Fig.~\ref{fig:pt
 
 Finally, enabling PCIe Precision Time Measurement on the master card (hardware cross-timestamps through \texttt{PTP\_SYS\_OFFSET\_PRECISE}) removed the software-bracketed read asymmetry from the phc2sys comparison entirely: both legs then rest on hardware-paired timestamps, the microsecond-scale delay calibration becomes unnecessary, and a 22-minute common-view run with zero calibration showed smoothed output phase wander of about 10~ns RMS against the shared atomic reference with drift below $10^{-11}$ (Fig.~\ref{fig:ptmrun}). Tightening the driver's phase-nudge dead-band from its 200~ns default to 30~ns and deepening the phc2sys per-sample read filtering reduced each output's absolute spread from 78~ns to 47~ns (below the 69~ns spread of the atomic reference channel itself on the same instrument), with residual drift of $2$~ps/s.
 
-\section{A Windows Counterpart}
+\section{A Windows Counterpart}\label{sec:windows}
 
-The register-level semantics of Section~V are properties of the device, not of Linux, so they should transfer to any operating system able to map the same MMIO. The same two blocks were therefore brought up under Windows as a KMDF driver, which both tests that claim and serves users of the tested platform who do not run Linux. The driver is a root-enumerated software device, the direct analogue of the Linux module's static addressing: firmware enumerates nothing, so it claims no PnP resources and maps the physical addresses itself through \texttt{MmMapIoSpaceEx}. Addresses, MMIO span, block count, and ART frequency live in the service registry key, seeded by the INF with the same defaults as Table~\ref{tab:params}.
+The register-level semantics of Section~\ref{sec:bring-up-lessons} are properties of the device, not of Linux, so they should transfer to any operating system able to map the same MMIO. The same two blocks were therefore brought up under Windows as a KMDF driver, which both tests that claim and serves users of the tested platform who do not run Linux. The driver is a root-enumerated software device, the direct analogue of the Linux module's static addressing: firmware enumerates nothing, so it claims no PnP resources and maps the physical addresses itself through \texttt{MmMapIoSpaceEx}. Addresses, MMIO span, block count, and ART frequency live in the service registry key, seeded by the INF with the same defaults as Table~\ref{tab:params}.
 
 The control plane is where the ports diverge, and the divergence is forced. Windows has no PHC abstraction, hence no clock device for \texttt{ts2phc} or \texttt{phc2sys} to bind to and no pin-function model. The driver instead exposes eight buffered IOCTLs (info and block status, cross-timestamp, input enable, capture read, output start, stop, and invert) through one sequential queue, with a command-line tool over them; capture delivery is pull-only, the poll loop living in user mode. Timebase handling degrades similarly. Linux hands captured ART cycles to the timekeeper as a correlated counter and refines the base rate at runtime; lacking any such interface, the Windows driver brackets a \texttt{KeQuerySystemTimePrecise()} read between two \texttt{RDTSC} samples at \texttt{DISPATCH\_LEVEL}, converts the midpoint through the CPUID leaf \texttt{0x15} ratio and the \texttt{IA32\_TSC\_ADJUST} offset, and returns the bracket width so callers can bound the pairing error. That rate is nominal and never refined, so a Windows output free-runs at the crystal's ppm error: the same limitation as the Linux ART mode, but the only option rather than one of three.
 
-What transfers intact is the output engine. The Windows driver arms the same toggle-mode hardware periodic output, applies the same whole-period late-arm guard, mirrors the same unreadable level flop by folding the live comparator readback, and performs the same paused comparator rewrite for a glitch-free half-period inversion. That code was written directly from Section~V's findings and worked without further hardware archaeology, the strongest available evidence that those findings describe the device rather than the driver. The port also enabled a useful testing technique: a host-side harness compiles the unmodified driver sources against stub headers on an ordinary POSIX toolchain, replacing the register accessors with a logging shim, so assertions can check the programming \emph{sequence} (interval before comparator before the enabling control write, enable asserted exactly once, the pause bracket around an inversion) rather than final state alone. Ordering is precisely what this hardware is sensitive to, and the tests run in a second with no kernel, target machine, or analyzer.
+What transfers intact is the output engine. The Windows driver arms the same toggle-mode hardware periodic output, applies the same whole-period late-arm guard, mirrors the same unreadable level flop by folding the live comparator readback, and performs the same paused comparator rewrite for a glitch-free half-period inversion. That code was written directly from the findings in Section~\ref{sec:bring-up-lessons} and worked without further hardware archaeology, the strongest available evidence that those findings describe the device rather than the driver. The port also enabled a useful testing technique: a host-side harness compiles the unmodified driver sources against stub headers on an ordinary POSIX toolchain, replacing the register accessors with a logging shim, so assertions can check the programming \emph{sequence} (interval before comparator before the enabling control write, enable asserted exactly once, the pause bracket around an inversion) rather than final state alone. Ordering is precisely what this hardware is sensitive to, and the tests run in a second with no kernel, target machine, or analyzer.
 
 Several Linux features are not ported: no disciplining or servo, no PPS source, no asymmetric duty cycle or one-shot pulse, and no automatic polarity recovery. The driver generates a UTC-aligned 1~Hz output on the tested platform, but the measurement campaign has not been repeated there, and every number reported in this paper is from Linux.
 
-\section{Limitations and Future Work}
+\section{Limitations and Future Work}\label{sec:limitations-future-work}
 
 The current implementation is intentionally platform-specific: it requires known MMIO addresses and should only be loaded where those have been confirmed. A production-quality upstream driver would need robust platform discovery, ownership checks, and maintainable quirks. The external timestamp path is polling-based, which keeps the driver compact but creates a latency and event-loss tradeoff controlled by \texttt{poll\_ms}; an interrupt-backed path would be preferable for high-rate streams. The default PHC mode adjusts a software clock model layered on ART rather than disciplining the ART oscillator itself, unlike a NIC PHC that owns an independent hardware clock.
 
@@ -244,7 +253,7 @@ Output polarity ultimately rests on one bit of external truth: the level flop ca
 
 Future work includes the remaining timestamp-mode comparisons, repeating the measurement campaign on the Windows port, validating additional platforms, replacing static addressing with a discovery or quirk mechanism, adding interrupt support where available, and evaluating whether a subset of the design is suitable for upstream Linux review.
 
-\section{Conclusion}
+\section{Conclusion}\label{sec:conclusion}
 
 This work shows that firmware-undeclared timed I/O hardware can be made useful through the standard Linux PTP interface: presenting each mapped TGPIO block as a PTP pin lets existing tools control hardware that would otherwise be unreachable, and a direct TGPIO input provides a compact path from an external time reference into host timekeeping.
 
