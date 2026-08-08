@@ -19,6 +19,7 @@ POLL_MS="${POLL_MS:-10}"
 ART_FREQUENCY="${ART_FREQUENCY:-0}"
 HARDWARE_TIMESTAMPS="${HARDWARE_TIMESTAMPS:-1}"
 HARDWARE_PERIODIC_OUTPUT="${HARDWARE_PERIODIC_OUTPUT:-1}"
+SOFTWARE_REARM_TOGGLE="${SOFTWARE_REARM_TOGGLE:-1}"
 ACTIVITY_LOG="${ACTIVITY_LOG:-0}"
 VERBOSE_ROUNDING="${VERBOSE_ROUNDING:-0}"
 VERBOSE="${VERBOSE:-0}"
@@ -93,6 +94,7 @@ insmod "${MODULE}" addr0="${ADDR0}" addr1="${ADDR1}" mmio_size="${MMIO_SIZE}" \
 	output_polarity="${OUTPUT_POLARITY}" poll_ms="${POLL_MS}" \
 	art_frequency="${ART_FREQUENCY}" hardware_timestamps="${HARDWARE_TIMESTAMPS}" \
 	hardware_periodic_output="${HARDWARE_PERIODIC_OUTPUT}" \
+	software_rearm_toggle="${SOFTWARE_REARM_TOGGLE}" \
 	activity_log="${ACTIVITY_LOG}" \
 	verbose_rounding="${VERBOSE_ROUNDING}" \
 	verbose="${VERBOSE}" \

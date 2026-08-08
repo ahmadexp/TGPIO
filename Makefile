@@ -18,6 +18,7 @@ POLL_MS ?= 10
 ART_FREQUENCY ?= 0
 HARDWARE_TIMESTAMPS ?= 1
 HARDWARE_PERIODIC_OUTPUT ?= 1
+SOFTWARE_REARM_TOGGLE ?= 1
 ACTIVITY_LOG ?= 0
 VERBOSE_ROUNDING ?= 0
 VERBOSE ?= 0
@@ -49,6 +50,7 @@ LOAD_ENV += OUTPUT_POLARITY="$(OUTPUT_POLARITY)" POLL_MS="$(POLL_MS)"
 LOAD_ENV += ART_FREQUENCY="$(ART_FREQUENCY)"
 LOAD_ENV += HARDWARE_TIMESTAMPS="$(HARDWARE_TIMESTAMPS)"
 LOAD_ENV += HARDWARE_PERIODIC_OUTPUT="$(HARDWARE_PERIODIC_OUTPUT)"
+LOAD_ENV += SOFTWARE_REARM_TOGGLE="$(SOFTWARE_REARM_TOGGLE)"
 LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)" VERBOSE_ROUNDING="$(VERBOSE_ROUNDING)" VERBOSE="$(VERBOSE)"
 LOAD_ENV += TDC="$(TDC)" TDC_START="$(TDC_START)"
 LOAD_ENV += AUTO_POLARITY="$(AUTO_POLARITY)"
@@ -64,7 +66,7 @@ LOAD_ENV += OUTPUT_PHASE_OFFSET_NS="$(OUTPUT_PHASE_OFFSET_NS)"
 LOAD_ENV += OUTPUT_PHASE_TOLERANCE_NS="$(OUTPUT_PHASE_TOLERANCE_NS)"
 LOAD_ENV += ART_CALIBRATION="$(ART_CALIBRATION)" RATE_TRIM_PPB="$(RATE_TRIM_PPB)"
 
-.PHONY: all clean help load reload unload status install persist uninstall save-config tui
+.PHONY: all clean help load reload unload status install persist uninstall save-config tui loopback
 
 help:
 	@echo "TGPIO PTP driver -- build, load, and configuration"
@@ -237,3 +239,6 @@ save-config:
 
 tui:
 	$(SUDO) ./tools/tgpio-tui/tgpio-tui
+
+loopback:
+	$(CC) -O2 -Wall -Wextra -Werror -o tools/tgpio-loopback tools/tgpio-loopback.c

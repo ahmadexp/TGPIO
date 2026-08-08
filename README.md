@@ -548,10 +548,12 @@ hardware:
   tracking PHC servo rate changes automatically. Validated: a 25% duty 1 s
   request measured 249.998 ms / 749.995 ms on the logic analyzer.
 - **Halves shorter than 50 ms with non-50% duty (software path)**: the
-  waveform comes out at the requested ratio, but the edges are produced by
-  the per-edge register writes themselves — single-shot output compares
-  never fire on this hardware — so each edge lands roughly a lead time
-  (~20 ms) early and jitters with software scheduling. Treat this case as
+  next hardware-timed compare is armed by software every half-cycle, so the
+  waveform comes out at the requested ratio but retains software scheduling
+  jitter. The driver primes a known-low state once, then keeps the TGPIO
+  comparator in toggle mode; it writes only the next future compare value.
+  This avoids the 50--60 ns runt pulses caused by rewriting the rising/falling
+  comparator selector on the validated Z890 platform. Treat this case as
   millisecond-quality signaling, not precision timing.
 
 ### One-Shot Timed Pulse
@@ -571,11 +573,15 @@ lands in the following low half, which is why the width must be at least
 one rise and one fall. The block must not be running a periodic output
 (`EBUSY` otherwise).
 
-Use `HARDWARE_PERIODIC_OUTPUT=0` to return to the older software re-arm path:
+Use `HARDWARE_PERIODIC_OUTPUT=0` to force the software re-arm path:
 
 ```sh
 sudo make reload TGPIO0=output HARDWARE_PERIODIC_OUTPUT=0
 ```
+
+`SOFTWARE_REARM_TOGGLE=1` is the default for this path. It is the validated
+workaround for the selector-rewrite runt; set it to `0` only to reproduce or
+diagnose the legacy behavior.
 
 If your board or measurement path inverts the output, reload with
 `OUTPUT_POLARITY=inverted`.

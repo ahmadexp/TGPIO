@@ -228,6 +228,8 @@ static enum tgpio_timestamp_mode timestamp_mode;
 static enum tgpio_output_polarity output_polarity;
 static bool hardware_timestamps = true;
 static bool hardware_periodic_output = true;
+/* Keep EP stable after the known-low prime; see tgpio_program_output_edge(). */
+static bool software_rearm_toggle = true;
 static bool activity_log;
 static bool verbose_rounding;
 static bool verbose;
@@ -312,6 +314,10 @@ MODULE_PARM_DESC(hardware_timestamps,
 module_param(hardware_periodic_output, bool, 0444);
 MODULE_PARM_DESC(hardware_periodic_output,
 		 "Use TGPIO hardware periodic mode for PTP periodic output");
+
+module_param(software_rearm_toggle, bool, 0444);
+MODULE_PARM_DESC(software_rearm_toggle,
+		 "Use TGPIO toggle mode for software output after the initial prime (disable only for diagnosis)");
 
 module_param(activity_log, bool, 0644);
 MODULE_PARM_DESC(activity_log,
@@ -2804,9 +2810,17 @@ tgpio_program_output_edge(struct tgpio_device *dev,
 	ctrl = tgpio_read_ctl(mmio_block);
 	ctrl &= ~TGPIOCTL_EP;
 	ctrl |= edge_bits;
-	tgpio_write_ctl(mmio_block, ctrl);
-
-	tgpio_write_compv(mmio_block, art.val);
+	/*
+	 * Toggle mode keeps EP stable.  Write its future COMPV before touching
+	 * control, so the brief register update cannot match an elapsed compare.
+	 */
+	if (edge_bits == TGPIOCTL_EP_TOGGLE) {
+		tgpio_write_compv(mmio_block, art.val);
+		tgpio_write_ctl(mmio_block, ctrl);
+	} else {
+		tgpio_write_ctl(mmio_block, ctrl);
+		tgpio_write_compv(mmio_block, art.val);
+	}
 	tgpio_log_rounding_edge(dev, mmio_block, "software_edge",
 				ktime_to_ns(edge_time), art.val);
 	return TGPIO_OK;
@@ -3799,6 +3813,13 @@ static void tgpio_output_work(struct work_struct *work)
 	edge = mmio_block->output_next_edge_type;
 	next_edge = mmio_block->output_next_edge;
 	edge_bits = tgpio_output_edge_bits(edge);
+	/*
+	 * The first arm uses a falling-edge compare to establish the low state.
+	 * Once that is done, toggle mode carries the physical level flop from one
+	 * edge to the next without rewriting EP every half period.
+	 */
+	if (software_rearm_toggle)
+		edge_bits = TGPIOCTL_EP_TOGGLE;
 	next_interval_ns = tgpio_output_interval_after_edge(mmio_block, edge);
 
 	interval = tgpio_clock_delta_to_real_ns(dev, next_interval_ns);

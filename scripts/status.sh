@@ -20,7 +20,7 @@ echo
 echo "== tgpio parameters =="
 for param in clock_mode timestamp_mode output_polarity art_frequency \
 	tsc_art_numerator tsc_art_denominator hardware_timestamps \
-	hardware_periodic_output activity_log input0_enable input1_enable \
+	hardware_periodic_output software_rearm_toggle activity_log input0_enable input1_enable \
 	input0_channel input1_channel output0_channel output1_channel \
 	output0_period_ns output1_period_ns output0_duty_ns output1_duty_ns \
 	output_start_delay_ns; do
