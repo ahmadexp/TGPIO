@@ -83,11 +83,12 @@ Linux exposes peripheral device clocks through the PHC subsystem. Usually the de
 
 Modern Intel platforms use the Always Running Timer as the basis of hardware timekeeping on the platform. The Time Stamp Counter (TSC) is used for CPU timekeeping. TSC is locked to the ART by a fixed ratio that can be discovered by software using CPUID leaf \texttt{0x15} which also reports the ART clock frequency. The CPUs that support  \texttt{0x15} are listed in the \cite{intel-sdm}. Linux timekeeping, for example CLOCK\_REALTIME, on Intel platforms in based on TSC. Given the fixed ratio between ART and TSC, ART can also be related to CLOCK\_REALTIME \cite{linux-timekeeping-docs,linux-crosststamp-rfc}. The TGPIO device is driven by ART extending the Linux system clock to a physical pin where CLOCK\_REALTIME can be used to sample or generate a signal.
 
-The TGPIO hardware used by this driver captures and compares ART-domain counter values.  The driver converts between ART and the active PTP clock domain in both directions, as detailed in Section~\ref{sec:clock-domain-handling}.
+%% I am not sure what the PTP clock domain is in this context -Chris
+%%The TGPIO hardware used by this driver captures and compares ART-domain counter values.  The driver converts between ART and the active PTP clock domain in both directions, as detailed in Section~\ref{sec:clock-domain-handling}.
 
 \subsection{Firmware Enumeration Gap}
 
-Upstream and public discussion around Intel's TGPIOs (sometimes called ``timed I/O'') shows that TGPIO-like facilities have existed in Linux development contexts \cite{linux-pps-gen-tio,lkml-tgpio-pmc,lkml-tgpio-io}, but the platform studied here does not enumerate the relevant ACPI device. The driver therefore takes the MMIO base addresses as platform-specific module parameters, which is less general than firmware discovery but useful when the hardware exists and the address map has been confirmed.
+Despite extensive public discussion proposing support for the TGPIO (sometimes called ``timed I/O'') support in Linux \cite{linux-pps-gen-tio,lkml-tgpio-pmc,lkml-tgpio-io}, the platform studied does not expose the TGPIO device addresses using ACPI. This is true for most platforms as BIOS developers have declined to include support for TGPIO. To remedy this, the driver takes the MMIO base addresses used by the TGPIO device as a module parameter. These addresses are platform dependent, requiring an additional step by the user to get the device base address from the hardware documentation.
 
 \section{Driver Design}\label{sec:driver-design}
 \input{figures/architecture}
