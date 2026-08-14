@@ -132,13 +132,16 @@ At load time, the driver maps all enabled blocks and registers a single PHC devi
 
 \subsection{Userspace Control}
 
-The control interface is the standard PTP character device rather than a private ABI. \texttt{testptp} handles pin assignment, external timestamp enablement,\footnote{Due to a PTP core change in v6.16, older kernel versions may behave unexpectedly with respect to input event flags; a driver must advertise \texttt{supported\_extts\_flags} for the strict \texttt{PTP\_EXTTS\_REQUEST2} ioctl to succeed.} and periodic-output requests, and \PyLib offers the same operations as a Python API.
+The control interface is the standard PTP character device rather than a private ABI. \texttt{testptp} handles pin assignment, external timestamp enablement for input\footnote{Due to a PTP core change in v6.16, older kernel versions may behave unexpectedly with respect to input event flags; a driver must advertise \texttt{supported\_extts\_flags} for the strict \texttt{PTP\_EXTTS\_REQUEST2} ioctl to succeed.} and periodic output. PyLib exposes the same operations using a Python wrapper module.
 
 \subsection{External Timestamp Input}
 
-For input mode, enabling a PTP external timestamp request configures the block for input, applies the edge selection, and starts a poll worker that reads the capture timestamp and event counter. The register sequence matters: reading the low capture timestamp register latches the associated timestamp and event-count values before the remaining registers are read.
+For input mode, enabling a PTP external timestamp request configures the block for input, applies the edge selection (rising, falling, toggle / both edges), and starts a polling worker thread that reads the capture timestamp and event counter. The register sequence matters: ART is a 64-bit counter and is accessed using two 32-bit reads (bit 0:31 and  32:63). On current Intel platforms, the lower 32-bits roll over every 1.9 minutes for client platforms or 2.9 minutes for server platforms. On detection of an edge, the hardware latches the lower 32-bits of ART. No other events can be timestamped until software reads the capture register. The upper 64 bits are not latched. The software must account for the rollover in the lower 32-bits when synthesizing the 64-bit ART value.
 
-When the event count changes, the driver emits an external timestamp event through the PHC event path, timestamped according to the selected timestamp mode. Captures also feed other consumers: per-input phase and interval statistics in the status file, an RFC~2783 PPS source per input block for NTP-family tools, and a time-to-digital converter mode that pairs start and stop captures across the two blocks with one-ART-cycle resolution. The PHC additionally implements precise cross-timestamps (\texttt{PTP\_SYS\_OFFSET\_PRECISE}), which \texttt{phc2sys} and \texttt{chrony} adopt automatically.
+Software detects an event capture by polling the latched ART value and/or the event count. When the driver detects an event, it emits an external timestamp event through the PHC event path using the timestamp type selected by the timestamp mode.
+
+%% This doesn't seem connected with the rest of the input description -Chris
+%% Captures also feed other consumers: per-input phase and interval statistics in the status file, an RFC~2783 PPS source per input block for NTP-family tools, and a time-to-digital converter mode that pairs start and stop captures across the two blocks with one-ART-cycle resolution. The PHC additionally implements precise cross-timestamps (\texttt{PTP\_SYS\_OFFSET\_PRECISE}), which \texttt{phc2sys} and \texttt{chrony} adopt automatically.
 
 \subsection{Periodic Output}
 
