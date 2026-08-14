@@ -1,5 +1,6 @@
 \documentclass[conference,a4paper]{IEEEtran}
 
+\usepackage{nameref}
 \usepackage{cite}
 \usepackage{booktabs}
 \usepackage{graphicx}
@@ -86,7 +87,7 @@ Modern Intel platforms use the Always Running Timer as the basis of hardware tim
 %% I am not sure what the PTP clock domain is in this context -Chris
 %%The TGPIO hardware used by this driver captures and compares ART-domain counter values.  The driver converts between ART and the active PTP clock domain in both directions, as detailed in Section~\ref{sec:clock-domain-handling}.
 
-\subsection{Firmware Enumeration Gap}
+\subsection{Firmware Enumeration Gap}\label{sec:device-enumeration}
 
 Despite extensive public discussion proposing support for the TGPIO (sometimes called ``timed I/O'') support in Linux \cite{linux-pps-gen-tio,lkml-tgpio-pmc,lkml-tgpio-io}, the platform studied does not expose the TGPIO device addresses using ACPI. This is true for most platforms as BIOS developers have declined to include support for TGPIO. To remedy this, the driver takes the MMIO base addresses used by the TGPIO device as a module parameter. These addresses are platform dependent, requiring an additional step by the user to get the device base address from the hardware documentation.
 
@@ -96,10 +97,10 @@ Figure~\ref{fig:architecture} shows the overall architecture, in which the drive
 
 \subsection{Static Blocks and Module Parameters}
 
-The driver supports two static TGPIO blocks, each with a per-pin mode: \texttt{input}, \texttt{output}, or \texttt{off}.
+The driver supports two static TGPIO blocks; one per pin. The mode of each pin is independently configurable: \texttt{input}, \texttt{output}, or \texttt{disabled}.
 %, each with a configurable MMIO base address (defaults \texttt{0xFE001210} and \texttt{0xFE001310}, span \texttt{0x38} bytes)
 %The default configuration enables both blocks as rising-edge external timestamp inputs.
-Table~\ref{tab:params} highlights the relevant driver parameters. Keeping platform identity outside the driver binary makes the module easy to test where the MMIO resources are known while avoiding a false claim of general platform discovery.
+Table~\ref{tab:params} highlights commonly used driver parameters. Separating device enumeration from the core driver logic simplifies testing by avoiding fragile hard-coded device discover. See section \ref{sec:device-enumeration}:``\nameref{sec:device-enumeration}'' for details.
 
 \begin{table}[t]
 \caption{Selected Driver Parameters}
