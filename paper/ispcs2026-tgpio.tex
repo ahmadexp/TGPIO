@@ -15,6 +15,8 @@
 \newcommand{\eg}{\textit{e.g.},\xspace}
 \newcommand{\etal}{\textit{et al.}\xspace}
 \newcommand{\etc}{\textit{etc.}\xspace}
+\newcommand{\PyLib}{PyTimeLab\xspace}
+\newcommand{\ClRT}{CLOCK\_REALTIME\xspace}
 
 \title{A Customizable Linux PTP Driver\\
 for Time-Aware GPIO}
@@ -68,11 +70,11 @@ Consider a system that must derive time from a GPS receiver without a PTP-capabl
 
 %% There is a gap when employing certain platforms. The timed I/O resources are physically present and functional, but firmware has not enumerated them, so they are not found by the normal platform-driver discovery path. The result is that applications do not have a standardized way to reach hardware useful for time synchronization and measurement.
 
-This paper describes an out-of-tree Linux driver that exposes additional capabilities beyond the upstream driver for the Intel Time-Aware GPIO (TGPIO) device. Most Intel platforms have two TGPIO pins, each controlled by a dedicated register block. The driver maps the physical pin and its register block to a PHC channel and pin accessible from software. A PHC pin can be configured as an EXTTS input, a periodic output (PEROUT) generator, or disabled. The design leans on the Linux PHC interface instead of a bespoke user ABI, enabling use of existing unmodified tools like \texttt{testptp}. A companion Python library, PyPTM, wraps the PHC character-device interface, facilitating scripted experiments \cite{pyptm-repo}.
+This paper describes an out-of-tree Linux driver that exposes additional capabilities beyond the upstream driver for the Intel Time-Aware GPIO (TGPIO) device. Most Intel platforms have two TGPIO pins, each controlled by a dedicated register block. The driver maps the physical pin and its register block to a PHC channel and pin accessible from software. A PHC pin can be configured as an EXTTS input, a periodic output (PEROUT) generator, or disabled. The design leans on the Linux PHC interface instead of a bespoke user ABI, enabling use of existing unmodified tools like \texttt{testptp}. A companion Python library, \PyLib, wraps the PHC character-device interface, facilitating scripted experiments \cite{pyptm-repo}.
 
 The TGPIO hardware timestamps events using the Always Running Timer (ART). By default, the driver reports timestamps in terms of ART. This simplified usage was useful for bring-up and debugging. However, disciplining the system clock requires timestamps in terms of the system clock rather than ART. One of the major implementation challenges was translating between ART and system time to enable this.
 
-This work makes five contributions. First, a PTP-clock abstraction that enumerates, initializes, and configures the hardware, with per-pin selection of functionality (\ie EXTTS, PEROUT, or disabled). Second, a timestamp path that supports raw ART timestamps, conversion of ART timestamps to CLOCK\_REALTIME, and a default ART-backed adjustable PHC mode for use with tools such as \texttt{ts2phc}. Third, a test harness used for initial bring-up and ongoing driver development. Fourth, a one-shot external calibration that measures and corrects for hardware pipeline delays (\eg buffering), holding a disciplined 1~PPS output within \ns{100} of an atomic reference. Finally, a Windows KMDF port of the same blocks that reuses those hardware findings unchanged, separating the common TGPIO driver design from the operating-system specifics.
+This work makes five contributions. First, a PTP-clock abstraction that enumerates, initializes, and configures the hardware, with per-pin selection of functionality (\ie EXTTS, PEROUT, or disabled). Second, a timestamp path that supports raw ART timestamps, conversion of ART timestamps to \ClRT, and a default ART-backed adjustable PHC mode for use with tools such as \texttt{ts2phc}. Third, a test harness used for initial bring-up and ongoing driver development. Fourth, a one-shot external calibration that measures and corrects for hardware pipeline delays (\eg buffering), holding a disciplined 1~PPS output within \ns{100} of an atomic reference. Finally, a Windows KMDF port of the same blocks that reuses those hardware findings unchanged, separating the common TGPIO driver design from the operating-system specifics.
 
 \section{Background}\label{sec:background}
 
@@ -130,7 +132,7 @@ At load time, the driver maps all enabled blocks and registers a single PHC devi
 
 \subsection{Userspace Control}
 
-The control interface is the standard PTP character device rather than a private ABI. \texttt{testptp} handles pin assignment, external timestamp enablement,\footnote{Due to a PTP core change in v6.16, older kernel versions may behave unexpectedly with respect to input event flags; a driver must advertise \texttt{supported\_extts\_flags} for the strict \texttt{PTP\_EXTTS\_REQUEST2} ioctl to succeed.} and periodic-output requests, and PyPTM offers the same operations as a Python API.
+The control interface is the standard PTP character device rather than a private ABI. \texttt{testptp} handles pin assignment, external timestamp enablement,\footnote{Due to a PTP core change in v6.16, older kernel versions may behave unexpectedly with respect to input event flags; a driver must advertise \texttt{supported\_extts\_flags} for the strict \texttt{PTP\_EXTTS\_REQUEST2} ioctl to succeed.} and periodic-output requests, and \PyLib offers the same operations as a Python API.
 
 \subsection{External Timestamp Input}
 
