@@ -126,7 +126,7 @@ Parameter & Default & Purpose\\
 
 \subsection{PTP Pin Model}
 
-At load time, the driver maps all enabled blocks and registers a single PTP clock, with each block becoming a PTP pin descriptor named by its physical index and mode. Pin verification accepts external timestamp requests only on input-mode blocks and periodic-output requests only on output-mode blocks. Channel mapping follows the PTP pin assignment model (\texttt{testptp -L}); absent an explicit assignment, the driver falls back to a direct channel-to-block mapping.
+At load time, the driver maps all enabled blocks and registers a single PHC device clock, with each TGPIO pin and corresponding register block represented by a PTP pin descriptor named by its physical index and mode. Pin verification accepts external timestamp requests only on input-mode blocks and periodic-output requests only on output-mode blocks. Channel mapping follows the PTP pin assignment model (\texttt{testptp -L}); absent an explicit assignment, the driver falls back to a direct channel-to-block mapping.
 
 \subsection{Userspace Control}
 
