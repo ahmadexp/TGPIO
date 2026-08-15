@@ -16,7 +16,7 @@
 \newcommand{\etal}{\textit{et al.}\xspace}
 \newcommand{\etc}{\textit{etc.}\xspace}
 \newcommand{\PyLib}{PyTimeLab\xspace}
-\newcommand{\ClRT}{CLOCK\_REALTIME\xspace}
+\newcommand{\ClRT}{\texttt{CLOCK\_REALTIME}\xspace}
 
 \title{A Customizable Linux PTP Driver\\
 for Time-Aware GPIO}
@@ -84,7 +84,7 @@ Linux exposes peripheral device clocks through the PHC subsystem. Usually the de
 
 \subsection{ART, TSC, and Cross Timestamps}
 
-Modern Intel platforms use the Always Running Timer as the basis of hardware timekeeping on the platform. The Time Stamp Counter (TSC) is used for CPU timekeeping. TSC is locked to the ART by a fixed ratio that can be discovered by software using CPUID leaf \texttt{0x15} which also reports the ART clock frequency. The CPUs that support  \texttt{0x15} are listed in the \cite{intel-sdm}. Linux timekeeping, for example CLOCK\_REALTIME, on Intel platforms in based on TSC. Given the fixed ratio between ART and TSC, ART can also be related to CLOCK\_REALTIME \cite{linux-timekeeping-docs,linux-crosststamp-rfc}. The TGPIO device is driven by ART extending the Linux system clock to a physical pin where CLOCK\_REALTIME can be used to sample or generate a signal.
+Modern Intel platforms use the Always Running Timer as the basis of hardware timekeeping on the platform. The Time Stamp Counter (TSC) is used for CPU timekeeping. TSC is locked to the ART by a fixed ratio that can be discovered by software using CPUID leaf \texttt{0x15} which also reports the ART clock frequency. The CPUs that support  \texttt{0x15} are listed in the \cite{intel-sdm}. Linux timekeeping, for example \ClRT, on Intel platforms in based on TSC. Given the fixed ratio between ART and TSC, ART can also be related to \ClRT~\cite{linux-timekeeping-docs,linux-crosststamp-rfc}. The TGPIO device is driven by ART extending the Linux system clock to a physical pin where \ClRT can be used to sample or generate a signal.
 
 %% I am not sure what the PTP clock domain is in this context -Chris
 %%The TGPIO hardware used by this driver captures and compares ART-domain counter values.  The driver converts between ART and the active PTP clock domain in both directions, as detailed in Section~\ref{sec:clock-domain-handling}.
@@ -99,10 +99,10 @@ Figure~\ref{fig:architecture} shows the overall architecture, in which the drive
 
 \subsection{Static Blocks and Module Parameters}
 
-The driver supports two static TGPIO blocks; one per pin. The mode of each pin is independently configurable: \texttt{input}, \texttt{output}, or \texttt{disabled}.
+The driver supports two static TGPIO blocks, one per pin. The mode of each pin is independently configurable: \texttt{input}, \texttt{output}, or \texttt{disabled}.
 %, each with a configurable MMIO base address (defaults \texttt{0xFE001210} and \texttt{0xFE001310}, span \texttt{0x38} bytes)
 %The default configuration enables both blocks as rising-edge external timestamp inputs.
-Table~\ref{tab:params} highlights commonly used driver parameters. Separating device enumeration from the core driver logic simplifies testing by avoiding fragile hard-coded device discover. See section \ref{sec:device-enumeration}:``\nameref{sec:device-enumeration}'' for details.
+Table~\ref{tab:params} highlights commonly used driver parameters. Separating device enumeration from the core driver logic simplifies testing by avoiding fragile hard-coded device discovery. See Section~\ref{sec:device-enumeration}: ``\nameref{sec:device-enumeration}'' for details.
 
 \begin{table}[t]
 \caption{Selected Driver Parameters}
@@ -132,11 +132,11 @@ At load time, the driver maps all enabled blocks and registers a single PHC devi
 
 \subsection{Userspace Control}
 
-The control interface is the standard PTP character device rather than a private ABI. \texttt{testptp} handles pin assignment, external timestamp enablement for input\footnote{Due to a PTP core change in v6.16, older kernel versions may behave unexpectedly with respect to input event flags; a driver must advertise \texttt{supported\_extts\_flags} for the strict \texttt{PTP\_EXTTS\_REQUEST2} ioctl to succeed.} and periodic output. PyLib exposes the same operations using a Python wrapper module.
+The control interface is the standard PTP character device rather than a private ABI. \texttt{testptp} handles pin assignment, external timestamp enablement for input,\footnote{Due to a PTP core change in v6.16, older kernel versions may behave unexpectedly with respect to input event flags; a driver must advertise \texttt{supported\_extts\_flags} for the strict \texttt{PTP\_EXTTS\_REQUEST2} ioctl to succeed.} and periodic output. \PyLib exposes the same operations using a Python wrapper module.
 
 \subsection{External Timestamp Input}
 
-For input mode, enabling a PTP external timestamp request configures the block for input, applies the edge selection (rising, falling, toggle / both edges), and starts a polling worker thread that reads the capture timestamp and event counter. The register sequence matters: ART is a 64-bit counter and is accessed using two 32-bit reads (bit 0:31 and  32:63). On current Intel platforms, the lower 32-bits roll over every 1.9 minutes for client platforms or 2.9 minutes for server platforms. On detection of an edge, the hardware latches the lower 32-bits of ART. No other events can be timestamped until software reads the capture register. The upper 64 bits are not latched. The software must account for the rollover in the lower 32-bits when synthesizing the 64-bit ART value.
+For input mode, enabling a PTP external timestamp request configures the block for input, applies the edge selection (rising, falling, toggle / both edges), and starts a polling worker thread that reads the capture timestamp and event counter. The register sequence matters: ART is a 64-bit counter and is accessed using two 32-bit reads (bits 0:31 and 32:63). On current Intel platforms, the lower 32 bits roll over every 1.9 minutes for client platforms or 2.9 minutes for server platforms. On detection of an edge, the hardware latches the lower 32 bits of ART. No other events can be timestamped until software reads the capture register. The upper 32 bits are not latched. Software must account for the rollover in the lower 32 bits when synthesizing the 64-bit ART value.
 
 Software detects an event capture by polling the latched ART value and/or the event count. When the driver detects an event, it emits an external timestamp event through the PHC event path using the timestamp type selected by the timestamp mode.
 
@@ -161,7 +161,7 @@ Quantization is reported by the driver and not abstracted. Converting a request 
 \toprule
 Configuration & Rate error & Mean offset & Std.\ dev. & Notes\\
 \midrule
-Free running (PHC anchored to \texttt{CLOCK\_REALTIME}) & $-28.4$~ppm & --- & --- & tracks system clock, by design\\
+Free running (PHC anchored to \ClRT) & $-28.4$~ppm & --- & --- & tracks system clock, by design\\
 Disciplined, before calibration & $<0.001$~ppm & $+2.38$~$\mu$s & 52~ns & constant PHC-comparison asymmetry\\
 Disciplined, after one-shot calibration & $<0.001$~ppm & $+9$~ns & 64~ns & 180 pulses\\
 TimeCard PHC PPS (reference hardware) & $<0.001$~ppm & $-10$~ns & 54~ns & same instrument and reference\\
@@ -176,7 +176,7 @@ Realtime mode, aggressive system servo & tracks system clock & $\pm 250$~ns band
 
 The driver supports three PTP clock modes; internally, the TGPIO registers always use ART-domain counter values for both capture and compare. The default mode exposes an ART-backed adjustable PHC with \texttt{settime64()}, \texttt{adjtime()}, and \texttt{adjfine()} support, so a GPS PPS signal connected directly to a TGPIO input can become the external reference for tools such as \texttt{ts2phc}, after which other Linux time tools can make the disciplined time available to the system. An \texttt{art} mode reuses the same anchor-plus-rate clock model but rejects adjustment requests, providing an undisciplined hardware-paced timebase; calibrating its rate against \texttt{CLOCK\_MONOTONIC\_RAW} can only recover the nominal ratio (that clock is mathematically related to the ART or crystal frequency, so the crystal's ppm-scale error remains), while an alternative realtime calibration tracks the kernel timekeeper's rate with a sliding-window estimator and a runtime trim accepts an operator calibration if available from an external instrument.
 
-An explicit realtime mode ties \texttt{gettime64()} to \texttt{CLOCK\_REALTIME} and passes through the PTP adjustment operations to the system clock. Because that clock is also steered behind the driver's back (\texttt{chrony}, \texttt{adjtimex}), realtime-mode outputs are re-synchronized to the realtime grid once per second using the same glitch-free nudge machinery as PHC mode. A reference pulse captured by a TGPIO input can then discipline the operating-system clock directly from hardware timestamps; validated with a \texttt{chrony} PHC-refclock configuration, the system clock locked to the atomic PPS with a $-218$~ns offset and 11~ns per-sample standard deviation. This gives the OS a local disciplined timebase for host-side timestamping and scheduling that is aligned with the external clock source; time-triggered process scheduling or network transmission still depends on the NIC hardware and other software stacks.
+An explicit realtime mode ties \texttt{gettime64()} to \ClRT and passes through the PTP adjustment operations to the system clock. Because that clock is also steered behind the driver's back (\texttt{chrony}, \texttt{adjtimex}), realtime-mode outputs are re-synchronized to the realtime grid once per second using the same glitch-free nudge machinery as PHC mode. A reference pulse captured by a TGPIO input can then discipline the operating-system clock directly from hardware timestamps; validated with a \texttt{chrony} PHC-refclock configuration, the system clock locked to the atomic PPS with a $-218$~ns offset and 11~ns per-sample standard deviation. This gives the OS a local disciplined timebase for host-side timestamping and scheduling that is aligned with the external clock source; time-triggered process scheduling or network transmission still depends on the NIC hardware and other software stacks.
 
 For input events in realtime mode, the driver constructs a device cross-timestamp context from the captured ART cycle count and the Linux ART clocksource identifier, calls the kernel cross-timestamp interface, and uses the returned realtime value as the event timestamp; in PHC mode, captured cycles are converted into the adjusted PHC domain by applying the current offset and frequency scale. The raw ART mode claims no realtime epoch alignment.
 Realtime mode converts through Linux timekeeping's realtime-to-ART relationship; PHC mode uses the driver's stable ART base rate plus the adjusted TSC offset and frequency scale; the periodic interval register uses the same conversion.
