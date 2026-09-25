@@ -19,6 +19,7 @@ ART_FREQUENCY ?= 0
 HARDWARE_TIMESTAMPS ?= 1
 HARDWARE_PERIODIC_OUTPUT ?= 1
 SOFTWARE_REARM_TOGGLE ?= 1
+EXPERIMENTAL_INSTANTANEOUS_REALTIME_PROJECTION ?= 0
 ACTIVITY_LOG ?= 0
 VERBOSE_ROUNDING ?= 0
 VERBOSE ?= 0
@@ -37,7 +38,7 @@ OUTPUT0_DUTY_NS ?= 0
 OUTPUT1_DUTY_NS ?= 0
 OUTPUT_START_DELAY_NS ?= 0
 OUTPUT_PHASE_OFFSET_NS ?= 0
-OUTPUT_PHASE_TOLERANCE_NS ?= 200
+OUTPUT_PHASE_TOLERANCE_NS ?= 0
 ART_CALIBRATION ?= raw
 RATE_TRIM_PPB ?= 0
 
@@ -51,6 +52,7 @@ LOAD_ENV += ART_FREQUENCY="$(ART_FREQUENCY)"
 LOAD_ENV += HARDWARE_TIMESTAMPS="$(HARDWARE_TIMESTAMPS)"
 LOAD_ENV += HARDWARE_PERIODIC_OUTPUT="$(HARDWARE_PERIODIC_OUTPUT)"
 LOAD_ENV += SOFTWARE_REARM_TOGGLE="$(SOFTWARE_REARM_TOGGLE)"
+LOAD_ENV += EXPERIMENTAL_INSTANTANEOUS_REALTIME_PROJECTION="$(EXPERIMENTAL_INSTANTANEOUS_REALTIME_PROJECTION)"
 LOAD_ENV += ACTIVITY_LOG="$(ACTIVITY_LOG)" VERBOSE_ROUNDING="$(VERBOSE_ROUNDING)" VERBOSE="$(VERBOSE)"
 LOAD_ENV += TDC="$(TDC)" TDC_START="$(TDC_START)"
 LOAD_ENV += AUTO_POLARITY="$(AUTO_POLARITY)"
@@ -128,8 +130,8 @@ help:
 	@echo "                       (runtime-writable via /sys/module parameters)"
 	@echo "  OUTPUT_PHASE_TOLERANCE_NS=$(OUTPUT_PHASE_TOLERANCE_NS)"
 	@echo "                       Phase dead-band: nudge the pending edge"
-	@echo "                       once drift exceeds this (ns; floor 26 ="
-	@echo "                       one ART cycle; runtime-writable)"
+	@echo "                       once drift reaches this (ns; 0 selects the"
+	@echo "                       one-ART-cycle floor; runtime-writable)"
 	@echo "  OUTPUT_START_DELAY_NS=$(OUTPUT_START_DELAY_NS)"
 	@echo "                       Delay from load to the first persisted edge"
 	@echo "  OUTPUT_POLARITY=$(OUTPUT_POLARITY)      normal | inverted"
@@ -153,6 +155,9 @@ help:
 	@echo "  MMIO_SIZE=$(MMIO_SIZE) USE_SECOND=$(USE_SECOND)"
 	@echo
 	@echo "Diagnostics (all runtime-writable under /sys/module/tgpio_ptp_input/parameters/):"
+	@echo "  EXPERIMENTAL_INSTANTANEOUS_REALTIME_PROJECTION=$(EXPERIMENTAL_INSTANTANEOUS_REALTIME_PROJECTION)"
+	@echo "                       1 = use an instantaneous timekeeper slope as a"
+	@echo "                       diagnostic negative control; keep 0 normally"
 	@echo "  ACTIVITY_LOG=$(ACTIVITY_LOG)       1 = log input/output activity to the kernel"
 	@echo "                       journal (journalctl -k -g 'activity=')"
 	@echo "  VERBOSE_ROUNDING=$(VERBOSE_ROUNDING)   1 = log the ART-cycle rounding of every"
@@ -169,7 +174,7 @@ help:
 	@echo "                       input captures into hardware-timestamped"
 	@echo "                       bipolar durations: signed stop - start,"
 	@echo "                       negative when stop precedes start"
-	@echo "                       (~26 ns resolution, 64-bit range)."
+	@echo "                       (one-ART-cycle resolution, 64-bit range)."
 	@echo "                       Requires TGPIO0=input TGPIO1=input; edges"
 	@echo "                       via EDGE0/EDGE1. Stats in the status file;"
 	@echo "                       clear with /sys/kernel/debug/tgpio/tdc_reset"
