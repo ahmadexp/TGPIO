@@ -1,5 +1,8 @@
-/* Licensed under the TGPIO Non-Commercial License (see LICENSE).
- * Commercial use requires the prior written permission of Ahmad Byagowi. */
+/* SPDX-License-Identifier: LicenseRef-TGPIO-Non-Commercial */
+/*
+ * Licensed under the TGPIO Non-Commercial License (see LICENSE).
+ * Commercial use requires the prior written permission of Ahmad Byagowi.
+ */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM tgpio
 

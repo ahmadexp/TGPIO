@@ -452,11 +452,11 @@ accuracy.
 Two knobs measurably narrow the phase envelope:
 
 - `OUTPUT_PHASE_TOLERANCE_NS` (runtime-writable as
-  `output_phase_tolerance_ns`, default 200, floor 26 = one ART cycle) —
-  the dead-band before the driver nudges the pending edge back onto the
-  grid. The default lets the output wander ±200 ns against its own PHC;
-  `30` holds the driver-reported grid error within ±30 ns at the cost of
-  more (verified glitch-free) in-flight compare rewrites.
+  `output_phase_tolerance_ns`, default `0`) — the dead-band before the driver
+  nudges the pending edge back onto the grid. Zero selects the dynamically
+  calculated one-ART-cycle floor; positive values request a wider dead-band,
+  but can never reduce it below one ART cycle. This minimizes the steady-state
+  phase sawtooth while avoiding attempts to correct sub-cycle error.
 - `phc2sys -N 15` — deeper per-sample read filtering rejects PCIe latency
   outliers better than the `-N 10` baseline.
 

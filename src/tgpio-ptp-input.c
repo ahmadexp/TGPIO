@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-TGPIO-Non-Commercial
 // Licensed under the TGPIO Non-Commercial License (see LICENSE).
 // Commercial use requires the prior written permission of Ahmad Byagowi.
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -123,9 +124,8 @@ tgpio_snapshot_art_cycles(const struct system_time_snapshot *snapshot,
 
 #define TGPIO_ART_HW_DELAY_CYCLES 2
 #define TGPIO_OUTPUT_SAFE_TIME_NS (20 * NSEC_PER_MSEC)
-#define TGPIO_OUTPUT_PHASE_NUDGE_NS 200
-/* Nudging below one ART cycle (~26 ns) just chases quantization. */
-#define TGPIO_OUTPUT_PHASE_NUDGE_MIN_NS 26
+/* Zero selects the dynamically measured one-ART-cycle dead-band. */
+#define TGPIO_OUTPUT_PHASE_NUDGE_NS 0
 #define TGPIO_HW_DUTY_MIN_HALF_NS (50 * NSEC_PER_MSEC)
 #define TGPIO_HW_DUTY_SERVICE_DELAY_NS (10 * NSEC_PER_MSEC)
 #define TGPIO_CPUID_ART_LEAF	  0x15
@@ -230,6 +230,8 @@ static bool hardware_timestamps = true;
 static bool hardware_periodic_output = true;
 /* Keep EP stable after the known-low prime; see tgpio_program_output_edge(). */
 static bool software_rearm_toggle = true;
+/* Experimental A/B control; default operation retains the averaged mapping. */
+static bool experimental_instantaneous_realtime_projection;
 static bool activity_log;
 static bool verbose_rounding;
 static bool verbose;
@@ -319,6 +321,10 @@ module_param(software_rearm_toggle, bool, 0444);
 MODULE_PARM_DESC(software_rearm_toggle,
 		 "Use TGPIO toggle mode for software output after the initial prime (disable only for diagnosis)");
 
+module_param(experimental_instantaneous_realtime_projection, bool, 0444);
+MODULE_PARM_DESC(experimental_instantaneous_realtime_projection,
+		 "Experiment only: use one instantaneous timekeeper state for future realtime/ART projection");
+
 module_param(activity_log, bool, 0644);
 MODULE_PARM_DESC(activity_log,
 		 "Log input captures and output activity to the kernel journal");
@@ -393,7 +399,7 @@ MODULE_PARM_DESC(output_phase_offset_ns,
 
 module_param(output_phase_tolerance_ns, ulong, 0644);
 MODULE_PARM_DESC(output_phase_tolerance_ns,
-		 "Output phase dead-band in ns: nudge the pending edge back onto the grid once the tracked phase error exceeds this (default 200; floor one ART cycle)");
+		 "Output phase dead-band in ns: 0 (default) selects one measured ART cycle; larger values request a wider dead-band; the floor is always one ART cycle");
 
 module_param_string(art_calibration, art_calibration_param,
 		    sizeof(art_calibration_param), 0444);
@@ -824,8 +830,10 @@ tgpio_parse_output_polarity(const char *value)
 static u32 tgpio_output_edge_bits(enum tgpio_logical_edge edge)
 {
 	/*
-	 * On the confirmed platform the compare EP bit is inverted relative to
-	 * the logical edge; output_polarity=inverted cancels that inversion.
+	 * The compare engine's EP encoding is inverted relative to the logical
+	 * edge on the hardware this driver supports. The output_polarity module
+	 * parameter permits boards with the opposite signal polarity to select
+	 * the direct encoding instead.
 	 */
 	enum tgpio_logical_edge inverted =
 		edge == TGPIO_EDGE_RISE ? TGPIO_EDGE_FALL : TGPIO_EDGE_RISE;
@@ -1525,6 +1533,42 @@ static struct tgpio_u64_result tgpio_get_current_art(void)
 	return tgpio_ok_u64(art);
 }
 
+/*
+ * Realized long-window CLOCK_REALTIME rate against ART. Retain the ratio
+ * rather than reducing it to integer cycles per second, preserving rate
+ * information below one cycle per second.
+ */
+static DEFINE_SEQLOCK(tgpio_realtime_rate_lock);
+static u64 tgpio_realtime_rate_art_cycles;
+static u64 tgpio_realtime_rate_real_ns;
+
+static u64 tgpio_output_phase_nudge_min_ns(void)
+{
+	u64 rate_art;
+	u64 rate_real;
+	u64 tick_ns;
+	unsigned int seq;
+
+	do {
+		seq = read_seqbegin(&tgpio_realtime_rate_lock);
+		rate_art = tgpio_realtime_rate_art_cycles;
+		rate_real = tgpio_realtime_rate_real_ns;
+	} while (read_seqretry(&tgpio_realtime_rate_lock, seq));
+
+	if (rate_art && rate_real) {
+		tick_ns = DIV_ROUND_CLOSEST_ULL(rate_real, rate_art);
+		return max_t(u64, tick_ns, 1);
+	}
+	if (READ_ONCE(art_frequency)) {
+		tick_ns = DIV_ROUND_CLOSEST_ULL(NSEC_PER_SEC,
+						 READ_ONCE(art_frequency));
+		return max_t(u64, tick_ns, 1);
+	}
+
+	/* Realtime output cannot be armed until its rate is available. */
+	return 1;
+}
+
 static struct tgpio_u64_result tgpio_realtime_delta_to_art_cycles(u64 delta_ns)
 {
 	ktime_t start;
@@ -1533,9 +1577,29 @@ static struct tgpio_u64_result tgpio_realtime_delta_to_art_cycles(u64 delta_ns)
 	struct tgpio_s64_result end_ns;
 	u64 start_art;
 	u64 end_art;
+	u64 rate_art;
+	u64 rate_real;
+	unsigned int seq;
 
 	if (!delta_ns || delta_ns > S64_MAX)
 		return tgpio_err_u64(TGPIO_E_RANGE);
+	do {
+		seq = read_seqbegin(&tgpio_realtime_rate_lock);
+		rate_art = tgpio_realtime_rate_art_cycles;
+		rate_real = tgpio_realtime_rate_real_ns;
+	} while (read_seqretry(&tgpio_realtime_rate_lock, seq));
+	if (rate_art && rate_real &&
+	    !READ_ONCE(experimental_instantaneous_realtime_projection))
+		return tgpio_rescale_nearest(delta_ns, rate_real, rate_art);
+	/*
+	 * Realtime output must wait for the measured rate. Projecting with a
+	 * single timekeeper multiplier state can introduce a repeatable phase
+	 * error while fractional rate correction is active. Clock-model modes
+	 * retain the legacy conversion for their one-time initialization.
+	 */
+	if (!tgpio_clock_uses_model() &&
+	    !READ_ONCE(experimental_instantaneous_realtime_projection))
+		return tgpio_err_u64(TGPIO_E_NODEV);
 
 	start = ktime_get_real();
 	start_ns = ktime_to_ns(start);
@@ -1610,15 +1674,55 @@ static struct tgpio_s64_result tgpio_clock_now_ns(struct tgpio_device *dev)
 static struct tgpio_u64_result tgpio_clock_ns_to_art(struct tgpio_device *dev,
 						     s64 ns)
 {
-	u64 art;
+	struct system_time_snapshot snapshot;
+	struct tgpio_u64_result delta;
+	u64 art_now;
+	s64 real_now;
 
 	if (tgpio_clock_uses_model())
 		return tgpio_phc_ns_to_art(tgpio_phc_params_get(dev), ns);
+	if (READ_ONCE(experimental_instantaneous_realtime_projection)) {
+		if (!ktime_real_to_base_clock(ns_to_ktime(ns), CSID_X86_ART,
+					      &art_now))
+			return tgpio_err_u64(TGPIO_E_NODEV);
+		return tgpio_ok_u64(art_now);
+	}
 
-	if (!ktime_real_to_base_clock(ns_to_ktime(ns), CSID_X86_ART, &art))
-		return tgpio_err_u64(TGPIO_E_NODEV);
+	/*
+	 * Do not invert a future realtime value directly. Fractional timekeeper
+	 * rate correction can alternate between adjacent integer multiplier
+	 * values, so extrapolation from one instantaneous value can accumulate a
+	 * multi-cycle phase error. Anchor at the current instant, where the
+	 * mapping is phase-continuous, then project with the measured long-window
+	 * rate used for periodic intervals.
+	 */
+	tgpio_get_realtime_snapshot(&snapshot);
+	if (tgpio_snapshot_art_cycles(&snapshot, &art_now)) {
+		real_now = ktime_to_ns(tgpio_snapshot_realtime(snapshot));
+	} else {
+		ktime_t real = ktime_get_real();
 
-	return tgpio_ok_u64(art);
+		real_now = ktime_to_ns(real);
+		if (!ktime_real_to_base_clock(real, CSID_X86_ART, &art_now))
+			return tgpio_err_u64(TGPIO_E_NODEV);
+	}
+	if (real_now < 0)
+		return tgpio_err_u64(TGPIO_E_RANGE);
+
+	delta = tgpio_realtime_delta_to_art_cycles(
+		ns >= real_now ? (u64)(ns - real_now) :
+				 (u64)(real_now - ns));
+	if (delta.status < 0)
+		return delta;
+	if (ns >= real_now) {
+		if (art_now > U64_MAX - delta.val)
+			return tgpio_err_u64(TGPIO_E_RANGE);
+		return tgpio_ok_u64(art_now + delta.val);
+	}
+	if (art_now < delta.val)
+		return tgpio_err_u64(TGPIO_E_RANGE);
+
+	return tgpio_ok_u64(art_now - delta.val);
 }
 
 static struct tgpio_u64_result
@@ -1683,25 +1787,37 @@ tgpio_clock_art_cycles_to_delta_ns(struct tgpio_device *dev, u64 cycles)
 static struct tgpio_s64_result tgpio_clock_art_to_ns(struct tgpio_device *dev,
 						     u64 art)
 {
-	struct tgpio_u64_result art_now;
+	struct system_time_snapshot snapshot;
 	struct tgpio_ns_result delta;
+	u64 art_now;
 	s64 real_now;
 
 	if (tgpio_clock_uses_model())
 		return tgpio_clock_phc_art_to_ns(dev, art);
 
-	art_now = tgpio_get_current_art();
-	real_now = ktime_get_real_ns();
-	if (art_now.status < 0)
-		return tgpio_err_s64(art_now.status);
+	/* Keep the ART and realtime anchors from one timekeeping snapshot.  Using
+	 * tgpio_get_current_art() followed by ktime_get_real_ns() makes the
+	 * gap between those observations look like output phase error.
+	 */
+	tgpio_get_realtime_snapshot(&snapshot);
+	if (tgpio_snapshot_art_cycles(&snapshot, &art_now)) {
+		real_now = ktime_to_ns(tgpio_snapshot_realtime(snapshot));
+	} else {
+		ktime_t real = ktime_get_real();
+
+		real_now = ktime_to_ns(real);
+		if (!ktime_real_to_base_clock(real, CSID_X86_ART, &art_now))
+			return tgpio_err_s64(TGPIO_E_NODEV);
+	}
+	if (real_now < 0)
+		return tgpio_err_s64(TGPIO_E_RANGE);
 
 	delta = tgpio_clock_art_cycles_to_delta_ns(
-		dev, art >= art_now.val ? art - art_now.val :
-					  art_now.val - art);
+		dev, art >= art_now ? art - art_now : art_now - art);
 	if (delta.status < 0 || delta.ns > S64_MAX)
 		return tgpio_err_s64(TGPIO_E_RANGE);
-	return tgpio_add_s64(real_now, art >= art_now.val ? (s64)delta.ns :
-							    -(s64)delta.ns);
+	return tgpio_add_s64(real_now, art >= art_now ? (s64)delta.ns :
+						 -(s64)delta.ns);
 }
 
 static struct tgpio_output_quantization
@@ -1802,10 +1918,29 @@ static struct { u64 art; s64 real; } tgpio_art_cal_ring[TGPIO_ART_CAL_RING];
 static unsigned int tgpio_art_cal_ring_head;
 static unsigned int tgpio_art_cal_ring_count;
 
+/*
+ * Realtime mode uses a separate short sliding window. This measures the
+ * realized average CLOCK_REALTIME/ART rate and therefore includes the
+ * timekeeper's fractional-multiplier compensation instead of sampling one
+ * phase of its multiplier dither.
+ */
+#define TGPIO_REALTIME_RATE_RING 8
+#define TGPIO_REALTIME_RATE_MIN_WINDOW_S 4
+struct tgpio_realtime_rate_sample {
+	u64 art;
+	s64 real;
+	unsigned int clock_was_set_seq;
+};
+static struct tgpio_realtime_rate_sample
+	tgpio_realtime_rate_ring[TGPIO_REALTIME_RATE_RING];
+static unsigned int tgpio_realtime_rate_ring_head;
+static unsigned int tgpio_realtime_rate_ring_count;
+
 struct tgpio_art_raw_sample {
 	enum tgpio_status status;
 	u64 art;
 	s64 raw;
+	unsigned int clock_was_set_seq;
 };
 
 /*
@@ -1847,20 +1982,44 @@ static struct tgpio_art_raw_sample tgpio_sample_art_real(void)
 	unsigned int i;
 
 	for (i = 0; i < 16; i++) {
-		s64 before = ktime_get_real_ns();
-		struct tgpio_u64_result art = tgpio_get_current_art();
-		s64 after = ktime_get_real_ns();
+		struct system_time_snapshot before_snapshot;
+		struct system_time_snapshot after_snapshot;
+		struct tgpio_u64_result art;
+		u64 snapshot_art;
+		s64 before;
+		s64 after;
+
+		tgpio_get_realtime_snapshot(&before_snapshot);
+		if (tgpio_snapshot_art_cycles(&before_snapshot, &snapshot_art))
+			return (struct tgpio_art_raw_sample){
+				.status = TGPIO_OK,
+				.art = snapshot_art,
+				.raw = ktime_to_ns(
+					tgpio_snapshot_realtime(before_snapshot)),
+				.clock_was_set_seq =
+					before_snapshot.clock_was_set_seq,
+			};
+
+		before = ktime_to_ns(tgpio_snapshot_realtime(before_snapshot));
+		art = tgpio_get_current_art();
+		tgpio_get_realtime_snapshot(&after_snapshot);
+		after = ktime_to_ns(tgpio_snapshot_realtime(after_snapshot));
 
 		if (art.status < 0)
 			return (struct tgpio_art_raw_sample){
 				.status = art.status
 			};
+		if (before_snapshot.clock_was_set_seq !=
+		    after_snapshot.clock_was_set_seq)
+			continue;
 		if (after - before < best_bracket) {
 			best_bracket = after - before;
 			best = (struct tgpio_art_raw_sample){
 				.status = TGPIO_OK,
 				.art = art.val,
 				.raw = before + (after - before) / 2,
+				.clock_was_set_seq =
+					before_snapshot.clock_was_set_seq,
 			};
 		}
 		if (best_bracket <= 300)
@@ -1972,7 +2131,68 @@ static void tgpio_art_refine_work_fn(struct work_struct *work)
 	u64 base;
 
 	if (!tgpio_clock_uses_model()) {
+		struct tgpio_art_raw_sample real = tgpio_sample_art_real();
+		unsigned int oldest;
+
+		if (real.status < 0)
+			goto realtime_resched;
+		if (tgpio_realtime_rate_ring_count) {
+			u64 delta_art;
+			s64 delta_real;
+
+			oldest = tgpio_realtime_rate_ring_count <
+					 TGPIO_REALTIME_RATE_RING ?
+					 0 : tgpio_realtime_rate_ring_head;
+			if (real.clock_was_set_seq !=
+			    tgpio_realtime_rate_ring[oldest].clock_was_set_seq) {
+				/* A clock step changes phase, not the established rate. */
+				tgpio_realtime_rate_ring_count = 0;
+				tgpio_realtime_rate_ring_head = 0;
+				goto realtime_store;
+			}
+			if (real.art <= tgpio_realtime_rate_ring[oldest].art ||
+			    real.raw <= tgpio_realtime_rate_ring[oldest].real) {
+				tgpio_realtime_rate_ring_count = 0;
+				tgpio_realtime_rate_ring_head = 0;
+				write_seqlock_irqsave(&tgpio_realtime_rate_lock,
+						 flags);
+				tgpio_realtime_rate_art_cycles = 0;
+				tgpio_realtime_rate_real_ns = 0;
+				write_sequnlock_irqrestore(&tgpio_realtime_rate_lock,
+						    flags);
+				goto realtime_store;
+			}
+			delta_art = real.art -
+				    tgpio_realtime_rate_ring[oldest].art;
+			delta_real = real.raw -
+				     tgpio_realtime_rate_ring[oldest].real;
+			if (delta_real >= TGPIO_REALTIME_RATE_MIN_WINDOW_S *
+					  (s64)NSEC_PER_SEC) {
+				write_seqlock_irqsave(&tgpio_realtime_rate_lock,
+						 flags);
+				tgpio_realtime_rate_art_cycles = delta_art;
+				tgpio_realtime_rate_real_ns = (u64)delta_real;
+				write_sequnlock_irqrestore(&tgpio_realtime_rate_lock,
+						    flags);
+				if (tgpio_log_verbose())
+					pr_info("verbose=realtime_rate delta_art=%llu window_ns=%lld\n",
+						delta_art, delta_real);
+			}
+		}
+realtime_store:
+		tgpio_realtime_rate_ring[tgpio_realtime_rate_ring_head].art =
+			real.art;
+		tgpio_realtime_rate_ring[tgpio_realtime_rate_ring_head].real =
+			real.raw;
+		tgpio_realtime_rate_ring[tgpio_realtime_rate_ring_head]
+			.clock_was_set_seq = real.clock_was_set_seq;
+		tgpio_realtime_rate_ring_head =
+			(tgpio_realtime_rate_ring_head + 1) %
+			TGPIO_REALTIME_RATE_RING;
+		if (tgpio_realtime_rate_ring_count < TGPIO_REALTIME_RATE_RING)
+			tgpio_realtime_rate_ring_count++;
 		tgpio_update_outputs_after_phc_freq(dev);
+realtime_resched:
 		schedule_delayed_work(&dev->art_refine_work,
 				      TGPIO_REALTIME_RESYNC_S * HZ);
 		return;
@@ -2336,10 +2556,10 @@ static void tgpio_apply_input(struct tgpio_mmio_block *mmio_block, int desired)
  * result is signed stop-minus-start, so a stop that precedes its start
  * reads negative. Both timestamps come from the hardware capture registers
  * in the same ART domain, so the duration is immune to clock discipline
- * and software latency; the resolution is one ART cycle per edge (about
- * 26 ns at 38.4 MHz). Multiple edges inside one poll window latch only the
- * last capture: repeated edges on the armed input re-arm (latest wins),
- * overwritten captures are counted in tdc_lost.
+ * and software latency; the resolution is one ART cycle per edge. Multiple
+ * edges inside one poll window latch only the last capture: repeated edges
+ * on the armed input re-arm (latest wins), overwritten captures are counted
+ * in tdc_lost.
  */
 /*
  * poll_work-only: automatic output polarity verification. When a reference
@@ -2798,7 +3018,8 @@ tgpio_clock_ns_to_compare_art(struct tgpio_device *dev, s64 edge_time_ns)
 static enum tgpio_status
 tgpio_program_output_edge(struct tgpio_device *dev,
 			  struct tgpio_mmio_block *mmio_block,
-			  ktime_t edge_time, u32 edge_bits)
+			  ktime_t edge_time, u32 edge_bits,
+			  const char *rounding_event)
 {
 	struct tgpio_u64_result art =
 		tgpio_clock_ns_to_compare_art(dev, ktime_to_ns(edge_time));
@@ -2821,7 +3042,7 @@ tgpio_program_output_edge(struct tgpio_device *dev,
 		tgpio_write_ctl(mmio_block, ctrl);
 		tgpio_write_compv(mmio_block, art.val);
 	}
-	tgpio_log_rounding_edge(dev, mmio_block, "software_edge",
+	tgpio_log_rounding_edge(dev, mmio_block, rounding_event,
 				ktime_to_ns(edge_time), art.val);
 	return TGPIO_OK;
 }
@@ -3127,14 +3348,18 @@ tgpio_hw_periodic_phase_get(struct tgpio_device *dev,
 		 * Realtime mode: the pending time above went through a
 		 * bracketed ART/realtime pairing, whose sampling noise would
 		 * enter every nudge. The noisy value is only used to pick
-		 * the nearest grid edge; the error is then recomputed
-		 * exactly in the ART domain through the timekeeper's
+		 * the nearest grid edge; the error is then recomputed in the ART
+		 * domain through the timekeeper's
 		 * realtime-to-ART conversion of that edge.
 		 */
 		struct tgpio_u64_result target = tgpio_clock_ns_to_compare_art(
 			dev, pending.val - err_ns);
 		struct tgpio_ns_result exact;
-		u64 pending_art = compv + TGPIO_ART_HW_DELAY_CYCLES;
+		/* tgpio_clock_ns_to_compare_art() returns the COMPV-domain value
+		 * with the hardware delay already subtracted.  Compare it with
+		 * COMPV, not with the physical-edge ART value (COMPV + delay).
+		 */
+		u64 pending_art = compv;
 		bool late;
 
 		if (target.status == TGPIO_OK) {
@@ -3238,7 +3463,8 @@ static int tgpio_arm_output(struct tgpio_device *dev,
 	if (mode != TGPIO_OUTPUT_HARDWARE &&
 	    tgpio_program_output_edge(
 		    dev, mmio_block, ns_to_ktime(prime_edge_ns),
-		    tgpio_output_edge_bits(TGPIO_EDGE_FALL)) != TGPIO_OK) {
+		    tgpio_output_edge_bits(TGPIO_EDGE_FALL),
+		    "software_prime") != TGPIO_OK) {
 		tgpio_disable_output_hw(mmio_block);
 		return -ENODEV;
 	}
@@ -3559,8 +3785,13 @@ static void tgpio_hw_periodic_apply_freq(struct tgpio_device *dev,
 	}
 
 	tolerance = max_t(s64, READ_ONCE(output_phase_tolerance_ns),
-			  TGPIO_OUTPUT_PHASE_NUDGE_MIN_NS);
-	if (phase.error_ns >= -tolerance && phase.error_ns <= tolerance)
+			  (s64)tgpio_output_phase_nudge_min_ns());
+	/*
+	 * The dead-band is open at its boundary: one full ART tick of error is
+	 * already correctable.  Treating +/- one tick as inside waits for two
+	 * ticks and doubles the steady-state phase sawtooth.
+	 */
+	if (phase.error_ns > -tolerance && phase.error_ns < tolerance)
 		return;
 	if (!phase.nudge_safe)
 		return; /* edge imminent; retry on the next frequency update */
@@ -3823,7 +4054,9 @@ static void tgpio_output_work(struct work_struct *work)
 	next_interval_ns = tgpio_output_interval_after_edge(mmio_block, edge);
 
 	interval = tgpio_clock_delta_to_real_ns(dev, next_interval_ns);
-	if (tgpio_program_output_edge(dev, mmio_block, next_edge, edge_bits) !=
+	if (tgpio_program_output_edge(dev, mmio_block, next_edge, edge_bits,
+			       edge == TGPIO_EDGE_RISE ? "software_rising" :
+						       "software_falling") !=
 		    TGPIO_OK ||
 	    interval.status < 0 || interval.val == 0) {
 		hrtimer_cancel(&mmio_block->output_timer);
@@ -5085,6 +5318,52 @@ static int tgpio_status_show(struct seq_file *m, void *v)
 }
 DEFINE_SHOW_ATTRIBUTE(tgpio_status);
 
+/*
+ * Read-only experiment record. The two paired ART/realtime snapshots bracket
+ * the MMIO read, allowing post-processing to reconstruct the timekeeper
+ * mapping around an output edge without using the external edge receiver.
+ * This file does not change output state or scheduling.
+ */
+static int tgpio_qerr_snapshot_show(struct seq_file *m, void *v)
+{
+	struct tgpio_device *dev = m->private;
+	struct tgpio_mmio_block *block = &dev->mmio_blocks[0];
+	struct system_time_snapshot before, after;
+	u64 art_before, art_after, compv, piv;
+	u32 ctl;
+
+	if (block->mode != TGPIO_MODE_OUTPUT)
+		return -EOPNOTSUPP;
+
+	tgpio_get_realtime_snapshot(&before);
+	compv = tgpio_read_compv(block);
+	piv = (u64)tgpio_readl(block, TGPIOPIV31_0) |
+	      ((u64)tgpio_readl(block, TGPIOPIV63_32) << 32);
+	ctl = tgpio_read_ctl(block);
+	tgpio_get_realtime_snapshot(&after);
+	/* The target kernel exposes ART as the base clock but does not populate
+	 * snapshot.cycles with ART. In that case, invert each snapshot's *own*
+	 * realtime value, rather than projecting a future value. The two pairs
+	 * remain independent of the external physical edge receiver.
+	 */
+	if (!tgpio_snapshot_art_cycles(&before, &art_before) &&
+	    !ktime_real_to_base_clock(tgpio_snapshot_realtime(before),
+					   CSID_X86_ART, &art_before))
+		return -ENODEV;
+	if (!tgpio_snapshot_art_cycles(&after, &art_after) &&
+	    !ktime_real_to_base_clock(tgpio_snapshot_realtime(after),
+					   CSID_X86_ART, &art_after))
+		return -ENODEV;
+
+	seq_printf(m, "%llu,%lld,%u,%llu,%lld,%u,%llu,%llu,%u\n",
+		   art_before, ktime_to_ns(tgpio_snapshot_realtime(before)),
+		   before.clock_was_set_seq,
+		   art_after, ktime_to_ns(tgpio_snapshot_realtime(after)),
+		   after.clock_was_set_seq, compv, piv, ctl);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(tgpio_qerr_snapshot);
+
 static struct dentry *tgpio_debugfs_dir;
 
 /*
@@ -5238,6 +5517,8 @@ static void tgpio_debugfs_init(struct tgpio_device *dev)
 	tgpio_debugfs_dir = debugfs_create_dir("tgpio", NULL);
 	debugfs_create_file("status", 0444, tgpio_debugfs_dir, dev,
 			    &tgpio_status_fops);
+	debugfs_create_file("qerr_snapshot", 0444, tgpio_debugfs_dir, dev,
+			    &tgpio_qerr_snapshot_fops);
 	debugfs_create_file("tdc_reset", 0200, tgpio_debugfs_dir, dev,
 			    &tgpio_tdc_reset_fops);
 
@@ -5420,12 +5701,13 @@ static int __init tgpio_input_init(void)
 	if (ret)
 		goto err_cleanup;
 
-	/* Realtime mode: the system clock is steered behind the driver's
-	 * back, so running outputs need periodic re-sync to its grid.
+	/* Realtime mode: begin rate acquisition immediately. The system clock is
+	 * steered behind the driver's back, so running outputs also need periodic
+	 * re-sync to its grid. Output requests made during acquisition remain
+	 * pending and are retried by the refinement work.
 	 */
 	if (clock_mode == TGPIO_CLOCK_REALTIME)
-		schedule_delayed_work(&tgpio->art_refine_work,
-				      TGPIO_REALTIME_RESYNC_S * HZ);
+		schedule_delayed_work(&tgpio->art_refine_work, 0);
 
 	pr_info("loaded with tgpio0=%s tgpio1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s hardware_periodic_output=%c activity_log=%c\n",
 		tgpio_mode_name(tgpio->mmio_blocks[0].mode),

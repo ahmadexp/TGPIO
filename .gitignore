@@ -4,3 +4,14 @@
 *.swp
 *.swo
 *.tex.swp
+/tools/tgpio-loopback
+/.secureboot/
+*.cmd
+*.ko
+*.log
+*.mod
+*.mod.c
+*.o
+Module.symvers
+modules.order
+/tools/__pycache__
