@@ -44,6 +44,37 @@ build.cmd
 
 Outputs: `driver\x64\Release\tgpio\` (driver package) and `out\tgpioctl.exe`.
 
+## Unsigned Microsoft signing submission
+
+`Prepare-Submission.ps1` builds a Release x64 package without test signatures,
+runs INF and catalog validation, and creates a CAB for the signing partner.
+Use an x64 Visual Studio 2022 developer environment with the WDK build tools.
+Restore the pinned, matching SDK/WDK packages before running it:
+
+```powershell
+nuget restore packages.config -PackagesDirectory packages -NonInteractive
+.\Prepare-Submission.ps1
+```
+
+Start with no `out/signing` directory. The output includes
+`out/signing/TGPIO-18.0.0.2-x64-unsigned.cab`, matching PDB symbols, the control
+tool, checksums, build logs, and a source-revision record. The CAB contains
+`tgpio.sys`, `tgpio.inf`, `tgpio.cat`, `tgpio.ico` and `tgpio.pdb` inside a
+`TGPIOx64` subfolder. The signing partner must sign the CAB and complete the
+Microsoft Hardware Dev Center submission before installation on a normal
+Windows system.
+
+The compiler/linker target is explicitly Windows 10 1709 (build 16299),
+matching the INF's minimum build. KMDF remains 1.15. The pinned WDK version
+is the build tool version, not the minimum Windows version. Catalog checks
+cover x64 Windows 10 1709 through the listed Windows 11 25H2 target.
+These checks do not constitute runtime, HLK, Secure Boot or HVCI validation;
+the bare-metal restrictions below still apply.
+
+The `Windows signing package` workflow builds this same package on a Windows
+runner and retains its logs and artifacts. It does not hold a signing key,
+install the driver, or upload a submission to Microsoft.
+
 ## Install (test machine only)
 
 The build test-signs the driver. Enable test signing once and reboot:
