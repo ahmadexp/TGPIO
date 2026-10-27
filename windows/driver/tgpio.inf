@@ -14,7 +14,7 @@ Signature   = "$WINDOWS NT$"
 Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 07/14/2026,18.0.0.1
+DriverVer   = 10/27/2026,18.0.0.2
 CatalogFile = tgpio.cat
 PnpLockdown = 1
 

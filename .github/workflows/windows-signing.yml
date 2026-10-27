@@ -1,0 +1,30 @@
+name: Windows signing package
+on:
+  push:
+    branches: [windows-signing-package]
+    paths: ['windows/**', '.github/workflows/windows-signing.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore matching SDK and WDK
+        shell: pwsh
+        run: nuget restore windows/packages.config -PackagesDirectory windows/packages -NonInteractive
+      - name: Build and validate unsigned CAB
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          .\windows\Prepare-Submission.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: TGPIO-Windows-signing
+          path: windows/out/signing
+          if-no-files-found: warn

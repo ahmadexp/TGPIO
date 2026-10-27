@@ -15,3 +15,5 @@
 Module.symvers
 modules.order
 /tools/__pycache__
+
+/windows/packages/
