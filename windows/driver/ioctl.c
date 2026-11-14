@@ -6,7 +6,7 @@
  * Copyright (c) 2026 Ahmad Byagowi
  *
  * Thin glue between the user-mode interface and the hardware layer. All
- * hardware access runs under the device spin lock; requests are already
+ * hardware access runs under the device wait lock; requests are already
  * serialized by the sequential queue, the lock additionally fences the
  * power transitions and surprise removal.
  */
@@ -16,9 +16,9 @@
 _When_(return != FALSE, _Acquires_lock_(dev->lock))
 static BOOLEAN tgpio_lock_online(struct tgpio_win_device *dev)
 {
-	WdfSpinLockAcquire(dev->lock);
+	WdfWaitLockAcquire(dev->lock, NULL);
 	if (dev->removed) {
-		WdfSpinLockRelease(dev->lock);
+		WdfWaitLockRelease(dev->lock);
 		return FALSE;
 	}
 	return TRUE;
@@ -109,7 +109,7 @@ static NTSTATUS tgpio_ioctl_set_input(struct tgpio_win_device *dev,
 	tgpio_hw_set_input(block, in->enable ? TRUE : FALSE, edge_bits);
 	block->mode = in->enable ? TGPIO_WIN_BLOCK_INPUT :
 				   TGPIO_WIN_BLOCK_OFF;
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 	return STATUS_SUCCESS;
 }
 
@@ -150,7 +150,7 @@ static NTSTATUS tgpio_ioctl_read_capture(struct tgpio_win_device *dev,
 	tgpio_hw_read_capture(block, &out->event_count, &out->art_cycles);
 	out->tsc_now = __rdtsc();
 	KeQuerySystemTimePrecise(&systime);
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 
 	out->systime_100ns = (unsigned __int64)systime.QuadPart;
 	*written = sizeof(*out);
@@ -187,7 +187,7 @@ static NTSTATUS tgpio_ioctl_start_output(struct tgpio_win_device *dev,
 				       low_cycles, in->first_edge_art);
 	block->mode = NT_SUCCESS(status) ? TGPIO_WIN_BLOCK_OUTPUT :
 					   TGPIO_WIN_BLOCK_OFF;
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 	return status;
 }
 
@@ -208,7 +208,7 @@ static NTSTATUS tgpio_ioctl_stop_output(struct tgpio_win_device *dev,
 		return STATUS_DEVICE_REMOVED;
 	tgpio_hw_stop_output(block);
 	block->mode = TGPIO_WIN_BLOCK_OFF;
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 	return STATUS_SUCCESS;
 }
 
@@ -228,7 +228,7 @@ static NTSTATUS tgpio_ioctl_invert_output(struct tgpio_win_device *dev,
 	if (!tgpio_lock_online(dev))
 		return STATUS_DEVICE_REMOVED;
 	tgpio_hw_invert_output(block);
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 	return STATUS_SUCCESS;
 }
 
@@ -262,7 +262,7 @@ static NTSTATUS tgpio_ioctl_get_block(struct tgpio_win_device *dev,
 	tgpio_hw_read_capture(block, &out->event_count, &art);
 	out->flop_high = block->flop_high;
 	out->reserved = 0;
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 
 	*written = sizeof(*out);
 	return STATUS_SUCCESS;

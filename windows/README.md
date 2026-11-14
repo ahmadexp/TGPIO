@@ -67,7 +67,7 @@ nuget restore packages.config -PackagesDirectory packages -NonInteractive
 ```
 
 Start with no `out/signing` directory. The output includes
-`out/signing/TGPIO-18.0.0.3-x64-unsigned.cab`, matching PDB symbols, the control
+`out/signing/TGPIO-18.0.0.4-x64-unsigned.cab`, matching PDB symbols, the control
 tool, checksums, build logs, and a source-revision record. The CAB contains
 `tgpio.sys`, `tgpio.inf`, `tgpio.cat`, `tgpio.ico` and `tgpio.pdb` inside a
 `TGPIOx64` subfolder. The signing partner must sign the CAB and complete the

@@ -81,7 +81,7 @@ struct tgpio_win_block {
 /* WDF context macros token-paste the type name: keep it a bare typedef. */
 typedef struct tgpio_win_device {
 	WDFDEVICE wdf_device;
-	WDFSPINLOCK lock; /* serializes all hardware access */
+	WDFWAITLOCK lock; /* serializes all hardware access */
 	struct tgpio_win_block block[TGPIO_WIN_MAX_BLOCKS];
 	ULONG block_count;
 	BOOLEAN removed;

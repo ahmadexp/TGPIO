@@ -62,6 +62,7 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes,
 						TGPIO_DEVICE_CONTEXT);
+	attributes.ExecutionLevel = WdfExecutionLevelPassive;
 	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&power);
 	power.EvtDevicePrepareHardware = tgpio_evt_prepare;
 	power.EvtDeviceReleaseHardware = tgpio_evt_release;
@@ -99,7 +100,7 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 
 	WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
 	attributes.ParentObject = wdf_device;
-	status = WdfSpinLockCreate(&attributes, &dev->lock);
+	status = WdfWaitLockCreate(&attributes, &dev->lock);
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -174,14 +175,14 @@ NTSTATUS tgpio_evt_d0_entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous)
 		dev->art_frequency_hz = dev->art_frequency_override;
 	if (!dev->art_frequency_hz)
 		return STATUS_NOT_SUPPORTED;
-	WdfSpinLockAcquire(dev->lock);
+	WdfWaitLockAcquire(dev->lock, NULL);
 	if (dev->removed) {
-		WdfSpinLockRelease(dev->lock);
+		WdfWaitLockRelease(dev->lock);
 		return STATUS_DEVICE_REMOVED;
 	}
 	for (i = 0; i < dev->block_count; ++i)
 		tgpio_hw_resume(&dev->block[i]);
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 	return STATUS_SUCCESS;
 }
 
@@ -191,12 +192,12 @@ NTSTATUS tgpio_evt_d0_exit(WDFDEVICE device, WDF_POWER_DEVICE_STATE next)
 	ULONG i;
 
 	UNREFERENCED_PARAMETER(next);
-	WdfSpinLockAcquire(dev->lock);
+	WdfWaitLockAcquire(dev->lock, NULL);
 	if (!dev->removed) {
 		for (i = 0; i < dev->block_count; ++i)
 			tgpio_hw_suspend(&dev->block[i]);
 	}
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 	return STATUS_SUCCESS;
 }
 
@@ -204,9 +205,9 @@ VOID tgpio_evt_surprise_removal(WDFDEVICE device)
 {
 	struct tgpio_win_device *dev = tgpio_win_get_context(device);
 
-	WdfSpinLockAcquire(dev->lock);
+	WdfWaitLockAcquire(dev->lock, NULL);
 	dev->removed = TRUE;
-	WdfSpinLockRelease(dev->lock);
+	WdfWaitLockRelease(dev->lock);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,

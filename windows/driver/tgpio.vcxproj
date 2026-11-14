@@ -80,7 +80,7 @@
       <!-- Keep upgrades monotonic across midnight; automatic StampInf time
            versions can otherwise sort below the package already installed. -->
       <DateStamp>11/13/2026</DateStamp>
-      <TimeStamp>18.0.0.3</TimeStamp>
+      <TimeStamp>18.0.0.4</TimeStamp>
     </Inf>
     <None Include="tgpio.ico" />
   </ItemGroup>
