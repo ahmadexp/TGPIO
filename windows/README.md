@@ -44,6 +44,16 @@ build.cmd
 
 Outputs: `driver\x64\Release\tgpio\` (driver package) and `out\tgpioctl.exe`.
 
+For the W890 qualification workstation, build with
+`Prepare-Submission.ps1 -Board W890`. This selects the verified ACPI ranges
+at 0xF6801210 and 0xF6801310 before catalog creation. The default package
+uses the Z890 addresses.
+
+Windows quiesces the pins before leaving D0. On resume, the driver reads the
+current ART calibration and restores the input edge selection. A scheduled
+output returns to the off state. Read the hardware clock and arm a new first
+edge after wake, since an absolute deadline can expire during sleep.
+
 ## Unsigned Microsoft signing submission
 
 `Prepare-Submission.ps1` builds a Release x64 package without test signatures,
@@ -57,7 +67,7 @@ nuget restore packages.config -PackagesDirectory packages -NonInteractive
 ```
 
 Start with no `out/signing` directory. The output includes
-`out/signing/TGPIO-18.0.0.2-x64-unsigned.cab`, matching PDB symbols, the control
+`out/signing/TGPIO-18.0.0.3-x64-unsigned.cab`, matching PDB symbols, the control
 tool, checksums, build logs, and a source-revision record. The CAB contains
 `tgpio.sys`, `tgpio.inf`, `tgpio.cat`, `tgpio.ico` and `tgpio.pdb` inside a
 `TGPIOx64` subfolder. The signing partner must sign the CAB and complete the

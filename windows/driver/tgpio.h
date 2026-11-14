@@ -63,6 +63,7 @@ struct tgpio_win_block {
 	PHYSICAL_ADDRESS phys;
 	ULONG mmio_size;
 	enum tgpio_win_block_mode mode;
+	ULONG input_edge_bits;
 
 	/*
 	 * Output level mirror. The hardware flop holds the level of the last
@@ -83,6 +84,8 @@ typedef struct tgpio_win_device {
 	WDFSPINLOCK lock; /* serializes all hardware access */
 	struct tgpio_win_block block[TGPIO_WIN_MAX_BLOCKS];
 	ULONG block_count;
+	BOOLEAN removed;
+	ULONG art_frequency_override;
 
 	unsigned __int64 art_frequency_hz;
 	ULONG tsc_art_numerator;
@@ -108,6 +111,8 @@ NTSTATUS tgpio_hw_start_output(struct tgpio_win_device *dev,
 			       unsigned __int64 high_cycles,
 			       unsigned __int64 low_cycles,
 			       unsigned __int64 first_edge_art);
+void tgpio_hw_suspend(struct tgpio_win_block *block);
+void tgpio_hw_resume(struct tgpio_win_block *block);
 void tgpio_hw_stop_output(struct tgpio_win_block *block);
 void tgpio_hw_invert_output(struct tgpio_win_block *block);
 void tgpio_hw_flop_fold(struct tgpio_win_block *block);

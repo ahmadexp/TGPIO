@@ -8,6 +8,9 @@ permissions:
   contents: read
 jobs:
   build:
+    strategy:
+      matrix:
+        board: [Z890, W890]
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -21,10 +24,10 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
-          .\windows\Prepare-Submission.ps1
+          .\windows\Prepare-Submission.ps1 -Board '${{ matrix.board }}'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: TGPIO-Windows-signing
+          name: ${{ matrix.board == 'Z890' && 'TGPIO-Windows-signing' || 'TGPIO-W890-Windows-signing' }}
           path: windows/out/signing
           if-no-files-found: warn

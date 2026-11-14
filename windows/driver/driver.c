@@ -16,7 +16,11 @@
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD tgpio_evt_device_add;
-EVT_WDF_DEVICE_CONTEXT_CLEANUP tgpio_evt_device_cleanup;
+EVT_WDF_DEVICE_PREPARE_HARDWARE tgpio_evt_prepare;
+EVT_WDF_DEVICE_RELEASE_HARDWARE tgpio_evt_release;
+EVT_WDF_DEVICE_D0_ENTRY tgpio_evt_d0_entry;
+EVT_WDF_DEVICE_D0_EXIT tgpio_evt_d0_exit;
+EVT_WDF_DEVICE_SURPRISE_REMOVAL tgpio_evt_surprise_removal;
 
 static ULONG tgpio_reg_read_ulong(WDFKEY key, PCWSTR name, ULONG fallback)
 {
@@ -40,23 +44,11 @@ static unsigned __int64 tgpio_reg_read_addr(WDFKEY key, PCWSTR low_name,
 	return ((unsigned __int64)high << 32) | low;
 }
 
-static NTSTATUS tgpio_map_block(struct tgpio_win_block *block,
-				unsigned __int64 phys_addr, ULONG size)
-{
-	block->phys.QuadPart = (LONGLONG)phys_addr;
-	block->mmio_size = size;
-	block->regs = (volatile UCHAR *)MmMapIoSpaceEx(
-		block->phys, size, PAGE_READWRITE | PAGE_NOCACHE);
-	if (!block->regs)
-		return STATUS_INSUFFICIENT_RESOURCES;
-	block->mode = TGPIO_WIN_BLOCK_OFF;
-	return STATUS_SUCCESS;
-}
-
 NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 {
 	WDF_OBJECT_ATTRIBUTES attributes;
 	WDF_IO_QUEUE_CONFIG queue_config;
+	WDF_PNPPOWER_EVENT_CALLBACKS power;
 	DECLARE_CONST_UNICODE_STRING(symlink, TGPIO_SYMLINK_NAME);
 	struct tgpio_win_device *dev;
 	WDFDEVICE wdf_device;
@@ -66,12 +58,17 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 	unsigned __int64 addr1 = TGPIO_DEFAULT_ADDR1;
 	ULONG mmio_size = TGPIO_DEFAULT_MMIO_SIZE;
 	ULONG use_second = 1;
-	ULONG art_frequency_override = 0;
 	NTSTATUS status;
 
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes,
 						TGPIO_DEVICE_CONTEXT);
-	attributes.EvtCleanupCallback = tgpio_evt_device_cleanup;
+	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&power);
+	power.EvtDevicePrepareHardware = tgpio_evt_prepare;
+	power.EvtDeviceReleaseHardware = tgpio_evt_release;
+	power.EvtDeviceD0Entry = tgpio_evt_d0_entry;
+	power.EvtDeviceD0Exit = tgpio_evt_d0_exit;
+	power.EvtDeviceSurpriseRemoval = tgpio_evt_surprise_removal;
+	WdfDeviceInitSetPnpPowerEventCallbacks(device_init, &power);
 
 	status = WdfDeviceCreate(&device_init, &attributes, &wdf_device);
 	if (!NT_SUCCESS(status))
@@ -80,12 +77,6 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 	dev = tgpio_win_get_context(wdf_device);
 	RtlZeroMemory(dev, sizeof(*dev));
 	dev->wdf_device = wdf_device;
-
-	status = tgpio_art_detect(dev);
-	if (!NT_SUCCESS(status)) {
-		KdPrint(("tgpio: no ART on this CPU (CPUID leaf 0x15)\n"));
-		return status;
-	}
 
 	if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(
 		    driver, KEY_READ, WDF_NO_OBJECT_ATTRIBUTES,
@@ -99,44 +90,28 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 		use_second = tgpio_reg_read_ulong(params_key, L"UseSecond",
 						  use_second);
 		/* Crystal frequency when CPUID 15h leaves ECX zero. */
-		art_frequency_override = tgpio_reg_read_ulong(
+		dev->art_frequency_override = tgpio_reg_read_ulong(
 			params_key, L"ArtFrequencyHz", 0);
-		if (art_frequency_override)
-			dev->art_frequency_hz = art_frequency_override;
 		WdfRegistryClose(params_key);
 	}
-	if (!dev->art_frequency_hz) {
-		KdPrint(("tgpio: CPUID 15h has no crystal frequency; set "
-			 "the ArtFrequencyHz registry parameter\n"));
-		return STATUS_NOT_SUPPORTED;
-	}
-	KdPrint(("tgpio: ART %llu Hz, TSC/ART %lu/%lu, tsc_adjust %llu\n",
-		 dev->art_frequency_hz, dev->tsc_art_numerator,
-		 dev->tsc_art_denominator, dev->tsc_adjust));
 	if (mmio_size < TGPIO_DEFAULT_MMIO_SIZE)
 		mmio_size = TGPIO_DEFAULT_MMIO_SIZE;
 
-	status = WdfSpinLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &dev->lock);
+	WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+	attributes.ParentObject = wdf_device;
+	status = WdfSpinLockCreate(&attributes, &dev->lock);
 	if (!NT_SUCCESS(status))
 		return status;
 
-	status = tgpio_map_block(&dev->block[0], addr0, mmio_size);
-	if (!NT_SUCCESS(status))
-		return status;
-	dev->block_count = 1;
-
-	if (use_second) {
-		status = tgpio_map_block(&dev->block[1], addr1, mmio_size);
-		if (!NT_SUCCESS(status))
-			return status; /* cleanup unmaps block 0 */
-		dev->block_count = 2;
-	}
-
-	KdPrint(("tgpio: mapped %lu block(s) at 0x%llx / 0x%llx size 0x%lx\n",
-		 dev->block_count, addr0, use_second ? addr1 : 0, mmio_size));
+	dev->block_count = use_second ? 2 : 1;
+	dev->block[0].phys.QuadPart = (LONGLONG)addr0;
+	dev->block[0].mmio_size = mmio_size;
+	dev->block[1].phys.QuadPart = (LONGLONG)addr1;
+	dev->block[1].mmio_size = mmio_size;
 
 	WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queue_config,
 					       WdfIoQueueDispatchSequential);
+	queue_config.PowerManaged = WdfTrue;
 	queue_config.EvtIoDeviceControl = tgpio_evt_ioctl;
 	status = WdfIoQueueCreate(wdf_device, &queue_config,
 				  WDF_NO_OBJECT_ATTRIBUTES, &queue);
@@ -146,24 +121,92 @@ NTSTATUS tgpio_evt_device_add(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 	return WdfDeviceCreateSymbolicLink(wdf_device, &symlink);
 }
 
-VOID tgpio_evt_device_cleanup(WDFOBJECT object)
+NTSTATUS tgpio_evt_prepare(WDFDEVICE device, WDFCMRESLIST raw,
+			   WDFCMRESLIST translated)
 {
-	struct tgpio_win_device *dev = tgpio_win_get_context(object);
+	struct tgpio_win_device *dev = tgpio_win_get_context(device);
 	ULONG i;
 
-	for (i = 0; i < TGPIO_WIN_MAX_BLOCKS; i++) {
+	/* ROOT\TGPIO has no translated resources. Its pinned board profile
+	 * supplies the two addresses, as on the legacy root installation. */
+	UNREFERENCED_PARAMETER(raw);
+	UNREFERENCED_PARAMETER(translated);
+	for (i = 0; i < dev->block_count; ++i) {
 		struct tgpio_win_block *block = &dev->block[i];
 
+		block->regs = MmMapIoSpaceEx(block->phys, block->mmio_size,
+					     PAGE_READWRITE | PAGE_NOCACHE);
 		if (!block->regs)
-			continue;
-		/* Leave the pins quiet across unload. */
-		if (block->mode == TGPIO_WIN_BLOCK_OUTPUT)
-			tgpio_hw_stop_output(block);
-		else if (block->mode == TGPIO_WIN_BLOCK_INPUT)
-			tgpio_hw_set_input(block, FALSE, 0);
-		MmUnmapIoSpace((PVOID)block->regs, block->mmio_size);
-		block->regs = NULL;
+			return STATUS_INSUFFICIENT_RESOURCES;
 	}
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS tgpio_evt_release(WDFDEVICE device, WDFCMRESLIST translated)
+{
+	struct tgpio_win_device *dev = tgpio_win_get_context(device);
+	ULONG i;
+
+	UNREFERENCED_PARAMETER(translated);
+	/* KMDF also calls this after a partially successful prepare. */
+	for (i = 0; i < dev->block_count; ++i) {
+		struct tgpio_win_block *block = &dev->block[i];
+
+		if (block->regs) {
+			MmUnmapIoSpace((PVOID)block->regs, block->mmio_size);
+			block->regs = NULL;
+		}
+	}
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS tgpio_evt_d0_entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous)
+{
+	struct tgpio_win_device *dev = tgpio_win_get_context(device);
+	NTSTATUS status;
+	ULONG i;
+
+	UNREFERENCED_PARAMETER(previous);
+	status = tgpio_art_detect(dev);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (dev->art_frequency_override)
+		dev->art_frequency_hz = dev->art_frequency_override;
+	if (!dev->art_frequency_hz)
+		return STATUS_NOT_SUPPORTED;
+	WdfSpinLockAcquire(dev->lock);
+	if (dev->removed) {
+		WdfSpinLockRelease(dev->lock);
+		return STATUS_DEVICE_REMOVED;
+	}
+	for (i = 0; i < dev->block_count; ++i)
+		tgpio_hw_resume(&dev->block[i]);
+	WdfSpinLockRelease(dev->lock);
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS tgpio_evt_d0_exit(WDFDEVICE device, WDF_POWER_DEVICE_STATE next)
+{
+	struct tgpio_win_device *dev = tgpio_win_get_context(device);
+	ULONG i;
+
+	UNREFERENCED_PARAMETER(next);
+	WdfSpinLockAcquire(dev->lock);
+	if (!dev->removed) {
+		for (i = 0; i < dev->block_count; ++i)
+			tgpio_hw_suspend(&dev->block[i]);
+	}
+	WdfSpinLockRelease(dev->lock);
+	return STATUS_SUCCESS;
+}
+
+VOID tgpio_evt_surprise_removal(WDFDEVICE device)
+{
+	struct tgpio_win_device *dev = tgpio_win_get_context(device);
+
+	WdfSpinLockAcquire(dev->lock);
+	dev->removed = TRUE;
+	WdfSpinLockRelease(dev->lock);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,

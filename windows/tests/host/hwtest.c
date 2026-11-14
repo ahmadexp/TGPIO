@@ -265,6 +265,42 @@ static void test_capture_read(void)
 	printf("capture read ok\n");
 }
 
+static void test_power_cycle(void)
+{
+	static const ULONG edges[] = { TGPIOCTL_EP_RISING, TGPIOCTL_EP_FALLING,
+				       TGPIOCTL_EP_TOGGLE };
+	size_t i;
+	int before;
+
+	for (i = 0; i < sizeof(edges) / sizeof(edges[0]); ++i) {
+		ULONG edge = edges[i];
+
+		reset();
+		tgpio_hw_set_input(blk, TRUE, edge);
+		blk->mode = TGPIO_WIN_BLOCK_INPUT;
+		tgpio_hw_suspend(blk);
+		assert(!(tgpio_hw_read_ctl(blk) & TGPIOCTL_EN));
+		memset(fake_mmio, 0, sizeof(fake_mmio));
+		tgpio_hw_resume(blk);
+		assert(tgpio_hw_read_ctl(blk) ==
+		       (TGPIOCTL_EN | TGPIOCTL_DIR | edge));
+	}
+
+	reset();
+	assert(NT_SUCCESS(tgpio_hw_start_output(&dev, blk, ART_HZ / 2,
+						ART_HZ / 2, 0)));
+	blk->mode = TGPIO_WIN_BLOCK_OUTPUT;
+	tgpio_hw_suspend(blk);
+	assert(blk->mode == TGPIO_WIN_BLOCK_OFF);
+	assert(!(tgpio_hw_read_ctl(blk) & TGPIOCTL_EN));
+	assert(!reg64(TGPIOCOMPV31_0) && !reg64(TGPIOPIV31_0));
+	before = reglog_count;
+	tgpio_hw_resume(blk);
+	tgpio_hw_suspend(blk);
+	assert(before == reglog_count);
+	printf("power cycle restores capture and retires old output deadlines\n");
+}
+
 int main(void)
 {
 	test_art_math();
@@ -275,6 +311,7 @@ int main(void)
 	test_invert();
 	test_input_sequence();
 	test_capture_read();
+	test_power_cycle();
 	printf("all hw tests passed\n");
 	return 0;
 }

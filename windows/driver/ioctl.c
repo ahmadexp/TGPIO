@@ -8,10 +8,21 @@
  * Thin glue between the user-mode interface and the hardware layer. All
  * hardware access runs under the device spin lock; requests are already
  * serialized by the sequential queue, the lock additionally fences the
- * cleanup path.
+ * power transitions and surprise removal.
  */
 
 #include "tgpio.h"
+
+_When_(return != FALSE, _Acquires_lock_(dev->lock))
+static BOOLEAN tgpio_lock_online(struct tgpio_win_device *dev)
+{
+	WdfSpinLockAcquire(dev->lock);
+	if (dev->removed) {
+		WdfSpinLockRelease(dev->lock);
+		return FALSE;
+	}
+	return TRUE;
+}
 
 static struct tgpio_win_block *tgpio_block_from_index(
 	struct tgpio_win_device *dev, ULONG index)
@@ -91,7 +102,8 @@ static NTSTATUS tgpio_ioctl_set_input(struct tgpio_win_device *dev,
 		return STATUS_INVALID_PARAMETER;
 	}
 
-	WdfSpinLockAcquire(dev->lock);
+	if (!tgpio_lock_online(dev))
+		return STATUS_DEVICE_REMOVED;
 	if (block->mode == TGPIO_WIN_BLOCK_OUTPUT)
 		tgpio_hw_stop_output(block);
 	tgpio_hw_set_input(block, in->enable ? TRUE : FALSE, edge_bits);
@@ -133,7 +145,8 @@ static NTSTATUS tgpio_ioctl_read_capture(struct tgpio_win_device *dev,
 	if (!block)
 		return STATUS_INVALID_PARAMETER;
 
-	WdfSpinLockAcquire(dev->lock);
+	if (!tgpio_lock_online(dev))
+		return STATUS_DEVICE_REMOVED;
 	tgpio_hw_read_capture(block, &out->event_count, &out->art_cycles);
 	out->tsc_now = __rdtsc();
 	KeQuerySystemTimePrecise(&systime);
@@ -157,7 +170,7 @@ static NTSTATUS tgpio_ioctl_start_output(struct tgpio_win_device *dev,
 		return status;
 
 	block = tgpio_block_from_index(dev, in->block);
-	if (!block || !in->high_cycles)
+	if (!block || !in->high_cycles || in->high_cycles > MAXULONG64 / 4)
 		return STATUS_INVALID_PARAMETER;
 
 	/*
@@ -168,7 +181,8 @@ static NTSTATUS tgpio_ioctl_start_output(struct tgpio_win_device *dev,
 	if (low_cycles != in->high_cycles)
 		return STATUS_NOT_SUPPORTED;
 
-	WdfSpinLockAcquire(dev->lock);
+	if (!tgpio_lock_online(dev))
+		return STATUS_DEVICE_REMOVED;
 	status = tgpio_hw_start_output(dev, block, in->high_cycles,
 				       low_cycles, in->first_edge_art);
 	block->mode = NT_SUCCESS(status) ? TGPIO_WIN_BLOCK_OUTPUT :
@@ -190,7 +204,8 @@ static NTSTATUS tgpio_ioctl_stop_output(struct tgpio_win_device *dev,
 	if (!block)
 		return STATUS_INVALID_PARAMETER;
 
-	WdfSpinLockAcquire(dev->lock);
+	if (!tgpio_lock_online(dev))
+		return STATUS_DEVICE_REMOVED;
 	tgpio_hw_stop_output(block);
 	block->mode = TGPIO_WIN_BLOCK_OFF;
 	WdfSpinLockRelease(dev->lock);
@@ -210,7 +225,8 @@ static NTSTATUS tgpio_ioctl_invert_output(struct tgpio_win_device *dev,
 	if (!block)
 		return STATUS_INVALID_PARAMETER;
 
-	WdfSpinLockAcquire(dev->lock);
+	if (!tgpio_lock_online(dev))
+		return STATUS_DEVICE_REMOVED;
 	tgpio_hw_invert_output(block);
 	WdfSpinLockRelease(dev->lock);
 	return STATUS_SUCCESS;
@@ -236,7 +252,8 @@ static NTSTATUS tgpio_ioctl_get_block(struct tgpio_win_device *dev,
 	if (!block)
 		return STATUS_INVALID_PARAMETER;
 
-	WdfSpinLockAcquire(dev->lock);
+	if (!tgpio_lock_online(dev))
+		return STATUS_DEVICE_REMOVED;
 	tgpio_hw_flop_fold(block);
 	out->mode = block->mode;
 	out->ctl = tgpio_hw_read_ctl(block);

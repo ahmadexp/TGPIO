@@ -1,7 +1,7 @@
 # Licensed under the TGPIO Non-Commercial License (see LICENSE).
 # Builds an unsigned CAB. Does not install, sign, or submit the driver.
 [CmdletBinding()]
-param()
+param([ValidateSet('Z890','W890')][string]$Board = 'Z890')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -34,6 +34,18 @@ try {
     }
     Copy-Item -LiteralPath "$root\driver\x64\Release\tgpio.pdb" -Destination $stage
     $inf = Get-Content "$stage\tgpio.inf" -Raw
+    if ($Board -eq 'W890') {
+        # These two ACPI resources were measured on the W890 qualification host.
+        foreach ($pair in @(@('Addr0Low', '0xFE001210', '0xF6801210'),
+                            @('Addr1Low', '0xFE001310', '0xF6801310'))) {
+            $pattern = '(?im)^(HKR, Parameters, ' + $pair[0] + ',\s+0x10001, )' + $pair[1] + '(?=\s*$)'
+            if ([regex]::Matches($inf, $pattern).Count -ne 1) { throw "Unexpected INF entry for $($pair[0])" }
+            $inf = [regex]::Replace($inf, $pattern, ('${1}' + $pair[2]))
+        }
+        $inf = $inf.Replace('; below match the Linux module parameters (0xFE001210 / 0xFE001310).',
+                            '; below use the W890 ACPI resources (0xF6801210 / 0xF6801310).')
+        Set-Content -LiteralPath "$stage\tgpio.inf" -Value $inf -Encoding Unicode -NoNewline
+    }
     if ($inf.Contains('$ARCH$') -or $inf -notmatch 'NTamd64.10.0...16299') { throw 'INF architecture or minimum OS mismatch.' }
     Run $infverif @('/u','/v',"$stage\tgpio.inf")
     Run $infverif @('/h','/v',"$stage\tgpio.inf")
@@ -43,18 +55,18 @@ try {
     try {
         Run 'cl.exe' @('/nologo','/W4','/WX','/O2','/Zi','/Fetgpioctl.exe',"$root\tools\tgpioctl\tgpioctl.c")
         Run 'dumpbin.exe' @('/headers','/imports','TGPIOx64\tgpio.sys')
-        $ddf = @('.OPTION EXPLICIT','.Set CabinetFileCountThreshold=0','.Set FolderFileCountThreshold=0','.Set FolderSizeThreshold=0','.Set MaxCabinetSize=0','.Set MaxDiskFileCount=0','.Set MaxDiskSize=0','.Set CompressionType=MSZIP','.Set Cabinet=on','.Set Compress=on','.Set CabinetNameTemplate=TGPIO-18.0.0.2-x64-unsigned.cab','.Set DiskDirectoryTemplate=.','.Set DestinationDir=TGPIOx64')
+        $ddf = @('.OPTION EXPLICIT','.Set CabinetFileCountThreshold=0','.Set FolderFileCountThreshold=0','.Set FolderSizeThreshold=0','.Set MaxCabinetSize=0','.Set MaxDiskFileCount=0','.Set MaxDiskSize=0','.Set CompressionType=MSZIP','.Set Cabinet=on','.Set Compress=on','.Set CabinetNameTemplate=TGPIO-18.0.0.3-x64-unsigned.cab','.Set DiskDirectoryTemplate=.','.Set DestinationDir=TGPIOx64')
         foreach ($name in @('tgpio.sys','tgpio.inf','tgpio.cat','tgpio.ico','tgpio.pdb')) {
             if ((Get-Item "TGPIOx64\$name").Length -eq 0) { throw "Empty file: $name" }
             $ddf += ('"TGPIOx64\' + $name + '"')
         }
         $ddf | Set-Content submission.ddf -Encoding ASCII
         Run 'makecab.exe' @('/F','submission.ddf')
-        Run 'expand.exe' @('-D','TGPIO-18.0.0.2-x64-unsigned.cab')
+        Run 'expand.exe' @('-D','TGPIO-18.0.0.3-x64-unsigned.cab')
         $expanded = Join-Path $env:TEMP ([guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $expanded
         try {
-            Run 'expand.exe' @('-F:*','TGPIO-18.0.0.2-x64-unsigned.cab',$expanded)
+            Run 'expand.exe' @('-F:*','TGPIO-18.0.0.3-x64-unsigned.cab',$expanded)
             $contents = @(Get-ChildItem $expanded -Recurse -File)
             if ($contents.Count -ne 5) { throw 'CAB does not contain exactly five package files.' }
             foreach ($file in Get-ChildItem TGPIOx64 -File) {
@@ -66,16 +78,16 @@ try {
         } finally { Remove-Item $expanded -Recurse -Force }
         $record = [ordered]@{
             sourceCommit = (& git -C $root rev-parse HEAD)
-            configuration = 'Release x64'; sdkWdkPackage = '10.0.26100.6584'
+            board = $Board; configuration = 'Release x64'; sdkWdkPackage = '10.0.26100.6584'
             minimumWindowsBuild = 16299; ntTargetVersion = '0x0A000004'; kmdf = '1.15'
-            driverVersion = '18.0.0.2'; driverDate = '10/27/2026'; catalogTargets = $targets
+            driverVersion = '18.0.0.3'; driverDate = '11/13/2026'; catalogTargets = $targets
             msvc = $env:VCToolsVersion; preparedUtc = [DateTime]::UtcNow.ToString('o')
             validation = 'WDK build, InfVerif /u, InfVerif /h, Inf2Cat, MakeCab'
             runtimeTests = 'Not performed; requires supported TGPIO hardware'
         }
         $record | ConvertTo-Json | Set-Content BUILD-RECORD.json
         $lines = Get-ChildItem TGPIOx64 -File | Sort-Object Name | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  TGPIOx64/' + $_.Name }
-        $lines += (Get-FileHash 'TGPIO-18.0.0.2-x64-unsigned.cab' -Algorithm SHA256).Hash.ToLowerInvariant() + '  TGPIO-18.0.0.2-x64-unsigned.cab'
+        $lines += (Get-FileHash 'TGPIO-18.0.0.3-x64-unsigned.cab' -Algorithm SHA256).Hash.ToLowerInvariant() + '  TGPIO-18.0.0.3-x64-unsigned.cab'
         $lines | Set-Content SHA256SUMS.txt -Encoding ASCII
     } finally { Pop-Location }
 } finally { Stop-Transcript | Out-Null }

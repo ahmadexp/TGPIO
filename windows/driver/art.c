@@ -52,8 +52,8 @@ NTSTATUS tgpio_art_detect(struct tgpio_win_device *dev)
 
 	/*
 	 * IA32_TSC_ADJUST offsets the TSC from the ART-derived value. Read
-	 * it once at load; firmware writes it at boot and nothing on a
-	 * quiet test box moves it afterwards. Guarded: pre-Haswell parts
+	 * it each time the device enters D0 so resume picks up the current
+	 * firmware offset. Guarded: pre-Haswell parts
 	 * without the MSR would #GP.
 	 */
 	__cpuidex(regs, 7, 0);

@@ -143,6 +143,7 @@ void tgpio_hw_set_input(struct tgpio_win_block *block, BOOLEAN enable,
 	if (!enable)
 		return;
 
+	block->input_edge_bits = edge_bits;
 	ctrl = (ctrl & ~TGPIOCTL_EP_MASK) | (edge_bits & TGPIOCTL_EP_MASK);
 	ctrl |= TGPIOCTL_DIR;
 	tgpio_write_ctl(block, ctrl);
@@ -295,4 +296,22 @@ void tgpio_hw_invert_output(struct tgpio_win_block *block)
 	if (compv > MAXULONG64 - block->hw_piv)
 		return;
 	tgpio_hw_write_compv_paused(block, compv + block->hw_piv);
+}
+
+void tgpio_hw_suspend(struct tgpio_win_block *block)
+{
+	if (block->mode == TGPIO_WIN_BLOCK_INPUT) {
+		tgpio_hw_set_input(block, FALSE, 0);
+	} else if (block->mode == TGPIO_WIN_BLOCK_OUTPUT) {
+		tgpio_hw_stop_output(block);
+		/* Absolute ART deadlines and the physical pin level cannot be
+		 * recovered reliably after a system sleep. Require a new arm. */
+		block->mode = TGPIO_WIN_BLOCK_OFF;
+	}
+}
+
+void tgpio_hw_resume(struct tgpio_win_block *block)
+{
+	if (block->mode == TGPIO_WIN_BLOCK_INPUT)
+		tgpio_hw_set_input(block, TRUE, block->input_edge_bits);
 }
