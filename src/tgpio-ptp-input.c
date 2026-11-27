@@ -5616,8 +5616,6 @@ static int __init tgpio_input_init(void)
 	INIT_DELAYED_WORK(&tgpio->poll_work, tgpio_poll_work);
 	INIT_DELAYED_WORK(&tgpio->art_refine_work, tgpio_art_refine_work_fn);
 	INIT_DELAYED_WORK(&tgpio->watchdog_work, tgpio_watchdog_work_fn);
-	schedule_delayed_work(&tgpio->watchdog_work,
-			      TGPIO_WATCHDOG_PERIOD_S * HZ);
 
 	clock = tgpio_parse_clock_mode(clock_mode_param);
 	if (clock.status < 0) {
@@ -5709,6 +5707,10 @@ static int __init tgpio_input_init(void)
 	if (clock_mode == TGPIO_CLOCK_REALTIME)
 		schedule_delayed_work(&tgpio->art_refine_work, 0);
 
+	/* Start monitoring only after all fallible initialization has completed. */
+	schedule_delayed_work(&tgpio->watchdog_work,
+			      TGPIO_WATCHDOG_PERIOD_S * HZ);
+
 	pr_info("loaded with tgpio0=%s tgpio1=%s clock_mode=%s timestamp_mode=%s output_polarity=%s hardware_periodic_output=%c activity_log=%c\n",
 		tgpio_mode_name(tgpio->mmio_blocks[0].mode),
 		tgpio_mode_name(tgpio->mmio_blocks[1].mode),
@@ -5723,7 +5725,11 @@ err_cleanup:
 	tgpio_observability_exit();
 	if (tgpio->ptp_clock)
 		ptp_clock_unregister(tgpio->ptp_clock);
+	/* ART initialization can queue refinement before a later step fails. */
+	cancel_delayed_work_sync(&tgpio->art_refine_work);
+	cancel_delayed_work_sync(&tgpio->watchdog_work);
 	tgpio_disable_mmio_blocks(tgpio);
+	tgpio_pps_unregister(tgpio);
 	tgpio_unmap_mmio_blocks(tgpio);
 	kfree(tgpio);
 	tgpio = NULL;
@@ -5745,8 +5751,8 @@ static void __exit tgpio_input_exit(void)
 
 	cancel_delayed_work_sync(&tgpio->art_refine_work);
 	cancel_delayed_work_sync(&tgpio->watchdog_work);
-	tgpio_pps_unregister(tgpio);
 	tgpio_disable_mmio_blocks(tgpio);
+	tgpio_pps_unregister(tgpio);
 
 	tgpio_unmap_mmio_blocks(tgpio);
 
